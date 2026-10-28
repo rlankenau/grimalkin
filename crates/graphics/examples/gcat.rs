@@ -1,5 +1,22 @@
 //! gcat: a tiny cross-platform "icat" for the kitty graphics protocol.
 //! Run with `cargo run -p grimalkin-graphics --example gcat -- --help`.
+//!
+//! Support query: gcat sends an `a=q` query unless told otherwise. When the
+//! environment has `TERM_PROGRAM=grimalkin` the terminal is assumed to support
+//! the protocol and the query is skipped (`--query` forces it, `--no-query`
+//! always skips it).
+//!
+//! ConPTY mode (`--conpty`, the default on Windows, `--no-conpty` to disable):
+//! Windows ConPTY (OpenConsole) passes APC sequences through but does not learn
+//! that an image placement moved the cursor, so output following an image is
+//! drawn too high. In this mode every placement is sent with `C=1` (cursor does
+//! not move) and gcat prints N newlines itself, where N is the number of
+//! terminal rows the image covers: the given rows for `--place`, otherwise
+//! ceil(image height / cell height), capped at terminal rows - 1. The cell
+//! height comes from the window pixel size or a `CSI 16 t` query (reply
+//! `CSI 6 ; height ; width t`), falling back to 20 px. `--demo` additionally
+//! clears the screen and uses absolute `CSI H` positioning to put the cursor
+//! below the first image after the placed copy.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -24,6 +41,13 @@ OPTIONS:
   --no-move              do not move the cursor after display (C=1)
   --id N                 base image id (default 100; image i gets N+i)
   --no-query             skip the support query
+  --query                force the support query (it is skipped by default
+                         when TERM_PROGRAM=grimalkin)
+  --conpty               Windows ConPTY workaround (default on Windows): send
+                         C=1 and print the newlines for the image's rows
+                         ourselves; cell height is queried with CSI 16 t
+                         (fallback 20 px). Demo restores the cursor with CSI H.
+  --no-conpty            disable the ConPTY workaround
   -h, --help             show this help
 ";
 
@@ -35,6 +59,9 @@ struct Opts {
     z: Option<i32>,
     no_move: bool,
     id: u32,
+    conpty: bool,
+    cell_h: u32,
+    term_rows: u32,
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -86,6 +113,58 @@ fn query_support() -> bool {
     ok
 }
 
+/// Cell height in pixels: window pixel size if available, else `CSI 16 t`, else 20.
+fn cell_height() -> u32 {
+    if let Ok(ws) = terminal::window_size() {
+        if ws.rows > 0 && ws.height > 0 {
+            return (ws.height as u32 / ws.rows as u32).max(1);
+        }
+    }
+    let mut out = std::io::stdout();
+    if terminal::enable_raw_mode().is_err() {
+        return 20;
+    }
+    let _ = write!(out, "\x1b[16t");
+    let _ = out.flush();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut got = String::new();
+    let mut h = 20;
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match event::poll(left) {
+            Ok(true) => {
+                if let Ok(Event::Key(k)) = event::read() {
+                    match k.code {
+                        KeyCode::Char(c) => got.push(c),
+                        KeyCode::Esc => got.push('\x1b'),
+                        _ => {}
+                    }
+                    if got.ends_with('t') {
+                        // ESC [ 6 ; height ; width t
+                        let body = got.rsplit("[6;").next().unwrap_or("");
+                        if let Some(v) = body.split(';').next().and_then(|v| v.parse::<u32>().ok()) {
+                            if v > 0 {
+                                h = v;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = terminal::disable_raw_mode();
+    h
+}
+
+/// Terminal rows covered by an image of `height_px` pixels.
+fn image_rows(o: &Opts, height_px: u32) -> u32 {
+    if let Some((_, r, _, _)) = o.place {
+        return r;
+    }
+    height_px.div_ceil(o.cell_h.max(1)).min(o.term_rows.saturating_sub(1)).max(1)
+}
+
 /// Transmit and display one image. `payload` is raw pixels (f=32) or PNG bytes (f=100).
 fn send(out: &mut impl Write, payload: &[u8], dims: Option<(u32, u32)>, o: &Opts, id: u32) {
     let mut data = payload.to_vec();
@@ -110,7 +189,7 @@ fn send(out: &mut impl Write, payload: &[u8], dims: Option<(u32, u32)>, o: &Opts
     if let Some(z) = o.z {
         keys += &format!(",z={z}");
     }
-    if o.no_move {
+    if o.no_move || o.conpty {
         keys += ",C=1";
     }
     let chunks: Vec<&[u8]> = enc.chunks(4096).collect();
@@ -124,7 +203,17 @@ fn send(out: &mut impl Write, payload: &[u8], dims: Option<(u32, u32)>, o: &Opts
         let _ = out.write_all(ch);
         let _ = out.write_all(b"\x1b\\");
     }
-    let _ = out.write_all(b"\n");
+    if o.conpty {
+        let height_px = match dims {
+            Some((_, h)) => h,
+            // PNG IHDR: signature(8) + len/type(8) + width(4) + height(4)
+            None => payload.get(20..24).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+        };
+        let n = image_rows(o, height_px);
+        let _ = out.write_all("\n".repeat(n as usize).as_bytes());
+    } else {
+        let _ = out.write_all(b"\n");
+    }
     let _ = out.flush();
 }
 
@@ -146,6 +235,10 @@ fn demo_image() -> (Vec<u8>, u32, u32) {
 }
 
 fn demo(out: &mut impl Write, o: &Opts) {
+    if o.conpty {
+        // Known starting point so the row math below is exact.
+        let _ = write!(out, "\x1b[2J\x1b[H");
+    }
     let _ = writeln!(out, "\x1b[1mgcat demo\x1b[0m\n16 colours:");
     for i in 0..16 {
         let _ = write!(out, "\x1b[48;5;{i}m  ");
@@ -172,11 +265,19 @@ fn demo(out: &mut impl Write, o: &Opts) {
     let _ = writeln!(out, "┌──────────┐\n│ box draw │\n└──────────┘");
     let (px, w, h) = demo_image();
     let _ = writeln!(out, "image {w}x{h}:");
+    // Lines printed so far (assuming a terminal at least 72 columns wide): the
+    // image starts on the next row.
+    let image_row = 17;
     send(out, &px, Some((w, h)), &Opts { id: o.id, ..o.clone() }, o.id);
     let _ = writeln!(out, "scaled copy at 20x5@40x2:");
     let placed = Opts { place: Some((20, 5, 40, 2)), ..o.clone() };
     send(out, &px, Some((w, h)), &placed, o.id + 1);
-    let _ = writeln!(out, "\x1b[12;1H");
+    if o.conpty {
+        let below = image_row + image_rows(o, h) + 1;
+        let _ = write!(out, "\x1b[{below};1H");
+    } else {
+        let _ = writeln!(out, "\x1b[12;1H");
+    }
 }
 
 fn die(msg: &str) -> ! {
@@ -185,8 +286,8 @@ fn die(msg: &str) -> ! {
 }
 
 fn main() {
-    let mut o = Opts { id: 100, ..Default::default() };
-    let (mut files, mut do_demo, mut del, mut query) = (Vec::new(), false, false, true);
+    let mut o = Opts { id: 100, conpty: cfg!(windows), ..Default::default() };
+    let (mut files, mut do_demo, mut del, mut query) = (Vec::new(), false, false, None::<bool>);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = |n: &str| args.next().unwrap_or_else(|| die(&format!("{n} needs a value")));
@@ -200,7 +301,10 @@ fn main() {
             "--zlib" => o.zlib = true,
             "--png" => o.png = true,
             "--no-move" => o.no_move = true,
-            "--no-query" => query = false,
+            "--no-query" => query = Some(false),
+            "--query" => query = Some(true),
+            "--conpty" => o.conpty = true,
+            "--no-conpty" => o.conpty = false,
             "--z" => o.z = Some(val("--z").parse().unwrap_or_else(|_| die("bad --z"))),
             "--id" => o.id = val("--id").parse().unwrap_or_else(|_| die("bad --id")),
             "--place" => {
@@ -226,9 +330,14 @@ fn main() {
     if !do_demo && files.is_empty() {
         die("no images given");
     }
-    if query && !query_support() {
+    let trusted = std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "grimalkin");
+    if query.unwrap_or(!trusted) && !query_support() {
         println!("no kitty graphics support");
         std::process::exit(1);
+    }
+    if o.conpty {
+        o.term_rows = terminal::size().map_or(24, |(_, r)| r as u32);
+        o.cell_h = cell_height();
     }
     if do_demo {
         demo(&mut out, &o);
