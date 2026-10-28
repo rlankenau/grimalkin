@@ -3,7 +3,7 @@
 ; Build (from the repository root, after staging dist\, see the "windows
 ; installer" job in .github/workflows/ci.yml):
 ;
-;   ISCC.exe /DAppVersion=0.1.0 installer\windows\grimalkin.iss
+;   ISCC.exe /DAppVersion=0.1.0 /DAppVersionNumeric=0.1.0.0 installer\windows\grimalkin.iss
 ;
 ; Inputs (all in <repo>\dist, relative to this file: ..\..\dist):
 ;   grimalkin.exe, grimalkin.com (the console launcher, renamed
@@ -19,6 +19,10 @@
   #define AppVersion "0.0.0"
 #endif
 
+#ifndef AppVersionNumeric
+  #define AppVersionNumeric "0.0.0.0"
+#endif
+
 #define AppName "grimalkin"
 #define AppExe "grimalkin.exe"
 #define IconPath "..\..\assets\icon\grimalkin.ico"
@@ -32,6 +36,8 @@
 AppId={{5E56C746-3735-4FF7-96B9-E90F7D4C5AA7}
 AppName={#AppName}
 AppVersion={#AppVersion}
+VersionInfoVersion={#AppVersionNumeric}
+VersionInfoProductTextVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=grimalkin contributors
 AppPublisherURL=https://github.com/rlankenau/grimalkin

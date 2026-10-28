@@ -37,6 +37,22 @@ fn normalise(raw: &[u8]) -> String {
     s.replace('\\', "/").to_lowercase()
 }
 
+/// Reject entry names that could escape a directory if anyone ever extracted
+/// them: NUL, a leading `/` or `\\`, a drive prefix (`C:`), or a `..` component.
+fn check_entry_name(raw: &[u8]) -> Result<(), String> {
+    let bad = raw.contains(&0)
+        || matches!(raw.first(), Some(b'/' | b'\\'))
+        || (raw.len() >= 2 && raw[0].is_ascii_alphabetic() && raw[1] == b':')
+        || raw.split(|&b| b == b'/' || b == b'\\').any(|c| c == b"..");
+    if bad {
+        return Err(format!(
+            "unsafe entry name {:?} in archive",
+            String::from_utf8_lossy(raw)
+        ));
+    }
+    Ok(())
+}
+
 fn hidden(path: &str) -> bool {
     path.ends_with('/') || path.split('/').any(|c| c == "__macosx")
 }
@@ -51,6 +67,9 @@ impl Archive {
             .map_err(|e| format!("not a valid zip archive: {e}"))?;
         if zip.len() > MAX_ENTRIES {
             return Err("archive has too many entries".into());
+        }
+        for raw in zip.file_names_raw() {
+            check_entry_name(raw)?;
         }
         let names = zip.file_names_raw().map(normalise).collect();
         Ok(Archive {
@@ -240,6 +259,23 @@ mod tests {
             .unwrap_err()
             .contains("too large"));
         assert!(Archive::from_bytes(b"not a zip at all".to_vec()).is_err());
+    }
+
+    #[test]
+    fn unsafe_entry_names_are_rejected() {
+        for bad in [
+            "../x", "a/../x", "..\\x", "/abs", "\\abs", "C:evil", "c:/evil",
+        ] {
+            let z = zip_of(&[("pledit.bmp", b"a"), (bad, b"x")]);
+            let e = Archive::from_bytes(z).err().unwrap_or_default();
+            assert!(e.contains("unsafe entry name"), "{bad}: {e:?}");
+        }
+        let ok = zip_of(&[
+            ("pledit.bmp", b"a"),
+            ("sub/dir/..x.txt", b"x"),
+            ("a b/c.txt", b"y"),
+        ]);
+        assert!(Archive::from_bytes(ok).is_ok());
     }
 
     #[test]

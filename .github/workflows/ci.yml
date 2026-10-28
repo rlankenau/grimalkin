@@ -118,7 +118,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'choco install innosetup failed' }
           }
           if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
-          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" installer/windows/grimalkin.iss
+          $full = '${{ steps.version.outputs.version }}'
+          # Inno's VersionInfoVersion must be numeric x.y.z.w: drop any -suffix/+build.
+          $core = ($full -split '[-+]')[0]
+          if ($core -notmatch '^\d+\.\d+\.\d+$') { throw "unexpected version format: $full" }
+          $numeric = "$core.0"
+          Write-Host "AppVersion=$full AppVersionNumeric=$numeric"
+          & $iscc "/DAppVersion=$full" "/DAppVersionNumeric=$numeric" installer/windows/grimalkin.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
           Get-Item installer-out/grimalkin-setup-x64.exe
       - name: Smoke-test installer (silent install, check, uninstall)
