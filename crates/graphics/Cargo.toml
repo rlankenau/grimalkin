@@ -9,3 +9,7 @@ description = "Kitty graphics protocol implementation and image store for grimal
 [dependencies]
 flate2 = "1.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
