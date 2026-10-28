@@ -21,9 +21,39 @@ use crate::config::Config;
 /// Content of a freshly created config file: the documented example.
 const EXAMPLE: &str = include_str!("../../../docs/grimalkin.example.toml");
 
+/// Comments that stand above `key` but are not about it, kept when the key
+/// is removed: everything above the last blank line, or, for the first key
+/// of the file, the whole block (a file header usually sits right on top of
+/// the first setting). They move to the next entry of the table.
+fn salvage_comments(table: &mut dyn toml_edit::TableLike, key: &str, first_in_root: bool) {
+    let Some(prefix) = table.get_key_value(key).and_then(|(k, _)| k.leaf_decor().prefix().and_then(|p| p.as_str()).map(str::to_string)) else {
+        return;
+    };
+    let kept = if first_in_root {
+        prefix.as_str()
+    } else {
+        prefix.rfind("\n\n").or_else(|| prefix.rfind("\n\r\n")).map_or("", |i| &prefix[..=i + 1])
+    };
+    if !kept.contains('#') {
+        return;
+    }
+    let Some(next) = table.iter().map(|(k, _)| k.to_string()).skip_while(|k| k != key).nth(1) else { return };
+    let prepend = |old: Option<&str>| format!("{kept}{}", old.unwrap_or(""));
+    if let Some(tbl) = table.get_mut(&next).and_then(Item::as_table_mut) {
+        let p = prepend(tbl.decor().prefix().and_then(|p| p.as_str()));
+        tbl.decor_mut().set_prefix(p);
+    } else if let Some((mut k, _)) = table.get_key_value_mut(&next) {
+        let p = prepend(k.leaf_decor().prefix().and_then(|p| p.as_str()));
+        k.leaf_decor_mut().set_prefix(p);
+    }
+}
+
 pub struct ConfigEditor {
     path: PathBuf,
     doc: DocumentMut,
+    /// The file used Windows line endings; the parser normalises them, so
+    /// they are put back when saving.
+    crlf: bool,
 }
 
 fn invalid(msg: String) -> io::Error {
@@ -61,7 +91,7 @@ impl ConfigEditor {
 
     fn from_text(path: PathBuf, text: &str) -> io::Result<Self> {
         let doc = text.parse::<DocumentMut>().map_err(|e| invalid(format!("{}: {e}", path.display())))?;
-        Ok(ConfigEditor { path, doc })
+        Ok(ConfigEditor { path, doc, crlf: text.contains("\r\n") })
     }
 
     pub fn path(&self) -> &Path {
@@ -120,6 +150,8 @@ impl ConfigEditor {
                 None => return false,
             }
         }
+        let first_in_root = parents.is_empty() && table.iter().next().is_some_and(|(k, _)| k == *last);
+        salvage_comments(table, last, first_in_root);
         table.remove(last).is_some()
     }
 
@@ -129,7 +161,11 @@ impl ConfigEditor {
         let dir = self.path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
         let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-        let result = fs::write(&tmp, self.doc.to_string()).and_then(|()| {
+        let mut text = self.doc.to_string();
+        if self.crlf {
+            text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+        let result = fs::write(&tmp, text).and_then(|()| {
             // Keep the permissions of an existing config.
             if let Ok(meta) = fs::metadata(&self.path) {
                 let _ = fs::set_permissions(&tmp, meta.permissions());
@@ -268,5 +304,48 @@ mod tests {
         assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert!(fs::read_to_string(&real).unwrap().contains("\"b\""));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn inline_tables_crlf_and_value_types_survive() {
+        let dir = tmpdir("inline");
+        let f = dir.join("grimalkin.toml");
+        fs::write(&f, "# c\r\nfont = { size = 12.0, family = \"Menlo\" } # inline\r\ntheme = \"nord\"\r\n").unwrap();
+        let mut ed = ConfigEditor::open_at(&f).unwrap();
+        ed.set("font.size", 15.5).unwrap();
+        ed.set("theme", "default").unwrap();
+        ed.set("font.family", toml_edit::Value::from_iter(["A", "B"])).unwrap();
+        assert!(ed.set("theme.nested", 1).is_err(), "a string is not a table");
+        assert!(ed.set("", 1).is_err());
+        assert!(!ed.unset("window.opacity"), "removing a missing key is not an error");
+        ed.save().unwrap();
+        let text = fs::read_to_string(&f).unwrap();
+        assert!(text.contains("# inline") && text.starts_with("# c\r\n"), "{text:?}");
+        let c = Config::try_load(Some(&f)).unwrap();
+        assert_eq!((c.font.size, c.theme.as_str()), (15.5, "default"));
+        assert_eq!(c.font.family, vec!["A".to_string(), "B".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_a_key_keeps_the_file_header_and_detached_comments() {
+        let dir = tmpdir("salvage");
+        let f = dir.join("grimalkin.toml");
+        let text = "# my config header\ntheme = \"nord\" # why\nskin = \"llama\"\n\n# about fonts\n[font]\n# the size\nsize = 14.0\n\n# loose note\n\n# line height\nline_height = 1.2\nfamily = \"Menlo\"\n";
+        fs::write(&f, text).unwrap();
+        let mut ed = ConfigEditor::open_at(&f).unwrap();
+        assert!(ed.unset("theme"));
+        assert!(ed.unset("skin"));
+        assert!(ed.unset("font.size"));
+        assert!(ed.unset("font.line_height"));
+        ed.save().unwrap();
+        let out = fs::read_to_string(&f).unwrap();
+        assert_eq!(out, "# my config header\n\n# about fonts\n[font]\n\n# loose note\n\nfamily = \"Menlo\"\n", "{out}");
+        assert!(Config::try_load(Some(&f)).is_ok());
+        // Removing the only key leaves the header on the table.
+        let mut ed = ConfigEditor::open_at(&f).unwrap();
+        assert!(ed.unset("font.family"));
+        assert!(ed.get("font").is_none() || ed.get("font.family").is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

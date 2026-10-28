@@ -205,7 +205,7 @@ winning over the file.)
 
 ## Menus
 
-macOS has a menu bar: Settings... (Cmd+,), Edit (Copy, Paste), View (zoom,
+macOS has a menu bar: Settings... (Cmd+,) and Quit (Cmd+Q) in the app menu, Edit (Copy, Paste), View (zoom,
 and Themes / Skins submenus that switch live by editing `grimalkin.toml` in
 place, keeping its comments), Window and Help (open the config file, reveal
 the themes folder). On macOS and Windows, right-click opens the same items as a
@@ -226,7 +226,9 @@ straight away, keeping your comments, and the running terminal applies it live
 removes that section's keys from the file. Escape or Cmd/Ctrl+W closes the
 window. The window is drawn with egui on its own GPU device (egui-wgpu 0.35
 needs wgpu 29; the terminal uses wgpu 30). Shell, graphics cursor and the
-Windows ConPTY mode only apply to a new launch.
+Windows ConPTY mode only apply to a new launch, and so does switching
+between a plain window and a skin (the window says so when you try; switching
+between two skins is live).
 
 ## Key bindings
 
@@ -238,7 +240,7 @@ Windows ConPTY mode only apply to a new launch.
 | Mod+V, Shift+Insert | Paste |
 | Mod++ / Mod+- | Zoom in / out |
 | Mod+0 | Reset zoom |
-| Cmd+, (macOS) / Ctrl+, | Preferences (stub for now) |
+| Cmd+, (macOS) / Ctrl+, | Preferences |
 | Shift+PageUp / Shift+PageDown | Scroll a page (main screen) |
 | Mouse wheel | Scroll scrollback (or sent to the app in mouse mode) |
 

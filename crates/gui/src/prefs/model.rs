@@ -215,6 +215,21 @@ impl BellMode {
     }
 }
 
+/// A multi-line parse error (TOML prints the offending source line and a
+/// caret) reduced to where it is and what is wrong, without the file path:
+/// `TOML parse error at line 14, column 9: unknown variant ...`.
+pub fn short_error(msg: &str) -> String {
+    let mut lines = msg.lines().map(str::trim).filter(|l| !l.is_empty());
+    let Some(first) = lines.next() else { return String::new() };
+    // "<path>: TOML parse error ..." (the path may itself contain ": " on
+    // Windows, so cut at the marker instead).
+    let first = first.find("TOML parse error").map_or(first, |i| &first[i..]);
+    match lines.next_back() {
+        Some(last) if last != first && !last.starts_with('|') && !last.starts_with('^') => format!("{first}: {last}"),
+        _ => first.to_string(),
+    }
+}
+
 /// `"JetBrains Mono, Consolas"` to the family list.
 pub fn parse_families(text: &str) -> Vec<String> {
     text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
@@ -411,6 +426,17 @@ mod tests {
         for k in seen {
             ed.set(k, 1).unwrap();
         }
+    }
+
+    #[test]
+    fn parse_errors_are_shortened() {
+        let e = "/tmp/x/grimalkin.toml: TOML parse error at line 14, column 9\n   |\n14 | shape = \"banana\"\n   |         ^^^^^^^^\n    unknown variant `banana`, expected one of `block`, `underline`, `bar`\n    ";
+        assert_eq!(
+            short_error(e),
+            "TOML parse error at line 14, column 9: unknown variant `banana`, expected one of `block`, `underline`, `bar`"
+        );
+        assert_eq!(short_error("cannot read: denied"), "cannot read: denied");
+        assert_eq!(short_error(""), "");
     }
 
     #[test]

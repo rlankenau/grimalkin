@@ -129,7 +129,9 @@ impl PreferencesWindow {
         // and once more on release).
         let settled = !self.ctx.input(|i| i.pointer.any_down());
         self.prefs.editing_text = self.ctx.egui_wants_keyboard_input();
-        self.prefs.tick(now, settled);
+        if self.prefs.tick(now, settled) {
+            self.window.request_redraw();
+        }
         if let Some(t) = self.prefs.queue.due_at() {
             self.next_repaint = Some(t);
         }
@@ -253,6 +255,12 @@ impl SecondaryWindow for PreferencesWindow {
         }
         self.window.request_redraw();
         true
+    }
+
+    fn restart_notice(&mut self, text: Option<&str>) {
+        if self.prefs.restart_notice(text) {
+            self.window.request_redraw();
+        }
     }
 
     fn window(&self) -> &Window {

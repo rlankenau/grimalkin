@@ -252,8 +252,15 @@ pub fn monospace_families() -> Vec<String> {
         .faces()
         .filter(|f| f.monospaced)
         .filter_map(|f| f.families.first().map(|(n, _)| n.clone()))
+        .filter(|n| pickable_family(n))
         .collect();
     names.into_iter().collect()
+}
+
+/// Names that make sense in a picker: macOS lists private system fonts with a
+/// leading dot (`.SF NS Mono`), which cannot be selected by name.
+fn pickable_family(name: &str) -> bool {
+    !name.trim().is_empty() && !name.starts_with('.')
 }
 
 fn locale_of_default() -> String {
@@ -263,6 +270,13 @@ fn locale_of_default() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_system_families_are_not_offered() {
+        assert!(!pickable_family(".SF NS Mono"));
+        assert!(!pickable_family(" "));
+        assert!(pickable_family("Menlo"));
+    }
 
     #[test]
     fn partial_then_full() {

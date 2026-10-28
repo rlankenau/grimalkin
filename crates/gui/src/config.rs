@@ -445,6 +445,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn out_of_range_values_are_clamped() {
+        let c = Config::from_toml(
+            "scrollback_lines = 99999999999\n[font]\nsize = 500.0\nline_height = 0.1\n[window]\nopacity = 7.0\npadding = -5.0\ncols = 1\nrows = 5000\n",
+        )
+        .unwrap();
+        assert_eq!((c.font.size, c.font.line_height), (200.0, 0.5));
+        assert_eq!((c.window.opacity, c.window.padding), (1.0, 0.0));
+        assert_eq!((c.window.cols, c.window.rows), (2, 1000));
+        assert_eq!(c.scrollback_lines, 1_000_000);
+        let c = Config::from_toml("[font]\nsize = -3.0\n[window]\nopacity = -1.0\n").unwrap();
+        assert_eq!((c.font.size, c.window.opacity), (4.0, 0.0));
+    }
+
+    #[test]
     fn defaults_without_file() {
         let c = Config::from_toml("").unwrap();
         assert_eq!(c.window.cols, 120);

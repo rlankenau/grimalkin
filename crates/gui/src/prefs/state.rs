@@ -11,6 +11,9 @@ use crate::config::Config;
 use crate::menu::MenuAction;
 use crate::{skin, theme};
 
+/// Notices from the app that a change waits for a restart start with this.
+pub const RESTART_PREFIX: &str = "Restart grimalkin";
+
 /// A line under the controls: what just happened, or what went wrong.
 pub struct Status {
     pub text: String,
@@ -111,6 +114,23 @@ impl Prefs {
         self.status = Some(Status { text, error: true });
     }
 
+    /// Show (or, with `None`, clear) the "needs a restart" line. Returns
+    /// whether the status line changed.
+    pub fn restart_notice(&mut self, text: Option<&str>) -> bool {
+        let shown = self.status.as_ref().is_some_and(|s| s.text.starts_with(RESTART_PREFIX));
+        match text {
+            Some(t) if self.status.as_ref().is_none_or(|s| s.text != t) => {
+                self.note(t.to_string());
+                true
+            }
+            None if shown => {
+                self.status = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn note(&mut self, text: String) {
         self.status = Some(Status { text, error: false });
     }
@@ -127,7 +147,7 @@ impl Prefs {
             }
             Err(e) => {
                 // Keep showing the last good values; the terminal does too.
-                self.status = Some(Status { text: format!("Config file has an error: {e}"), error: true });
+                self.status = Some(Status { text: format!("Config file has an error: {}", model::short_error(&e)), error: true });
             }
         }
         let tdir = theme::user_dir();
@@ -175,14 +195,18 @@ impl Prefs {
 
     /// Once per frame, after the controls ran. `settled` is false while a
     /// slider or other drag is in progress.
-    pub fn tick(&mut self, now: Instant, settled: bool) {
-        self.poll_install();
+    /// Returns whether the shown values changed after the controls were
+    /// drawn (a reload), so the caller must draw another frame.
+    pub fn tick(&mut self, now: Instant, settled: bool) -> bool {
+        let mut changed = self.poll_install();
         if self.queue.due(now, settled) {
             self.flush(now);
         }
         if self.reload_pending && self.queue.is_empty() && settled {
             self.reload();
+            changed = true;
         }
+        changed
     }
 
     /// Theme and skin picks go through the app.
@@ -250,10 +274,10 @@ impl Prefs {
         self.install.lock().is_ok_and(|g| matches!(*g, Install::Running))
     }
 
-    fn poll_install(&mut self) {
+    fn poll_install(&mut self) -> bool {
         let done = match self.install.lock() {
             Ok(mut g) if matches!(*g, Install::Done(_)) => std::mem::replace(&mut *g, Install::Idle),
-            _ => return,
+            _ => return false,
         };
         if let Install::Done(r) = done {
             match r {
@@ -266,5 +290,130 @@ impl Prefs {
                 Err(e) => self.error(format!("Install failed: {e}")),
             }
         }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    struct Fixture {
+        dir: PathBuf,
+        file: PathBuf,
+        prefs: Prefs,
+        applied: Rc<Cell<u32>>,
+        picked: Rc<std::cell::RefCell<Vec<MenuAction>>>,
+    }
+
+    fn fixture(tag: &str, text: &str) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("grimalkin-prefs-state-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("grimalkin.toml");
+        std::fs::write(&file, text).unwrap();
+        let applied = Rc::new(Cell::new(0));
+        let picked = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (a, p) = (applied.clone(), picked.clone());
+        let prefs = Prefs::new(Some(file.clone()), Box::new(move |m| p.borrow_mut().push(m)), Box::new(move || a.set(a.get() + 1)), Arc::new(|| {}));
+        Fixture { dir, file, prefs, applied, picked }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn drag_writes_are_throttled_and_the_release_writes_the_rest() {
+        let mut f = fixture("drag", "[font]\nsize = 12.0 # mine\n");
+        let t0 = Instant::now();
+        f.prefs.edit(Edit::float("font.size", 14.0));
+        f.prefs.tick(t0, false);
+        assert_eq!(f.applied.get(), 1, "the first write of a drag goes out at once");
+        for (i, size) in [15.0, 16.0, 17.0].into_iter().enumerate() {
+            f.prefs.edit(Edit::float("font.size", size));
+            f.prefs.tick(t0 + Duration::from_millis(10 * (i as u64 + 1)), false);
+        }
+        assert_eq!(f.applied.get(), 1, "held back while the pointer is down");
+        assert!(f.prefs.queue.due_at().is_some(), "a repaint is scheduled for the held-back write");
+        f.prefs.tick(t0 + Duration::from_millis(120), false);
+        assert_eq!(f.applied.get(), 2, "one write per throttle period");
+        f.prefs.edit(Edit::float("font.size", 18.0));
+        f.prefs.tick(t0 + Duration::from_millis(130), true);
+        assert_eq!(f.applied.get(), 3, "release writes the final value at once");
+        let text = std::fs::read_to_string(&f.file).unwrap();
+        assert!(text.contains("size = 18.0 # mine"), "{text}");
+        assert!(f.prefs.queue.is_empty());
+    }
+
+    #[test]
+    fn external_changes_refresh_the_controls_after_the_frame() {
+        let mut f = fixture("reload", "theme = \"default\"\n");
+        assert_eq!(f.prefs.cfg.theme, "default");
+        std::fs::write(&f.file, "theme = \"nord\"\n").unwrap();
+        assert!(!f.prefs.tick(Instant::now(), true), "nothing to refresh yet");
+        f.prefs.config_changed();
+        let t = Instant::now();
+        assert!(!f.prefs.tick(t, false) && f.prefs.cfg.theme == "default", "not while a drag is in progress");
+        assert!(f.prefs.tick(t, true), "the caller is told to draw another frame");
+        assert_eq!(f.prefs.cfg.theme, "nord");
+    }
+
+    #[test]
+    fn a_broken_file_keeps_the_last_values_and_shows_a_short_error() {
+        let mut f = fixture("broken", "[font]\nsize = 20.0\n");
+        std::fs::write(&f.file, "[font]\nsize = 20.0\n[cursor]\nshape = \"banana\"\n").unwrap();
+        f.prefs.config_changed();
+        f.prefs.tick(Instant::now(), true);
+        assert_eq!(f.prefs.cfg.font.size, 20.0);
+        let s = f.prefs.status.as_ref().unwrap();
+        assert!(s.error && s.text.contains("banana") && !s.text.contains('\n'), "{}", s.text);
+        assert!(!s.text.contains(f.dir.to_str().unwrap()), "no path in the line: {}", s.text);
+        // Fixing the file clears the message.
+        std::fs::write(&f.file, "[font]\nsize = 21.0\n").unwrap();
+        f.prefs.config_changed();
+        f.prefs.tick(Instant::now(), true);
+        assert!(f.prefs.status.is_none());
+        assert_eq!(f.prefs.cfg.font.size, 21.0);
+    }
+
+    #[test]
+    fn restart_notice_is_shown_and_cleared() {
+        let mut f = fixture("restart", "");
+        assert!(!f.prefs.restart_notice(None), "nothing to clear");
+        assert!(f.prefs.restart_notice(Some("Restart grimalkin to switch.")));
+        assert!(!f.prefs.restart_notice(Some("Restart grimalkin to switch.")), "unchanged");
+        assert_eq!(f.prefs.status.as_ref().unwrap().text, "Restart grimalkin to switch.");
+        assert!(f.prefs.restart_notice(None));
+        assert!(f.prefs.status.is_none());
+        // Other messages are not touched by a clear.
+        f.prefs.note("Installed a skin".into());
+        assert!(!f.prefs.restart_notice(None));
+        assert!(f.prefs.status.is_some());
+    }
+
+    #[test]
+    fn theme_and_skin_picks_go_through_the_app() {
+        let mut f = fixture("picks", "");
+        f.prefs.pick_theme("nord");
+        f.prefs.pick_skin("llama");
+        assert_eq!(*f.picked.borrow(), vec![MenuAction::SetTheme("nord".into()), MenuAction::SetSkin("llama".into())]);
+        assert_eq!(f.prefs.cfg.theme, "nord");
+        assert!(f.prefs.queue.is_empty(), "the app writes the file, not the window");
+    }
+
+    #[test]
+    fn reset_section_rewrites_the_file_and_tells_the_app() {
+        let mut f = fixture("reset", "# keep\nscrollback_lines = 7\n[font]\nsize = 20.0\n");
+        f.prefs.reset_section(Section::Font);
+        assert_eq!(f.applied.get(), 1);
+        assert_eq!(f.prefs.cfg.font.size, Config::default().font.size);
+        assert_eq!(f.prefs.cfg.scrollback_lines, 7);
+        assert!(std::fs::read_to_string(&f.file).unwrap().starts_with("# keep\n"));
     }
 }

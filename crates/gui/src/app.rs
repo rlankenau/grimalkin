@@ -83,6 +83,9 @@ pub trait SecondaryWindow {
     /// A menu-bar action while this window is the focused one (Cmd+C and
     /// friends act on the focused window). Returns whether it was handled.
     fn menu_action(&mut self, action: &MenuAction) -> bool;
+    /// After a config reload: what the app could not apply live (a change
+    /// that needs a restart), or `None` when nothing is pending.
+    fn restart_notice(&mut self, text: Option<&str>);
     fn window(&self) -> &Window;
 }
 
@@ -93,6 +96,10 @@ fn open_in_os(target: impl AsRef<std::ffi::OsStr>) {
         log::error!("cannot open {}: {e}", target.to_string_lossy());
     }
 }
+
+/// What the user is told when a skin choice needs a new window.
+const RESTART_FOR_SKIN: &str = "Restart grimalkin to switch from a plain window to a skin.";
+const RESTART_FOR_NO_SKIN: &str = "Restart grimalkin to switch from a skin to a plain window.";
 
 /// Max bytes of pty output processed per wake so input and redraws stay
 /// responsive during floods.
@@ -265,6 +272,7 @@ impl App {
                 open_in_os(&dir);
             }
             MenuAction::About => open_in_os(env!("CARGO_PKG_REPOSITORY")),
+            MenuAction::Quit => event_loop.exit(),
         }
     }
 
@@ -432,6 +440,7 @@ impl App {
             exit_requested: false,
             menu_accels: false,
             context_menu_requested: false,
+            notice: None,
         };
         running.update_skin_min_size();
         Ok(running)
@@ -492,8 +501,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(m) = self.menus.as_mut() {
                     m.sync(&r.cfg.theme, &r.cfg.skin);
                 }
+                let notice = r.notice.take();
                 for w in self.secondary.values_mut() {
                     w.config_changed();
+                    w.restart_notice(notice.as_deref());
                 }
             }
             UserEvent::OpenPreferences | UserEvent::MenuAction(_) => {}
@@ -642,6 +653,9 @@ struct Running {
     /// A right click asked for the context menu (at the pointer); the
     /// app shows it (it owns the menus) once the event is handled.
     context_menu_requested: bool,
+    /// Something the last config reload could not do live; the app passes it
+    /// to the open secondary windows.
+    notice: Option<String>,
 }
 
 /// The skin's `viewport_background` stands in for the terminal background
@@ -860,6 +874,7 @@ impl Running {
         if let Some(s) = &self.reload.skin_override {
             raw.skin = s.clone();
         }
+        self.notice = None;
         self.swap_skin(&raw.skin);
         let skin = self.skin.as_ref().map(|r| r.skin.clone());
         let resolved = theme::resolve_for_skin(&raw, skin.as_deref());
@@ -923,11 +938,13 @@ impl Running {
         let Some(cur) = self.skin.as_ref() else {
             if wanted {
                 log::info!("skin {name:?} applies on the next launch (this window has no skin)");
+                self.notice = Some(RESTART_FOR_SKIN.into());
             }
             return;
         };
         if !wanted {
             log::info!("skin \"none\" applies on the next launch");
+            self.notice = Some(RESTART_FOR_NO_SKIN.into());
             return;
         }
         if name == self.cfg.skin && cur.skin.origin.starts_with("built-in") {

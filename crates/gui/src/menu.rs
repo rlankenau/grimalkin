@@ -29,6 +29,8 @@ pub enum MenuAction {
     RevealThemesFolder,
     RevealSkinsFolder,
     About,
+    /// Leave the app the normal way (terminal shutdown included).
+    Quit,
 }
 
 impl MenuAction {
@@ -48,6 +50,7 @@ impl MenuAction {
             MenuAction::RevealThemesFolder => "reveal_themes_folder".into(),
             MenuAction::RevealSkinsFolder => "reveal_skins_folder".into(),
             MenuAction::About => "about".into(),
+            MenuAction::Quit => "quit".into(),
         }
     }
 
@@ -72,9 +75,24 @@ impl MenuAction {
             "reveal_themes_folder" => MenuAction::RevealThemesFolder,
             "reveal_skins_folder" => MenuAction::RevealSkinsFolder,
             "about" => MenuAction::About,
+            "quit" => MenuAction::Quit,
             _ => return None,
         })
     }
+}
+
+/// Which of `names` gets the check mark in the Themes submenu: the active
+/// theme only.
+#[cfg_attr(not(any(windows, target_os = "macos", test)), allow(dead_code))]
+fn theme_marks(names: &[String], active: &str) -> Vec<bool> {
+    names.iter().map(|n| n == active.trim()).collect()
+}
+
+/// Which of the skin `values` gets the check mark in the Skins submenu
+/// (`none` and spellings of no skin mark the "None" entry).
+#[cfg_attr(not(any(windows, target_os = "macos", test)), allow(dead_code))]
+fn skin_marks(values: &[&str], active: &str) -> Vec<bool> {
+    values.iter().map(|v| crate::skin::same_choice(active, v)).collect()
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -175,13 +193,17 @@ mod native {
                         self.skin_items.push((value.clone(), it));
                     }
                 }
+                let _ = self.skins.append(&PredefinedMenuItem::separator());
+                let _ = self.skins.append(&MenuItem::new("Going to or from None needs a restart", false, None));
                 self.built_for = Some(key);
             }
-            for (name, it) in &self.theme_items {
-                it.set_checked(name == active_theme.trim());
+            let names: Vec<String> = self.theme_items.iter().map(|(n, _)| n.clone()).collect();
+            for ((_, it), on) in self.theme_items.iter().zip(super::theme_marks(&names, active_theme)) {
+                it.set_checked(on);
             }
-            for (value, it) in &self.skin_items {
-                it.set_checked(skin::same_choice(active_skin, value));
+            let values: Vec<&str> = self.skin_items.iter().map(|(v, _)| v.as_str()).collect();
+            for ((_, it), on) in self.skin_items.iter().zip(super::skin_marks(&values, active_skin)) {
+                it.set_checked(on);
             }
         }
     }
@@ -299,6 +321,11 @@ mod native {
         const CMD: Modifiers = Modifiers::META;
 
         pub fn build() -> muda::Result<(Menu, Choices)> {
+            // Terminal windows are not tabbed: keep AppKit from adding "Show Tab
+            // Bar" and "Show All Tabs" to the View menu.
+            if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+                objc2_app_kit::NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
+            }
             let menu = Menu::new();
             let choices = Choices::new();
             let accel = |mods, code| Some(Accelerator::new(mods, code));
@@ -323,7 +350,7 @@ mod native {
                     &PredefinedMenuItem::hide_others(None),
                     &PredefinedMenuItem::show_all(None),
                     &PredefinedMenuItem::separator(),
-                    &PredefinedMenuItem::quit(None),
+                    &item("Quit grimalkin", &MenuAction::Quit, accel(CMD, Code::KeyQ)),
                 ],
             )?;
             let edit = Submenu::with_items(
@@ -371,6 +398,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn check_marks_follow_the_config() {
+        let themes: Vec<String> = ["default", "nord", "solarized-light"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(theme_marks(&themes, "nord"), [false, true, false]);
+        assert_eq!(theme_marks(&themes, " nord "), [false, true, false], "config values are trimmed");
+        assert_eq!(theme_marks(&themes, "missing"), [false, false, false], "an unknown theme marks nothing");
+
+        let skins = ["none", "grimalkin", "llama", "winamp:Cool Skin"];
+        assert_eq!(skin_marks(&skins, "llama"), [false, false, true, false]);
+        assert_eq!(skin_marks(&skins, "Llama"), [false, false, true, false], "case is ignored");
+        assert_eq!(skin_marks(&skins, "winamp:cool skin"), [false, false, false, true]);
+        for off in ["none", "", "  ", "None"] {
+            assert_eq!(skin_marks(&skins, off), [true, false, false, false], "{off:?} is no skin");
+        }
+    }
+
+    #[test]
     fn action_ids_round_trip() {
         let all = [
             MenuAction::OpenPreferences,
@@ -386,6 +429,7 @@ mod tests {
             MenuAction::RevealThemesFolder,
             MenuAction::RevealSkinsFolder,
             MenuAction::About,
+            MenuAction::Quit,
         ];
         for a in all {
             assert_eq!(MenuAction::from_id(&a.id()), Some(a));
