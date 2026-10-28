@@ -131,22 +131,82 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Parsed {
     Parsed::Run(opts)
 }
 
+/// Console output for the Windows release build, which is a GUI-subsystem
+/// executable and so starts with no console. Elsewhere this is a no-op.
+mod console {
+    #[cfg(windows)]
+    static ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Attach to the parent's console (if any) and point stdout/stderr at it
+    /// so `println!`/`eprintln!` are visible in PowerShell/cmd. Fails
+    /// harmlessly when launched from Explorer (no parent console).
+    #[cfg(windows)]
+    pub fn attach() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{
+            ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+        };
+        // SAFETY: plain Win32 console calls; the opened CONOUT$ file is
+        // leaked on purpose so the handle stays valid for the process.
+        unsafe {
+            if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+                return;
+            }
+            ATTACHED.store(true, std::sync::atomic::Ordering::Relaxed);
+            for std_handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                // Keep handles the parent redirected to a file or pipe.
+                let cur = GetStdHandle(std_handle);
+                if !cur.is_null() && cur != INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                if let Ok(f) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+                    SetStdHandle(std_handle, f.as_raw_handle());
+                    std::mem::forget(f);
+                }
+            }
+        }
+    }
+
+    /// The parent shell already drew its prompt, so end our output with a
+    /// newline when we wrote to its console.
+    #[cfg(windows)]
+    pub fn finish() {
+        if ATTACHED.load(std::sync::atomic::Ordering::Relaxed) {
+            println!();
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn attach() {}
+    #[cfg(not(windows))]
+    pub fn finish() {}
+
+    /// `process::exit` after `finish`.
+    pub fn exit(code: i32) -> ! {
+        finish();
+        std::process::exit(code)
+    }
+}
+
 fn main() {
+    console::attach();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,grimalkin=info")).init();
 
     let opts = match parse_args(std::env::args().skip(1)) {
         Parsed::Run(o) => o,
         Parsed::Info(s) => {
             print!("{s}");
+            console::finish();
             return;
         }
         Parsed::Error(e) => {
             eprintln!("grimalkin: {e}\n\n{USAGE}");
-            std::process::exit(2);
+            console::exit(2);
         }
     };
     if let Some(src) = &opts.install_skin {
-        std::process::exit(skin::winamp::install::run(src, opts.force));
+        console::exit(skin::winamp::install::run(src, opts.force));
     }
     let mut config = Config::load(opts.config_path.as_deref());
     if let Some(t) = &opts.theme {
@@ -171,7 +231,7 @@ fn main() {
     }
     if let Some(err) = app.fatal_error() {
         eprintln!("grimalkin: {err}");
-        std::process::exit(1);
+        console::exit(1);
     }
 }
 

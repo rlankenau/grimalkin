@@ -52,6 +52,12 @@ cargo run --release -p grimalkin -- [OPTIONS] [-e COMMAND [ARGS...]]
 
 The release binary is `target/release/grimalkin`.
 
+On Windows the release build is a GUI-subsystem executable, but it attaches to
+the parent console on start, so `--help`, `--list-themes`, `--list-skins`,
+`--install-skin` and error messages print in PowerShell/cmd (followed by a
+blank line, since the shell has already drawn its next prompt). Launched from
+Explorer there is no parent console and no console window appears.
+
 ## Configuration
 
 Every key is optional. Default location:
