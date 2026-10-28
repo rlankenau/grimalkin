@@ -61,7 +61,6 @@ pub enum UserEvent {
 }
 
 /// What a secondary window wants after handling an event.
-#[allow(dead_code)] // stage 2 (Preferences window) is the first implementer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecondaryFlow {
     Keep,
@@ -71,11 +70,19 @@ pub enum SecondaryFlow {
 
 /// A window besides the terminal: Preferences, About, ... The app routes its
 /// `WindowEvent`s here by `WindowId`; the terminal window keeps its own path.
-#[allow(dead_code)] // stage 2 (Preferences window) is the first implementer
 pub trait SecondaryWindow {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) -> SecondaryFlow;
-    /// Ask the window to repaint (also used to re-read the config after it changed).
+    /// Ask the window to repaint.
     fn request_redraw(&self);
+    /// The config file or a theme/skin directory changed (after the terminal
+    /// applied it): re-read whatever the window shows.
+    fn config_changed(&mut self);
+    /// When the window wants to be repainted without an event (a held-back
+    /// write, an animation). The app wakes the loop for it.
+    fn next_repaint(&self) -> Option<Instant>;
+    /// A menu-bar action while this window is the focused one (Cmd+C and
+    /// friends act on the focused window). Returns whether it was handled.
+    fn menu_action(&mut self, action: &MenuAction) -> bool;
     fn window(&self) -> &Window;
 }
 
@@ -103,6 +110,8 @@ pub struct App {
     running: Option<Running>,
     /// Windows other than the terminal, by id.
     secondary: HashMap<WindowId, Box<dyn SecondaryWindow>>,
+    /// The Preferences window, if open (there is at most one).
+    prefs_id: Option<WindowId>,
     /// Menu bar / context menu (built once the loop runs; main thread only).
     menus: Option<AppMenus>,
     fatal: Option<String>,
@@ -120,6 +129,7 @@ impl App {
             wake_pending: Arc::new(AtomicBool::new(false)),
             running: None,
             secondary: HashMap::new(),
+            prefs_id: None,
             menus: None,
             fatal: None,
             debug_cmds,
@@ -127,7 +137,6 @@ impl App {
     }
 
     /// Show a window besides the terminal: its events are routed to it.
-    #[allow(dead_code)] // stage 2 (Preferences window)
     pub fn add_secondary(&mut self, w: Box<dyn SecondaryWindow>) {
         self.secondary.insert(w.window().id(), w);
     }
@@ -167,14 +176,46 @@ impl App {
         });
     }
 
-    fn open_preferences(&mut self) {
-        log::info!("Preferences: not implemented yet (stage 2)");
+    /// Open the Preferences window, or bring the open one to the front.
+    fn open_preferences(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(id) = self.prefs_id {
+            if self.secondary.contains_key(&id) {
+                let w = self.secondary[&id].window();
+                if w.is_minimized() == Some(true) {
+                    w.set_minimized(false);
+                }
+                w.set_visible(true);
+                w.focus_window();
+                return;
+            }
+            self.prefs_id = None;
+        }
+        let anchor = self.running.as_ref().and_then(|r| Some((r.window.outer_position().ok()?, r.window.outer_size())));
+        let args = crate::prefs::OpenArgs { config_path: self.config_path(), proxy: self.proxy.clone(), anchor };
+        match crate::prefs::PreferencesWindow::open(event_loop, args) {
+            Ok(w) => {
+                self.prefs_id = Some(w.window().id());
+                self.add_secondary(Box::new(w));
+            }
+            Err(e) => log::error!("{e}"),
+        }
     }
 
-    fn menu_action(&mut self, action: MenuAction) {
+    fn menu_action(&mut self, event_loop: &ActiveEventLoop, action: MenuAction) {
         log::debug!("menu action {action:?}");
+        // Edit and View actions belong to the window that has the focus.
+        if matches!(
+            action,
+            MenuAction::Copy | MenuAction::Paste | MenuAction::ZoomIn | MenuAction::ZoomOut | MenuAction::ZoomReset
+        ) {
+            if let Some(w) = self.secondary.values_mut().find(|w| w.window().has_focus()) {
+                if w.menu_action(&action) {
+                    return;
+                }
+            }
+        }
         match action {
-            MenuAction::OpenPreferences => self.open_preferences(),
+            MenuAction::OpenPreferences => self.open_preferences(event_loop),
             MenuAction::SetTheme(name) => {
                 // An explicit pick beats the `--theme` launch option.
                 if let Some(r) = self.running.as_mut() {
@@ -209,6 +250,14 @@ impl App {
             }
             MenuAction::RevealThemesFolder => {
                 let Some(dir) = theme::user_dir() else { return };
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    log::error!("cannot create {}: {e}", dir.display());
+                    return;
+                }
+                open_in_os(&dir);
+            }
+            MenuAction::RevealSkinsFolder => {
+                let Some(dir) = skin::user_skin_dir() else { return };
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     log::error!("cannot create {}: {e}", dir.display());
                     return;
@@ -416,9 +465,12 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Debug(i) => self.debug_cmds.get(i).cloned(),
             _ => None,
         };
+        if cmd.as_deref() == Some("prefs") {
+            return self.open_preferences(event_loop);
+        }
         let event = match event {
-            UserEvent::OpenPreferences => return self.open_preferences(),
-            UserEvent::MenuAction(action) => return self.menu_action(action),
+            UserEvent::OpenPreferences => return self.open_preferences(event_loop),
+            UserEvent::MenuAction(action) => return self.menu_action(event_loop, action),
             e => e,
         };
         let Some(r) = self.running.as_mut() else { return };
@@ -440,8 +492,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(m) = self.menus.as_mut() {
                     m.sync(&r.cfg.theme, &r.cfg.skin);
                 }
-                for w in self.secondary.values() {
-                    w.request_redraw();
+                for w in self.secondary.values_mut() {
+                    w.config_changed();
                 }
             }
             UserEvent::OpenPreferences | UserEvent::MenuAction(_) => {}
@@ -513,8 +565,15 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(r) = self.running.as_mut() else { return };
-        let next = r.poll_timers(Instant::now());
+        let now = Instant::now();
+        let mut next = self.running.as_mut().and_then(|r| r.poll_timers(now));
+        for w in self.secondary.values() {
+            match w.next_repaint() {
+                Some(t) if t <= now => w.request_redraw(),
+                Some(t) => next = Some(next.map_or(t, |n| n.min(t))),
+                None => {}
+            }
+        }
         match next {
             Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -810,6 +869,26 @@ impl Running {
         let new = resolved.config;
         let old = std::mem::replace(&mut self.cfg, new);
         let new = &self.cfg;
+
+        if new.window.opacity != old.window.opacity {
+            self.renderer.set_opacity(new.window.opacity);
+            self.window.set_transparent(self.renderer.is_transparent());
+        }
+        if new.scrollback_lines != old.scrollback_lines {
+            self.term.set_scrollback_limit(new.scrollback_lines);
+            self.selection.clear();
+        }
+        #[cfg(target_os = "macos")]
+        if new.input.option_as_alt != old.input.option_as_alt {
+            use winit::platform::macos::{OptionAsAlt, WindowExtMacOS};
+            self.window.set_option_as_alt(if new.input.option_as_alt { OptionAsAlt::Both } else { OptionAsAlt::None });
+        }
+        // The configured title replaces the shown one only if a program has
+        // not set its own.
+        if new.window.title != old.window.title && self.title == old.window.title {
+            self.window.set_title(&new.window.title);
+            self.title = new.window.title.clone();
+        }
 
         let font_changed = new.font.family != old.font.family
             || new.font.line_height != old.font.line_height

@@ -57,6 +57,14 @@ impl Grid {
     pub fn scrollback_limit(&self) -> usize {
         self.scrollback_limit
     }
+    /// Change the history limit, dropping the oldest rows that no longer fit.
+    /// Returns how many rows were dropped.
+    pub fn set_scrollback_limit(&mut self, limit: usize) -> usize {
+        self.scrollback_limit = limit;
+        let excess = self.scrollback.len().saturating_sub(limit);
+        self.scrollback.drain(..excess);
+        excess
+    }
     /// Scrollback row by index, 0 = oldest.
     pub fn scrollback_row(&self, i: usize) -> Option<&Row> {
         self.scrollback.get(i)

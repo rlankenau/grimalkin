@@ -165,6 +165,25 @@ pub enum FrameStatus {
     Retry,
 }
 
+/// The composite alpha mode for an opaque or transparent surface, and whether
+/// the clear colour must be premultiplied.
+fn pick_alpha_mode(modes: &[wgpu::CompositeAlphaMode], transparent: bool) -> (wgpu::CompositeAlphaMode, bool) {
+    if transparent {
+        if modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+            (wgpu::CompositeAlphaMode::PreMultiplied, true)
+        } else if modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+            (wgpu::CompositeAlphaMode::PostMultiplied, false)
+        } else {
+            log::warn!("surface does not support transparency");
+            (wgpu::CompositeAlphaMode::Auto, true)
+        }
+    } else if modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+        (wgpu::CompositeAlphaMode::Opaque, true)
+    } else {
+        (wgpu::CompositeAlphaMode::Auto, true)
+    }
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -176,6 +195,10 @@ pub struct Renderer {
     dump_path: Option<std::path::PathBuf>,
     srgb_target: bool,
     premultiplied_clear: bool,
+    /// Alpha modes the surface supports, and whether a skin needs an alpha
+    /// surface regardless of the opacity (for `set_opacity`).
+    alpha_modes: Vec<wgpu::CompositeAlphaMode>,
+    skin_alpha: bool,
 
     rect_pipeline: wgpu::RenderPipeline,
     mask_pipeline: wgpu::RenderPipeline,
@@ -290,21 +313,9 @@ impl Renderer {
             .or_else(|| caps.formats.first().copied())
             .ok_or("surface has no supported formats")?;
         let srgb_target = format.is_srgb();
-        let transparent = cfg.window.opacity < 1.0 || (skin::needs_alpha_surface() && skin::is_active(&cfg.skin));
-        let (alpha_mode, premultiplied_clear) = if transparent {
-            if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
-                (wgpu::CompositeAlphaMode::PreMultiplied, true)
-            } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-                (wgpu::CompositeAlphaMode::PostMultiplied, false)
-            } else {
-                log::warn!("surface does not support transparency");
-                (wgpu::CompositeAlphaMode::Auto, true)
-            }
-        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-            (wgpu::CompositeAlphaMode::Opaque, true)
-        } else {
-            (wgpu::CompositeAlphaMode::Auto, true)
-        };
+        let skin_alpha = skin::needs_alpha_surface() && skin::is_active(&cfg.skin);
+        let transparent = cfg.window.opacity < 1.0 || skin_alpha;
+        let (alpha_mode, premultiplied_clear) = pick_alpha_mode(&caps.alpha_modes, transparent);
         let surface_config = wgpu::SurfaceConfiguration {
             usage: if std::env::var_os("GRIMALKIN_DUMP_FRAME").is_some()
                 && caps.usages.contains(wgpu::TextureUsages::COPY_SRC)
@@ -484,6 +495,8 @@ impl Renderer {
             dump_path: std::env::var_os("GRIMALKIN_DUMP_FRAME").map(std::path::PathBuf::from),
             srgb_target,
             premultiplied_clear,
+            alpha_modes: caps.alpha_modes.clone(),
+            skin_alpha,
             rect_pipeline,
             mask_pipeline,
             color_pipeline,
@@ -735,6 +748,29 @@ impl Renderer {
         self.families = families.to_vec();
         self.line_height = line_height;
         self.set_font_size(pt);
+    }
+
+    /// Change the background opacity at runtime. A window that started opaque
+    /// gets a transparent surface the first time the opacity drops below 1
+    /// (the caller must also make the OS window transparent, see
+    /// [`is_transparent`](Self::is_transparent)).
+    pub fn set_opacity(&mut self, opacity: f32) {
+        if (self.opacity - opacity).abs() < f32::EPSILON {
+            return;
+        }
+        self.opacity = opacity;
+        let (mode, premultiplied) = pick_alpha_mode(&self.alpha_modes, self.is_transparent());
+        self.premultiplied_clear = premultiplied;
+        if mode != self.surface_config.alpha_mode {
+            self.surface_config.alpha_mode = mode;
+            self.surface.configure(&self.device, &self.surface_config);
+        }
+        self.force_full = true;
+    }
+
+    /// Whether the window needs to be transparent for the current opacity (or skin).
+    pub fn is_transparent(&self) -> bool {
+        self.opacity < 1.0 || self.skin_alpha
     }
 
     /// Force every row to be regenerated on the next frame (selection or

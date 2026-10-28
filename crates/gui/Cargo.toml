@@ -50,3 +50,13 @@ objc2-app-kit = { version = "0.2", default-features = false, features = ["std", 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 muda = { version = "0.21", default-features = false }
 raw-window-handle = "0.6"
+
+# Preferences window (src/prefs): egui on its own wgpu device. egui-wgpu 0.35 is
+# the newest release that builds on Rust 1.92 (0.36+ needs 1.95) and it uses
+# wgpu 29, while the terminal renderer uses wgpu 30. The two majors coexist;
+# the Preferences window simply gets its own Instance/Device. `wgpu29` only
+# exists to switch on the backends egui-wgpu's default features would enable.
+egui = { version = "0.35", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.35", default-features = false, features = ["clipboard"] }
+egui-wgpu = { version = "0.35", default-features = false, features = ["winit"] }
+wgpu29 = { package = "wgpu", version = "29", default-features = false, features = ["std", "wgsl", "dx12", "vulkan", "metal"] }

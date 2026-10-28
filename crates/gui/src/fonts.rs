@@ -243,6 +243,19 @@ pub fn monospace_family_installed(name: &str) -> bool {
     mono(&db)
 }
 
+/// Family names of the installed monospaced fonts, sorted (the Preferences
+/// font picker). Loads every system font, so call it off the UI thread.
+pub fn monospace_families() -> Vec<String> {
+    let mut db = Database::new();
+    db.load_system_fonts();
+    let names: BTreeSet<String> = db
+        .faces()
+        .filter(|f| f.monospaced)
+        .filter_map(|f| f.families.first().map(|(n, _)| n.clone()))
+        .collect();
+    names.into_iter().collect()
+}
+
 fn locale_of_default() -> String {
     sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string())
 }

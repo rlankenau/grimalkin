@@ -27,6 +27,7 @@ pub enum MenuAction {
     Paste,
     OpenConfigFile,
     RevealThemesFolder,
+    RevealSkinsFolder,
     About,
 }
 
@@ -45,6 +46,7 @@ impl MenuAction {
             MenuAction::Paste => "paste".into(),
             MenuAction::OpenConfigFile => "open_config_file".into(),
             MenuAction::RevealThemesFolder => "reveal_themes_folder".into(),
+            MenuAction::RevealSkinsFolder => "reveal_skins_folder".into(),
             MenuAction::About => "about".into(),
         }
     }
@@ -68,6 +70,7 @@ impl MenuAction {
             "paste" => MenuAction::Paste,
             "open_config_file" => MenuAction::OpenConfigFile,
             "reveal_themes_folder" => MenuAction::RevealThemesFolder,
+            "reveal_skins_folder" => MenuAction::RevealSkinsFolder,
             "about" => MenuAction::About,
             _ => return None,
         })
@@ -260,6 +263,7 @@ mod native {
             &item("Settings\u{2026}", &MenuAction::OpenPreferences, None),
             &item("Open Config File", &MenuAction::OpenConfigFile, None),
             &item("Reveal Themes Folder", &MenuAction::RevealThemesFolder, None),
+            &item("Reveal Skins Folder", &MenuAction::RevealSkinsFolder, None),
         ])?;
         if !cfg!(target_os = "macos") {
             // The menu bar has the native About panel; elsewhere it is an item.
@@ -349,6 +353,7 @@ mod native {
                 &[
                     &item("Open Config File", &MenuAction::OpenConfigFile, None),
                     &item("Reveal Themes Folder", &MenuAction::RevealThemesFolder, None),
+                    &item("Reveal Skins Folder", &MenuAction::RevealSkinsFolder, None),
                 ],
             )?;
             let parts: [&dyn IsMenuItem; 5] = [&app, &edit, &view, &window, &help];
@@ -379,6 +384,7 @@ mod tests {
             MenuAction::Paste,
             MenuAction::OpenConfigFile,
             MenuAction::RevealThemesFolder,
+            MenuAction::RevealSkinsFolder,
             MenuAction::About,
         ];
         for a in all {

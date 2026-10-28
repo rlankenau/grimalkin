@@ -598,6 +598,14 @@ impl Terminal {
     pub fn scrollback_len(&self) -> usize {
         self.grid().scrollback_len()
     }
+    /// Change the scrollback limit of the main screen at runtime. Returns
+    /// true if history rows were dropped (absolute row numbers stay valid,
+    /// but the oldest ones no longer exist).
+    pub fn set_scrollback_limit(&mut self, limit: usize) -> bool {
+        let dropped = self.main.set_scrollback_limit(limit) > 0;
+        self.display_offset = self.display_offset.min(self.main.scrollback_len());
+        dropped
+    }
     /// Scroll the viewport; positive `delta` moves toward older history.
     /// Returns true if the offset changed.
     pub fn scroll_display(&mut self, delta: i32) -> bool {

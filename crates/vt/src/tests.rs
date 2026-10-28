@@ -419,6 +419,25 @@ fn scrollback_limit_and_abs_rows() {
 }
 
 #[test]
+fn scrollback_limit_changes_at_runtime() {
+    let mut t = Terminal::new(4, 2, 10);
+    for i in 0..8 {
+        feed(&mut t, &format!("l{}\r\n", i));
+    }
+    assert_eq!(t.scrollback_len(), 7);
+    t.scroll_display(7);
+    assert_eq!(t.display_offset(), 7);
+    assert!(t.set_scrollback_limit(3));
+    assert_eq!(t.scrollback_len(), 3);
+    assert_eq!(t.display_offset(), 3);
+    assert_eq!(t.oldest_abs_row(), 4);
+    assert_eq!(t.row_at_abs(4).unwrap().text(), "l4");
+    // Growing the limit drops nothing.
+    assert!(!t.set_scrollback_limit(100));
+    assert_eq!(t.scrollback_len(), 3);
+}
+
+#[test]
 fn zero_scrollback_keeps_counting() {
     let mut t = Terminal::new(4, 2, 0);
     feed(&mut t, "a\r\nb\r\nc\r\nd");

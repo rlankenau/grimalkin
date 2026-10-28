@@ -213,6 +213,21 @@ context menu (when the program is not using the mouse; Shift+right-click
 always). Windows keeps the skinned window chrome-free, so it has no menu bar.
 Linux has no menus yet.
 
+## Preferences
+
+Settings... (Cmd+, on macOS; Ctrl+, elsewhere; also in the right-click menu)
+opens a Preferences window with Appearance (theme with palette previews, skin,
+opacity, padding), Font (family, installed monospace fonts, size, line height),
+Cursor, Terminal (scrollback, shell, title, bell), and Advanced (graphics
+cursor, clipboard, install a WinAMP skin from a file or URL, open the config
+file and the themes/skins folders). Every control writes `grimalkin.toml`
+straight away, keeping your comments, and the running terminal applies it live
+(slider drags are written ten times a second at most). "Reset ... to defaults"
+removes that section's keys from the file. Escape or Cmd/Ctrl+W closes the
+window. The window is drawn with egui on its own GPU device (egui-wgpu 0.35
+needs wgpu 29; the terminal uses wgpu 30). Shell, graphics cursor and the
+Windows ConPTY mode only apply to a new launch.
+
 ## Key bindings
 
 "Mod" is Ctrl+Shift on Windows/Linux, and Cmd (or Ctrl+Shift) on macOS.

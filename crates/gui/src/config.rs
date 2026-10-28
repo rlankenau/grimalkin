@@ -531,6 +531,10 @@ mod tests {
     #[test]
     fn example_file_parses() {
         let text = include_str!("../../../docs/grimalkin.example.toml");
-        Config::from_toml(text).unwrap();
+        let c = Config::from_toml(text).unwrap();
+        // A config created from the example must not pin colours: any
+        // `[colors]` key beats the theme, which would make every theme
+        // switch (menu, Preferences) invisible.
+        assert_eq!(c.colors, ColorsConfig::default());
     }
 }

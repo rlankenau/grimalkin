@@ -33,7 +33,7 @@ fn invalid(msg: String) -> io::Error {
 impl ConfigEditor {
     /// Open the config at the default location, creating it from the
     /// embedded example if it does not exist yet.
-    #[allow(dead_code)] // stage 2 (Preferences window); the app uses `open_at`
+    #[allow(dead_code)] // the app and Preferences use `open_at` (explicit path)
     pub fn open() -> io::Result<Self> {
         let path = Config::default_path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config directory"))?;
         Self::open_at(&path)
@@ -109,7 +109,6 @@ impl ConfigEditor {
         Ok(())
     }
 
-    #[allow(dead_code)] // stage 2 (Preferences: "reset to default")
     /// Remove the key at a dotted path. Returns whether it existed.
     pub fn unset(&mut self, path: &str) -> bool {
         let keys: Vec<&str> = path.split('.').collect();

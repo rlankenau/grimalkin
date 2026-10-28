@@ -3,6 +3,7 @@
 //! Module map (each is meant to be extended independently):
 //! * `config`        TOML configuration; `config_edit` edits the file in place
 //! * `menu`          native menu bar (macOS) and context menu
+//! * `prefs`         the Preferences window (egui, second winit window)
 //! * `app`           window/event loop glue, pty + terminal ownership
 //! * `renderer`      wgpu renderer (grid instances, cursor); `glyphs` fonts/atlas;
 //!   `boxdraw` procedural box/block characters
@@ -29,6 +30,7 @@ mod input;
 mod links;
 mod menu;
 mod pointer;
+mod prefs;
 mod reload;
 mod renderer;
 mod selection;

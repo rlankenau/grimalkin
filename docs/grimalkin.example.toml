@@ -61,19 +61,20 @@ title = "grimalkin"
 # Follow window titles set by programs (OSC 0/2).
 dynamic_title = true
 
-# Per-key overrides applied on top of the theme. Everything is optional; the
-# values shown are those of the "default" theme.
+# Per-key overrides applied on top of the theme, so they are commented out
+# here: any key you set beats the theme's own colour. The values shown are
+# those of the "default" theme.
 [colors]
-foreground = "#dddddd"
-background = "#000000"
-cursor = "#cccccc"
-cursor_text = "#000000"            # text under a block cursor (default: background)
-selection_background = "#fffacd"   # alias: selection_bg
-selection_foreground = "#000000"   # alias: selection_fg
-url = "#0d73cc"                    # underline color of a hovered link (default: text color)
+# foreground = "#dddddd"
+# background = "#000000"
+# cursor = "#cccccc"
+# cursor_text = "#000000"            # text under a block cursor (default: background)
+# selection_background = "#fffacd"   # alias: selection_bg
+# selection_foreground = "#000000"   # alias: selection_fg
+# url = "#0d73cc"                    # underline color of a hovered link (default: text color)
 # The 16 ANSI colors, by name (or color0 .. color15):
 # black, red, green, yellow, blue, magenta, cyan, white, bright_black, ...
-red = "#cc0403"
+# red = "#cc0403"
 # or as a list: a shorter list overrides only the first entries.
 # ansi = ["#000000", "#cc0403", "#19cb00", "#cecb00", "#0d73cc", "#cb1ed1",
 #         "#0dcdcd", "#dddddd", "#767676", "#f2201f", "#23fd00", "#fffd00",
