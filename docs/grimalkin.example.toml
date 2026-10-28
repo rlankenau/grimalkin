@@ -33,6 +33,10 @@ rows = 35
 padding = 4.0
 # Background opacity: 1.0 is opaque, 0.0 fully transparent.
 opacity = 1.0
+# Title shown before the shell sets one (and always, if dynamic_title is false).
+title = "grimalkin"
+# Follow window titles set by programs (OSC 0/2).
+dynamic_title = true
 
 [colors]
 foreground = "#dddddd"

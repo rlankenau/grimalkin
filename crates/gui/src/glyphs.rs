@@ -9,8 +9,9 @@
 
 use std::collections::HashMap;
 
+use crate::fonts::Fonts;
 use cosmic_text::{
-    Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight, Wrap,
+    Attrs, Buffer, CacheKey, Family, Metrics, Shaping, Style, SwashCache, SwashContent, Weight, Wrap,
 };
 
 /// Which atlas a glyph lives in.
@@ -216,7 +217,7 @@ impl Atlas {
 // ---------------------------------------------------------------------------
 
 pub struct GlyphCache {
-    fs: FontSystem,
+    fonts: Fonts,
     swash: SwashCache,
     buffer: Buffer,
     families: Vec<String>,
@@ -242,15 +243,15 @@ struct ShapedGlyph {
 
 impl GlyphCache {
     pub fn new(gpu: &Gpu, max_texture_dim: u32, families: &[String], px_size: f32, line_height: f32) -> GlyphCache {
-        let mut fs = FontSystem::new();
-        let mut buffer = Buffer::new(&mut fs, Metrics::new(px_size, (px_size * 1.2).ceil()));
+        let mut fonts = Fonts::load(families);
+        let mut buffer = Buffer::new(&mut fonts.fs, Metrics::new(px_size, (px_size * 1.2).ceil()));
         buffer.set_wrap(Wrap::None);
         buffer.set_size(None, None);
         let max_dim = max_texture_dim.min(8192);
         let mask = Atlas::new(gpu.device, wgpu::TextureFormat::R8Unorm, 1, 1024, 512, max_dim);
         let color = Atlas::new(gpu.device, wgpu::TextureFormat::Rgba8Unorm, 4, 1024, 512, max_dim);
         let mut gc = GlyphCache {
-            fs,
+            fonts,
             swash: SwashCache::new(),
             buffer,
             families: families.to_vec(),
@@ -303,7 +304,7 @@ impl GlyphCache {
 
     /// The family names that exist in the font database, in config order.
     fn installed_families(&self) -> Vec<String> {
-        let db = self.fs.db();
+        let db = self.fonts.fs.db();
         self.families
             .iter()
             .filter(|want| {
@@ -335,7 +336,7 @@ impl GlyphCache {
         let mut strike_off = self.px_size * 0.3;
         let mut stroke = (self.px_size / 14.0).max(1.0);
         if let Some(id) = font_id {
-            if let Some(font) = self.fs.get_font(id, Weight::NORMAL) {
+            if let Some(font) = self.fonts.fs.get_font(id, Weight::NORMAL) {
                 let m = font.as_swash().metrics(&[]).scale(self.px_size);
                 ascent = m.ascent;
                 descent = m.descent;
@@ -373,7 +374,7 @@ impl GlyphCache {
     fn shape_with(&mut self, text: &str, attrs: &Attrs) -> Option<(Vec<ShapedGlyph>, Option<cosmic_text::fontdb::ID>)> {
         self.buffer.set_metrics(Metrics::new(self.px_size, (self.px_size * 1.2).ceil()));
         self.buffer.set_text(text, attrs, Shaping::Advanced, None);
-        self.buffer.shape_until_scroll(&mut self.fs, false);
+        self.buffer.shape_until_scroll(&mut self.fonts.fs, false);
         let mut out = Vec::new();
         let mut first = None;
         for run in self.buffer.layout_runs() {
@@ -401,6 +402,7 @@ impl GlyphCache {
         let fstyle = if style & STYLE_ITALIC != 0 { Style::Italic } else { Style::Normal };
         let installed = self.installed_families();
         let mut fallback: Option<Vec<ShapedGlyph>> = None;
+        let partial = self.fonts.is_partial();
         for name in &installed {
             let attrs = Attrs::new().family(Family::Name(name)).weight(weight).style(fstyle);
             let Some((glyphs, _)) = self.shape_with(text, &attrs) else { continue };
@@ -410,6 +412,7 @@ impl GlyphCache {
             let all_ok = glyphs.iter().all(|g| {
                 g.key.glyph_id != 0
                     && self
+                        .fonts
                         .fs
                         .db()
                         .face(g.key.font_id)
@@ -422,6 +425,12 @@ impl GlyphCache {
             if fallback.is_none() {
                 fallback = Some(glyphs);
             }
+        }
+        if partial {
+            // A glyph is missing from every configured family: load the
+            // complete system font set (emoji / CJK fallback) and retry.
+            self.fonts.upgrade();
+            return self.shape_cluster(text, style);
         }
         if let Some(f) = fallback {
             return f;
@@ -475,7 +484,7 @@ impl GlyphCache {
             if g.key.glyph_id == 0 && shaped.len() > 1 {
                 continue;
             }
-            let Some(img) = self.swash.get_image_uncached(&mut self.fs, g.key) else { continue };
+            let Some(img) = self.swash.get_image_uncached(&mut self.fonts.fs, g.key) else { continue };
             let pw = img.placement.width;
             let ph = img.placement.height;
             if pw == 0 || ph == 0 {

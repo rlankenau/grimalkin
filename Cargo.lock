@@ -847,6 +847,7 @@ dependencies = [
  "open",
  "pollster",
  "serde",
+ "sys-locale",
  "toml",
  "wgpu",
  "winit",

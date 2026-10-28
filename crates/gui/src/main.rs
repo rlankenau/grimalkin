@@ -15,6 +15,7 @@ mod app;
 mod bell;
 mod boxdraw;
 mod config;
+mod fonts;
 mod glyphs;
 mod graphics_glue;
 mod images;

@@ -18,7 +18,7 @@ core works, many conveniences are missing.
 - Kitty keyboard protocol (flag stack, query, key encoding)
 - Selection, clipboard copy/paste, clickable OSC 8 hyperlinks, visual bell
   (optional audible), cursor shapes/blink, runtime zoom
-- TOML config: fonts, colors, window size/padding/opacity, cursor, bell, OSC 52
+- TOML config: fonts, colors, window size/padding/opacity/title, cursor, bell, OSC 52
 
 Not done: no tabs or splits, no ligatures, no IME, no `U=1` unicode
 placeholders, no animation frames (`a=f`).
@@ -68,6 +68,8 @@ size = 13.0
 cols = 120
 rows = 35
 opacity = 0.95
+title = "grimalkin"      # shown until the shell sets one
+dynamic_title = true     # false: ignore OSC 0/2 titles
 
 [colors]
 background = "#101014"
@@ -112,6 +114,12 @@ drives `kitten icat` through several scenarios (basic, place, alpha, big,
 scroll, clear, zindex, altscreen) and captures frames. `MODE=dump` (default) is
 offscreen; `MODE=screen` captures the real window. `scripts/kitty-send.py` is a
 raw protocol sender.
+
+Startup font loading: the first run scans all system fonts and writes an index
+(`fonts.cache` under the user cache dir, e.g. `%LOCALAPPDATA%\\grimalkin` on Windows). Later runs
+load only the configured families from the index and build the full set (emoji/CJK
+fallback) on a background thread. Set `GRIMALKIN_EXIT_AFTER_FRAME=1` to quit after the
+first frame (for timing).
 
 Set `GRIMALKIN_DUMP_FRAME=/path/frame.png` to render offscreen and write each
 frame to that PNG (useful over ssh or with a locked screen).

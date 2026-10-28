@@ -114,6 +114,11 @@ pub struct WindowConfig {
     pub padding: f32,
     /// Background opacity, 0.0 (transparent) to 1.0 (opaque).
     pub opacity: f32,
+    /// Window title shown until (or instead of) a program sets one.
+    pub title: String,
+    /// Follow titles set by programs (OSC 0/2). When false they are ignored
+    /// and `title` is always shown.
+    pub dynamic_title: bool,
 }
 
 impl Default for WindowConfig {
@@ -123,6 +128,8 @@ impl Default for WindowConfig {
             rows: 35,
             padding: 4.0,
             opacity: 1.0,
+            title: "grimalkin".to_string(),
+            dynamic_title: true,
         }
     }
 }

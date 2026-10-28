@@ -80,7 +80,7 @@ impl App {
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<Running, String> {
         let cfg = &self.cfg;
         let mut attrs = Window::default_attributes()
-            .with_title("grimalkin")
+            .with_title(cfg.window.title.as_str())
             .with_inner_size(LogicalSize::new(900.0, 600.0))
             .with_visible(false);
         if cfg.window.opacity < 1.0 {
@@ -363,7 +363,11 @@ impl Running {
         need_redraw |= self.gfx.take_dirty();
         for ev in events {
             match ev {
-                TermEvent::Title(t) => self.window.set_title(if t.is_empty() { "grimalkin" } else { &t }),
+                TermEvent::Title(t) => {
+                    if self.cfg.window.dynamic_title {
+                        self.window.set_title(if t.is_empty() { &self.cfg.window.title } else { &t });
+                    }
+                }
                 TermEvent::Bell => {
                     if !self.focused {
                         self.window.request_user_attention(Some(UserAttentionType::Informational));
@@ -553,6 +557,10 @@ impl Running {
         }
         if matches!(status, FrameStatus::Presented | FrameStatus::Occluded) {
             self.retries = 0;
+            // Benchmark aid: quit once the first frame is on screen.
+            if std::env::var_os("GRIMALKIN_EXIT_AFTER_FRAME").is_some() {
+                self.exit_requested = true;
+            }
         }
         if !self.shown {
             self.shown = true;
