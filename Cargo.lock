@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "grimalkin"
-version = "1.0.0-rc1"
+version = "1.0.0-rc2"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "grimalkin-graphics"
-version = "1.0.0-rc1"
+version = "1.0.0-rc2"
 dependencies = [
  "crossterm",
  "flate2",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "grimalkin-launcher"
-version = "1.0.0-rc1"
+version = "1.0.0-rc2"
 dependencies = [
  "windows-sys 0.61.2",
  "winresource",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "grimalkin-pty"
-version = "1.0.0-rc1"
+version = "1.0.0-rc2"
 dependencies = [
  "libc",
  "log",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "grimalkin-vt"
-version = "1.0.0-rc1"
+version = "1.0.0-rc2"
 dependencies = [
  "unicode-segmentation",
  "unicode-width",
