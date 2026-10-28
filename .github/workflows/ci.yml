@@ -56,3 +56,48 @@ jobs:
           files: |
             dist/grimalkin.exe
             dist/grimalkin.com
+
+  macos-bundle:
+    name: macos bundle (${{ matrix.arch }})
+    runs-on: macos-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest is Apple Silicon: arm64 is a native build, x86_64 is
+          # cross-compiled with the extra rust target (same runner, cheap).
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build app bundle and dmg
+        run: scripts/make-app-bundle.sh --target ${{ matrix.target }}
+      - name: Check the dmg
+        run: |
+          set -euo pipefail
+          dmg=$(ls dist/grimalkin-*-macos-${{ matrix.arch }}.dmg)
+          hdiutil attach -readonly -nobrowse -mountpoint /tmp/grimalkin-dmg "$dmg"
+          ls -la /tmp/grimalkin-dmg
+          test -x /tmp/grimalkin-dmg/grimalkin.app/Contents/MacOS/grimalkin
+          test -L /tmp/grimalkin-dmg/Applications
+          codesign --verify --deep --strict /tmp/grimalkin-dmg/grimalkin.app
+          lipo -archs /tmp/grimalkin-dmg/grimalkin.app/Contents/MacOS/grimalkin
+          hdiutil detach /tmp/grimalkin-dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grimalkin-macos-${{ matrix.arch }}
+          path: dist/grimalkin-*-macos-${{ matrix.arch }}.dmg
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/grimalkin-*-macos-${{ matrix.arch }}.dmg

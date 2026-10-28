@@ -80,6 +80,25 @@ When building yourself: `cargo build --release -p grimalkin -p grimalkin-launche
 then copy `target/release/grimalkin-launcher.exe` to `grimalkin.com` beside
 `grimalkin.exe`.
 
+## Installing on macOS
+
+Download `grimalkin-<version>-macos-arm64.dmg` (Apple Silicon) or
+`grimalkin-<version>-macos-x86_64.dmg` (Intel) from the latest release or the
+CI artifacts, open it and drag `grimalkin.app` onto the Applications shortcut.
+
+The app is ad-hoc signed but not notarized (there is no Apple Developer ID
+behind it), so Gatekeeper blocks the first launch. Either right-click the app
+in Applications, choose Open, then Open again in the dialog (once is enough),
+or clear the quarantine flag from a terminal:
+
+```
+xattr -d com.apple.quarantine /Applications/grimalkin.app
+```
+
+When started from Finder the shell opens in your home directory. To build the
+app and dmg yourself run `scripts/make-app-bundle.sh` (output in `dist/`;
+options `--target`, `--binary`, `--no-dmg`).
+
 ## Configuration
 
 Every key is optional. Default location:
