@@ -19,6 +19,7 @@ core works, many conveniences are missing.
 - Selection, clipboard copy/paste, clickable OSC 8 hyperlinks, visual bell
   (optional audible), cursor shapes/blink, runtime zoom
 - Themes (TOML or kitty `.conf`) with live config reload; TOML config: fonts, colors, window size/padding/opacity/title, cursor, bell, OSC 52
+- Skins: undecorated, non-rectangular WinAMP-style windows (`--skin llama|grimalkin|mint`, or your own; see docs/SKINS.md)
 
 Not done: no tabs or splits, no ligatures, no IME, no `U=1` unicode
 placeholders, no animation frames (`a=f`).
@@ -42,6 +43,7 @@ cargo run --release -p grimalkin -- [OPTIONS] [-e COMMAND [ARGS...]]
 | `-e`, `--command CMD [ARGS...]` | Run CMD instead of the shell (consumes the remaining arguments) |
 | `--config PATH` | Use this config file |
 | `--working-directory DIR` | Start in DIR |
+| `--skin NAME` | Use a window skin (llama, grimalkin, mint, or a path; `none` = normal window) |
 | `--theme NAME` | Use this color theme (overrides `theme` in the config) |
 | `--list-themes` | List built-in and user themes, then exit |
 | `-h`, `--help` / `-V`, `--version` | Help / version |

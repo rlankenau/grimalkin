@@ -10,7 +10,8 @@ scrollback_lines = 10000
 # Window skin: an undecorated, possibly non-rectangular window drawn from
 # bitmaps (see docs/SKINS.md). A skin name (looked up in the "skins" folder
 # next to this file, then the built-ins), a path to a skin folder, or "none"
-# for the normal OS window. `grimalkin --skin NAME` overrides it.
+# for the normal OS window. Built-ins: llama, grimalkin, mint (and debug).
+# `grimalkin --skin NAME` overrides it.
 skin = "none"
 
 # Program to run in the terminal. Empty means your default shell ($SHELL on

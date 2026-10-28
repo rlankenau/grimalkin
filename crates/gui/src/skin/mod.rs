@@ -517,6 +517,26 @@ mod tests {
     }
 
     #[test]
+    fn all_builtin_skins_load_and_are_consistent() {
+        for want in ["debug", "llama", "grimalkin", "mint"] {
+            assert!(builtin_names().contains(&want), "{want} is not embedded");
+        }
+        for name in builtin_names() {
+            let s = Skin::load_from(name, None).unwrap_or_else(|e| panic!("skin {name}: {e}"));
+            let f = &s.def.frame;
+            assert!(s.frame1.w > 0 && s.frame1.h > 0, "{name}: empty frame");
+            // The terminal viewport must be a positive area inside the frame.
+            let (iw, ih) = (f.viewport_inset.left + f.viewport_inset.right, f.viewport_inset.top + f.viewport_inset.bottom);
+            assert!(iw < s.frame1.w && ih < s.frame1.h, "{name}: viewport inset exceeds frame");
+            assert!(s.sheet.is_some(), "{name}: buttons.png missing");
+            assert!(s.shade_img.is_some(), "{name}: shade.png missing");
+            // A runtime must build and lay out at a typical window size.
+            let rt = SkinRuntime::new(Arc::new(s), (1000, 640), 1);
+            assert!(rt.layout.viewport.w > 0 && rt.layout.viewport.h > 0, "{name}: empty viewport");
+        }
+    }
+
+    #[test]
     fn unknown_and_bad_names_fail() {
         assert!(Skin::load_from("no-such-skin", None).is_err());
         assert!(Skin::load_from("", None).is_err());

@@ -1350,3 +1350,35 @@ impl Running {
         }
     }
 }
+
+#[cfg(test)]
+mod skin_palette_tests {
+    use super::*;
+    use crate::config::Rgb;
+
+    fn palette(cfg: &Config, skin: &Skin) -> theme::Palette {
+        skin_palette(theme::resolve_in(cfg, None).palette, cfg, Some(skin))
+    }
+
+    #[test]
+    fn skin_background_yields_to_theme_and_user_colors() {
+        let skin = Skin::load_from("grimalkin", None).expect("built-in skin");
+        let want = skin.def.frame.viewport_background.expect("grimalkin sets a viewport background");
+
+        // No theme and no [colors] background: the skin's viewport colour.
+        let mut cfg = Config::default();
+        assert_eq!(palette(&cfg, &skin).background, want);
+        // No skin: the theme's own background.
+        let plain = skin_palette(theme::resolve_in(&cfg, None).palette, &cfg, None);
+        assert_ne!(plain.background, want);
+
+        // An explicit theme wins over the skin.
+        cfg.theme = "dracula".into();
+        assert_ne!(palette(&cfg, &skin).background, want);
+
+        // So does an explicit [colors] background.
+        let mut cfg = Config::default();
+        cfg.colors.background = Some(Rgb(1, 2, 3));
+        assert_eq!(palette(&cfg, &skin).background, Rgb(1, 2, 3));
+    }
+}
