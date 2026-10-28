@@ -1,0 +1,10 @@
+[package]
+name = "grimalkin-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin PTY (ConPTY / forkpty) wrapper for the grimalkin terminal emulator"
+
+[dependencies]
+portable-pty = "0.9"

@@ -1,0 +1,12 @@
+[package]
+name = "grimalkin-vt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal state machine for grimalkin (no I/O, no GUI)"
+
+[dependencies]
+vte = "0.15"
+unicode-width = "0.2"
+unicode-segmentation = "1.12"
