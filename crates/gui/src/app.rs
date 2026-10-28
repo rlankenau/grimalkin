@@ -372,7 +372,7 @@ impl App {
             passthrough: cfg.pty.passthrough_enabled(),
             cmd,
             args,
-            cwd: self.launch.working_directory.clone(),
+            cwd: default_cwd(self.launch.working_directory.clone()),
             env: crate::terminfo::child_env(),
             cols: cols as u16,
             rows: rows as u16,
@@ -1860,5 +1860,46 @@ mod skin_palette_tests {
         let mut cfg = Config::default();
         cfg.colors.background = Some(Rgb(1, 2, 3));
         assert_eq!(palette(&cfg, &skin).background, Rgb(1, 2, 3));
+    }
+}
+
+/// The directory the shell starts in. An explicit `--working-directory` wins.
+/// Otherwise the inherited cwd is kept, except when it is the filesystem root:
+/// that is what a macOS app launched from Finder/Dock/`open` gets (launchd
+/// starts it in `/`), and a terminal that opens in `/` is never what anyone
+/// wants, so fall back to the home directory.
+fn default_cwd(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    pick_cwd(explicit, std::env::current_dir().ok(), dirs::home_dir())
+}
+
+fn pick_cwd(explicit: Option<PathBuf>, current: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    match current {
+        Some(c) if c.parent().is_none() => home.or(Some(c)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::pick_cwd;
+    use std::path::PathBuf;
+
+    fn p(s: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(s))
+    }
+
+    #[test]
+    fn root_cwd_falls_back_to_home() {
+        assert_eq!(pick_cwd(None, p("/"), p("/Users/me")), p("/Users/me"));
+    }
+
+    #[test]
+    fn explicit_wins_and_normal_cwd_is_kept() {
+        assert_eq!(pick_cwd(p("/tmp"), p("/"), p("/Users/me")), p("/tmp"));
+        assert_eq!(pick_cwd(None, p("/work"), p("/Users/me")), None);
+        assert_eq!(pick_cwd(None, p("/"), None), p("/"));
     }
 }

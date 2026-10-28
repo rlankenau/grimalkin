@@ -1,5 +1,6 @@
 /target
 **/*.rs.bk
 .DS_Store
-/dist
+# Installer / bundle output
+/dist/
 /installer-out

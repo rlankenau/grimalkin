@@ -11,9 +11,9 @@
 ;   README.md, LICENSE, LICENSE-MIT, LICENSE-APACHE
 ; Output: <repo>\installer-out\grimalkin-setup-x64.exe
 ;
-; The setup/wizard icon is <repo>\assets\icon\grimalkin.ico. That file is added
-; by a separate branch; until it exists the build simply falls back to Inno's
-; default icon (see HaveIcon below), so this script builds either way.
+; The setup/wizard icon is <repo>\assets\icon\grimalkin.ico. If that file is
+; ever missing the build falls back to Inno's default icon (see HaveIcon
+; below), so this script builds either way.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
