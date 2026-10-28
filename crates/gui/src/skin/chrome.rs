@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-use super::hit::{ButtonKind, Layout};
+use super::hit::{ButtonKind, Layout, Patch, SliceSpec};
 use super::parse::Align;
 use super::{Image, Skin, TexId};
 use crate::glyphs::{GlyphCache, GlyphQuad, Gpu};
@@ -132,6 +132,16 @@ fn make_bind(
             },
         ],
     })
+}
+
+/// The frame patches to draw. The centre patch is the terminal viewport (the
+/// grid draws there), so it is left out, except for a shade bar: that has no
+/// viewport, and its middle band is real artwork.
+fn frame_patches(spec: &SliceSpec, win: (u32, u32), k: i32, shaded: bool) -> Vec<Patch> {
+    spec.patches(win.0 as i32, win.1 as i32, k)
+        .into_iter()
+        .filter(|p| shaded || !p.centre)
+        .collect()
 }
 
 impl Chrome {
@@ -284,10 +294,7 @@ impl Chrome {
         // Frame.
         let (spec, tex, k) = skin.frame_spec(view.shaded, scale);
         let start = self.insts.len();
-        for p in spec.patches(win.0 as i32, win.1 as i32, k) {
-            if p.centre {
-                continue;
-            }
+        for p in frame_patches(&spec, win, k, view.shaded) {
             self.insts.push(ChromeInst {
                 dst: [p.dst[0] as f32, p.dst[1] as f32, p.dst[2] as f32, p.dst[3] as f32],
                 src: [p.src[0] as f32, p.src[1] as f32, p.src[2] as f32, p.src[3] as f32],
@@ -445,6 +452,25 @@ impl Chrome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shade_bar_is_fully_covered_and_the_frame_keeps_a_hole() {
+        for name in super::super::builtin_names() {
+            let skin = Skin::load_from(name, None).unwrap();
+            for scale in [1u32, 2] {
+                let (spec, _, k) = skin.frame_spec(true, scale);
+                let (w, h) = (700u32, skin.shade_height() * scale);
+                let area: i64 = frame_patches(&spec, (w, h), k, true).iter().map(|p| p.dst[2] as i64 * p.dst[3] as i64).sum();
+                assert_eq!(area, (w * h) as i64, "{name} @{scale}x: the shade bar must be drawn edge to edge");
+                // The normal frame leaves the viewport to the terminal.
+                let (spec, _, k) = skin.frame_spec(false, scale);
+                let (w, h) = (900u32, 600u32);
+                let frame: i64 = frame_patches(&spec, (w, h), k, false).iter().map(|p| p.dst[2] as i64 * p.dst[3] as i64).sum();
+                let vp = Layout::new(&skin.def, w, h, scale, false, true).viewport;
+                assert_eq!(frame, (w * h) as i64 - (vp.w * vp.h) as i64, "{name} @{scale}x");
+            }
+        }
+    }
 
     #[test]
     fn instance_layout_matches_the_vertex_attributes() {

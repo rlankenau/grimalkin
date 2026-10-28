@@ -47,6 +47,8 @@ pub enum UserEvent {
     Redraw,
     /// The config file or a user theme changed on disk (debounced).
     ConfigChanged,
+    /// Step `n` of the `GRIMALKIN_DEBUG_SCRIPT` test script.
+    Debug(usize),
 }
 
 /// Max bytes of pty output processed per wake so input and redraws stay
@@ -64,10 +66,13 @@ pub struct App {
     wake_pending: Arc<AtomicBool>,
     running: Option<Running>,
     fatal: Option<String>,
+    /// `GRIMALKIN_DEBUG_SCRIPT` commands (empty normally).
+    debug_cmds: Vec<String>,
 }
 
 impl App {
     pub fn new(cfg: Config, launch: LaunchOptions, proxy: EventLoopProxy<UserEvent>) -> App {
+        let debug_cmds = crate::debug_script::start(&proxy);
         App {
             cfg,
             launch,
@@ -75,6 +80,7 @@ impl App {
             wake_pending: Arc::new(AtomicBool::new(false)),
             running: None,
             fatal: None,
+            debug_cmds,
         }
     }
 
@@ -220,6 +226,7 @@ impl App {
             reload: ReloadCtx {
                 path: self.launch.config_path.clone(),
                 theme_override: self.launch.theme.clone(),
+                skin_override: self.launch.skin.clone(),
                 _watcher: {
                     let proxy = self.proxy.clone();
                     reload::watch(self.launch.config_path.as_deref(), move || {
@@ -255,8 +262,17 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        let cmd = match event {
+            UserEvent::Debug(i) => self.debug_cmds.get(i).cloned(),
+            _ => None,
+        };
         let Some(r) = self.running.as_mut() else { return };
         match event {
+            UserEvent::Debug(_) => {
+                if let Some(c) = cmd {
+                    r.debug_command(&c);
+                }
+            }
             UserEvent::PtyWake => r.on_pty_wake(),
             UserEvent::Redraw => r.window.request_redraw(),
             UserEvent::ConfigChanged => r.reload_config(),
@@ -283,7 +299,7 @@ impl ApplicationHandler<UserEvent> for App {
                 r.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                r.renderer.set_scale_factor(scale_factor, r.cfg.window.padding);
+                r.renderer.set_scale_factor(crate::debug_script::effective_scale(scale_factor), r.cfg.window.padding);
                 let s = r.window.inner_size();
                 if s.width > 0 && s.height > 0 {
                     r.renderer.resize(s.width, s.height);
@@ -602,6 +618,10 @@ impl Running {
         if let Some(t) = &self.reload.theme_override {
             raw.theme = t.clone();
         }
+        if let Some(s) = &self.reload.skin_override {
+            raw.skin = s.clone();
+        }
+        self.swap_skin(&raw.skin);
         let resolved = theme::resolve(&raw);
         log::info!("config reloaded (theme: {})", resolved.name);
         let skin = self.skin.as_ref().map(|r| r.skin.clone());
@@ -622,7 +642,7 @@ impl Running {
             self.renderer.set_font(&new.font.family, pt, new.font.line_height);
         }
         if padding_changed {
-            self.renderer.set_scale_factor(self.window.scale_factor(), new.window.padding);
+            self.renderer.set_scale_factor(crate::debug_script::effective_scale(self.window.scale_factor()), new.window.padding);
         }
         if font_changed || padding_changed {
             let s = self.window.inner_size();
@@ -633,6 +653,45 @@ impl Running {
         }
         self.renderer.invalidate();
         self.window.request_redraw();
+    }
+
+    /// Hot-swap the window skin on a config reload: a different skin name, or
+    /// any skin loaded from a user directory (so its files can be edited live).
+    /// Going between "no skin" and a skin needs a different window (decorations,
+    /// surface alpha) and waits for the next launch.
+    fn swap_skin(&mut self, name: &str) {
+        let wanted = skin::is_active(name);
+        let Some(cur) = self.skin.as_ref() else {
+            if wanted {
+                log::info!("skin {name:?} applies on the next launch (this window has no skin)");
+            }
+            return;
+        };
+        if !wanted {
+            log::info!("skin \"none\" applies on the next launch");
+            return;
+        }
+        if name == self.cfg.skin && cur.skin.origin.starts_with("built-in") {
+            return;
+        }
+        if cur.shaded() {
+            log::info!("skin change deferred: restore the shaded window first");
+            return;
+        }
+        let new = match Skin::load(name) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                log::error!("cannot load skin {name:?}, keeping the current one: {e}");
+                return;
+            }
+        };
+        self.renderer.set_skin(Some(new.clone()));
+        let size = self.window.inner_size();
+        self.skin = Some(SkinRuntime::new(new, (size.width, size.height), self.renderer.skin_scale()));
+        self.renderer.resize(size.width.max(1), size.height.max(1));
+        self.apply_grid_resize();
+        self.update_skin_min_size();
+        self.skin_geometry_changed();
     }
 
     fn zoom(&mut self, op: ZoomOp) {
@@ -949,6 +1008,61 @@ impl Running {
             })
             .collect();
         self.paste_text(&format!("{quoted} "));
+    }
+
+    // -- test hooks ----------------------------------------------------------
+
+    /// One command of `GRIMALKIN_DEBUG_SCRIPT` (see `debug_script`): runs
+    /// through the same handlers real input uses.
+    fn debug_command(&mut self, cmd: &str) {
+        log::info!("debug script: {cmd}");
+        let (name, arg) = cmd.split_once(':').unwrap_or((cmd, ""));
+        let button_centre = |me: &Self, name: &str| {
+            let kind = match name {
+                "close" => skin::hit::ButtonKind::Close,
+                "minimize" => skin::hit::ButtonKind::Minimize,
+                "maximize" => skin::hit::ButtonKind::Maximize,
+                _ => skin::hit::ButtonKind::Shade,
+            };
+            let r = me.skin.as_ref()?.layout.button_rect(kind)?;
+            Some((r.x as f64 + r.w as f64 / 2.0, r.y as f64 + r.h as f64 / 2.0))
+        };
+        match name {
+            "move" => {
+                if let Some((x, y)) = arg.split_once(',').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))) {
+                    self.on_cursor_moved(x, y);
+                }
+            }
+            "hover" | "press" => {
+                if let Some((x, y)) = button_centre(self, arg) {
+                    self.on_cursor_moved(x, y);
+                    if name == "press" {
+                        self.on_mouse_button(ElementState::Pressed, MouseButton::Left);
+                    }
+                }
+            }
+            "down" => self.on_mouse_button(ElementState::Pressed, MouseButton::Left),
+            "up" => self.on_mouse_button(ElementState::Released, MouseButton::Left),
+            "click" | "dblclick" => {
+                for _ in 0..if name == "click" { 1 } else { 2 } {
+                    self.on_mouse_button(ElementState::Pressed, MouseButton::Left);
+                    self.on_mouse_button(ElementState::Released, MouseButton::Left);
+                }
+            }
+            "shade" => self.run_skin_action(Action::ToggleShade),
+            "size" => {
+                if let Some((w, h)) = arg.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))) {
+                    if let Some(size) = self.window.request_inner_size(PhysicalSize::new(w, h)) {
+                        self.renderer.resize(size.width, size.height);
+                        self.apply_grid_resize();
+                        self.skin_geometry_changed();
+                        self.window.request_redraw();
+                    }
+                }
+            }
+            "exit" => self.exit_requested = true,
+            _ => log::warn!("debug script: unknown command {cmd:?}"),
+        }
     }
 
     // -- skin --------------------------------------------------------------

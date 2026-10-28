@@ -201,3 +201,16 @@ Details the format above leaves open, for skin authors:
   the only thing drawn there; terminal content is confined to the viewport.
 * **macOS**: winit has no `drag_resize_window`, so edge/grip resizing is done
   by hand from pointer motion there.
+
+## Testing hooks
+
+Environment variables for frame dumps and automation (`crates/gui/src/debug_script.rs`):
+
+* `GRIMALKIN_SCALE_FACTOR=2` pretends the display scale is 2 (HiDPI chrome checks on a 1x screen).
+* `GRIMALKIN_DEBUG_SCRIPT="1500:hover:close;800:shade;1000:size:900x500"`
+  runs `delay-ms:command` steps through the real input handlers: `move:X,Y`,
+  `hover:BUTTON`, `press:BUTTON`, `down`, `up`, `click`, `dblclick`, `shade`,
+  `size:WxH`, `exit`. Combine with `GRIMALKIN_DUMP_FRAME` to inspect each state.
+* Hot reload: between two skins the window is re-skinned live (a skin read from
+  a user directory is re-read on every change under `skins/`); going between
+  "no skin" and a skin applies on the next launch.

@@ -88,6 +88,36 @@ blink = true
 option_as_alt = true   # macOS
 ```
 
+## Skins & themes
+
+Two independent layers, like the media players of the late 90s: a **theme**
+recolours the terminal, a **skin** replaces the window frame with bitmap
+artwork, including non-rectangular shapes (WinAMP style).
+
+| llama | grimalkin | mint |
+|:-:|:-:|:-:|
+| ![llama](crates/gui/assets/skins/llama/preview.png) | ![grimalkin](crates/gui/assets/skins/grimalkin/preview.png) | ![mint](crates/gui/assets/skins/mint/preview.png) |
+
+```toml
+skin  = "llama"        # llama | grimalkin | mint | a folder of your own | "none"
+theme = "dracula"
+```
+
+`grimalkin --skin grimalkin --theme nord` does the same from the command line.
+A skinned window has no OS title bar: drag the title bar or the frame to move,
+the edges and the corner grip to resize, double-click the title bar for the
+skin's action (usually *windowshade*: the window collapses to its title bar
+and restores on the next double-click or shade button). Pixels outside the
+artwork's shape are transparent and click through.
+
+A skin is a folder with `skin.toml`, `frame.png` (9-slice), `buttons.png` and
+optionally `shade.png` and `frame@2x.png`; put yours in
+`<config dir>/grimalkin/skins/NAME/`. The format is documented in
+[docs/SKINS.md](docs/SKINS.md), and `scripts/gen-skins.py` shows how the
+built-in skins are drawn. On a skinned window the grid starts at the skin's
+viewport inset plus `[window] padding`; the skin's `viewport_background` is the
+terminal background unless you chose a theme or `[colors] background`.
+
 ### Themes and live reload
 
 `theme = "NAME"` (or `--theme NAME`) selects a color theme: colors, optional
@@ -107,10 +137,12 @@ Your own themes go in `<config dir>/grimalkin/themes/` (the directory that holds
 
 The `[colors]` table of `grimalkin.toml` overrides the theme key by key.
 
-The config file and the themes directory are watched. Saving either re-applies
-the theme, colors, cursor and font (family, size, line height) in the running
-window, with no restart. A file with a syntax error is reported in the log and
-the running settings are kept. (`--theme` keeps winning over the file.)
+The config directory (config file, `themes/`, `skins/`) is watched. Saving a
+file re-applies the theme, colors, cursor, font and, between two skins, the
+window skin in the running window, with no restart (switching between a skin
+and a normal window needs a restart). A file with a syntax error is reported
+in the log and the running settings are kept. (`--theme` and `--skin` keep
+winning over the file.)
 
 ## Key bindings
 

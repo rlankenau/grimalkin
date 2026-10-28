@@ -256,7 +256,7 @@ fn srgb_to_linear(c: f64) -> f64 {
 impl Renderer {
     pub fn new(window: Arc<Window>, cfg: &Config) -> Result<Renderer, String> {
         let size = window.inner_size();
-        let scale = window.scale_factor();
+        let scale = crate::debug_script::effective_scale(window.scale_factor());
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance

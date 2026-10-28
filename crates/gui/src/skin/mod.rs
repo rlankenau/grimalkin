@@ -629,6 +629,44 @@ mod tests {
     }
 
     #[test]
+    fn builtin_skins_shade_and_unshade_from_the_bar() {
+        for name in builtin_names() {
+            for scale in [1u32, 2] {
+                let skin = Arc::new(Skin::load_from(name, None).unwrap());
+                let bar = skin.shade_height() * scale;
+                let mut rt = SkinRuntime::new(skin.clone(), (900, 600), scale);
+                // Click the shade button in the full window: the app shades.
+                let b = rt.layout.button_rect(ButtonKind::Shade).unwrap_or_else(|| panic!("{name}: no shade button"));
+                let (x, y) = (b.x as f64 + b.w as f64 / 2.0, b.y as f64 + b.h as f64 / 2.0);
+                let t = Instant::now();
+                assert_eq!(rt.press(x, y, t), None);
+                assert_eq!(rt.release(x, y), Some(Action::ToggleShade), "{name}");
+                // Shaded: the window is the bar, the shade button is still on it.
+                rt.set_geometry((900, bar), scale);
+                rt.set_shaded(true);
+                let b = rt.layout.button_rect(ButtonKind::Shade).unwrap();
+                assert!(b.y >= 0 && b.y + b.h <= bar as i32, "{name} @{scale}x: shade button off the bar: {b:?} bar {bar}");
+                let (x, y) = (b.x as f64 + b.w as f64 / 2.0, b.y as f64 + b.h as f64 / 2.0);
+                assert_eq!(rt.press(x, y, t), None);
+                assert_eq!(rt.release(x, y), Some(Action::ToggleShade), "{name}: unshade from the bar");
+                // Double-click on an empty stretch of the bar acts per the skin.
+                let tb = rt.layout.titlebar.expect("titlebar");
+                let mid = (tb.x as f64 + tb.w as f64 / 3.0, tb.y as f64 + tb.h as f64 / 2.0);
+                assert_eq!(rt.hit_at(mid.0, mid.1), Hit::Titlebar, "{name}");
+                let want = match skin.def.titlebar.as_ref().unwrap().double_click {
+                    DoubleClick::Shade => Action::ToggleShade,
+                    DoubleClick::Maximize => Action::ToggleMaximize,
+                    DoubleClick::None => Action::DragMove,
+                };
+                assert_eq!(rt.press(mid.0, mid.1, t), Some(Action::DragMove));
+                assert_eq!(rt.press(mid.0, mid.1, t + Duration::from_millis(100)), Some(want), "{name}");
+                // No resize zones while shaded.
+                assert!(!matches!(rt.hit_at(1.0, bar as f64 / 2.0), Hit::ResizeEdge(_)), "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn min_window_keeps_corners() {
         let s = debug();
         let (w, h) = s.min_window(2, (8, 16));

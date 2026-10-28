@@ -9,6 +9,7 @@
 //! * `selection`     text selection; `links` hyperlink detection; `bell` audible bell
 //! * `theme`         color themes (TOML + kitty .conf); `reload` config hot-reload
 //! * `graphics_glue` kitty graphics protocol glue (stub)
+//! * `debug_script` env-driven test hooks (scale override, scripted input)
 //! * `skin`         undecorated, non-rectangular window skins (docs/SKINS.md)
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -17,6 +18,7 @@ mod app;
 mod bell;
 mod boxdraw;
 mod config;
+mod debug_script;
 mod fonts;
 mod glyphs;
 mod graphics_glue;

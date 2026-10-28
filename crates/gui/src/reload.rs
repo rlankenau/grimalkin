@@ -1,4 +1,4 @@
-//! Config hot-reload: watch the config file (and the user theme directory)
+//! Config hot-reload: watch the config file (and the user theme and skin directories)
 //! and call back, debounced, when something changed.
 //!
 //! The callback runs on a helper thread; `app.rs` uses it to post a
@@ -28,6 +28,8 @@ pub struct ReloadCtx {
     pub path: Option<PathBuf>,
     /// `--theme NAME`, which keeps winning over the file.
     pub theme_override: Option<String>,
+    /// `--skin NAME`, which keeps winning over the file.
+    pub skin_override: Option<String>,
     pub _watcher: Option<ConfigWatcher>,
 }
 
@@ -53,6 +55,7 @@ pub fn watch(path: Option<&Path>, on_change: impl Fn() + Send + 'static) -> Opti
     let (tx, rx) = mpsc::channel::<()>();
     let relevant_file = file.clone();
     let relevant_themes = themes.clone();
+    let relevant_skins = config_dir.as_ref().map(|d| d.join("skins"));
     let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(ev) = res else { return };
         if matches!(ev.kind, EventKind::Access(_)) {
@@ -61,7 +64,11 @@ pub fn watch(path: Option<&Path>, on_change: impl Fn() + Send + 'static) -> Opti
         let hit = ev
             .paths
             .iter()
-            .any(|p| *p == relevant_file || relevant_themes.as_ref().is_some_and(|t| p.starts_with(t)));
+            .any(|p| {
+                *p == relevant_file
+                    || relevant_themes.as_ref().is_some_and(|t| p.starts_with(t))
+                    || relevant_skins.as_ref().is_some_and(|t| p.starts_with(t))
+            });
         if hit {
             let _ = tx.send(());
         }
@@ -85,8 +92,10 @@ pub fn watch(path: Option<&Path>, on_change: impl Fn() + Send + 'static) -> Opti
     if let Some(parent) = file.parent() {
         add(parent, RecursiveMode::NonRecursive);
     }
-    if let Some(t) = &themes {
-        add(t, RecursiveMode::Recursive);
+    // The whole config directory, recursively, so a `themes` folder created
+    // after startup is picked up too (events are filtered by path above).
+    if let Some(d) = &config_dir {
+        add(d, RecursiveMode::Recursive);
     }
     if !watching {
         log::debug!("no config directory to watch for {}", file.display());
