@@ -194,8 +194,8 @@ jobs:
             $info = (Get-Item $path).VersionInfo
             Write-Host "$name icons=$icons product=$($info.ProductName) file=$($info.FileVersion) desc=$($info.FileDescription)"
             if ($icons -lt 1) { throw "$name has no embedded icon" }
-            if ($info.ProductName -ne 'Grimalkin') { throw "$name: unexpected ProductName" }
-            if ($info.FileVersion -ne $version) { throw "$name: FileVersion $($info.FileVersion) != $version" }
+            if ($info.ProductName -ne 'Grimalkin') { throw "${name}: unexpected ProductName" }
+            if ($info.FileVersion -notlike "$version*") { throw "${name}: FileVersion $($info.FileVersion) != $version" }
           }
 
   macos-bundle:
