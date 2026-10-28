@@ -94,8 +94,8 @@ Source: "..\..\dist\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; WorkingDir: start in the user's profile rather than the install folder.
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{userprofile}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{userprofile}"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{%USERPROFILE}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
 
 [Registry]
 ; --- PATH -------------------------------------------------------------------
@@ -120,7 +120,7 @@ Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\grimalkin"; Valu
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\grimalkin\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" --working-directory ""%V"""; Tasks: contextmenu
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; WorkingDir: "{userprofile}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; WorkingDir: "{%USERPROFILE}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 const
