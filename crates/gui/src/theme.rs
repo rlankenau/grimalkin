@@ -174,8 +174,12 @@ impl ThemeColors {
 enum ColorValue {
     One(String),
     List(Vec<String>),
+    /// Anything else (a number, a table, ...): reported and ignored.
+    Other(de::IgnoredAny),
 }
 
+/// Colours are read leniently: a bad entry is reported and skipped so that it
+/// cannot cost the user every other setting in the file.
 impl<'de> Deserialize<'de> for ThemeColors {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let map = BTreeMap::<String, ColorValue>::deserialize(d)?;
@@ -184,22 +188,32 @@ impl<'de> Deserialize<'de> for ThemeColors {
         for (key, val) in map {
             match val {
                 ColorValue::List(v) if key == "ansi" => ansi_list = Some(v),
-                ColorValue::List(_) => return Err(de::Error::custom(format!("colors.{key} must be a color string"))),
-                ColorValue::One(s) => {
-                    let rgb = parse_color(&s)
-                        .ok_or_else(|| de::Error::custom(format!("invalid color {s:?} for {key}, expected \"#rrggbb\"")))?;
-                    if !c.set(&key, rgb) {
-                        log::warn!("unknown color key {key:?} ignored");
-                    }
+                ColorValue::List(_) | ColorValue::Other(_) if key == "ansi" => {
+                    log::warn!("colors.ansi must be a list of color strings; ignored");
                 }
+                ColorValue::List(_) | ColorValue::Other(_) => {
+                    log::warn!("colors.{key} must be a color string; ignored");
+                }
+                ColorValue::One(s) => match parse_color(&s) {
+                    Some(rgb) => {
+                        if !c.set(&key, rgb) {
+                            log::warn!("unknown color key {key:?} ignored");
+                        }
+                    }
+                    None => log::warn!("invalid color {s:?} for colors.{key}, expected \"#rrggbb\"; ignored"),
+                },
             }
         }
         // `ansi = [...]` is the base; named/colorN keys win over it.
         if let Some(list) = ansi_list {
             for (i, s) in list.iter().take(16).enumerate() {
-                let rgb = parse_color(s).ok_or_else(|| de::Error::custom(format!("invalid color {s:?} in colors.ansi")))?;
-                if c.ansi[i].is_none() {
-                    c.ansi[i] = Some(rgb);
+                match parse_color(s) {
+                    Some(rgb) => {
+                        if c.ansi[i].is_none() {
+                            c.ansi[i] = Some(rgb);
+                        }
+                    }
+                    None => log::warn!("invalid color {s:?} in colors.ansi[{i}]; ignored"),
                 }
             }
         }
@@ -527,9 +541,12 @@ mod tests {
 
     #[test]
     fn toml_errors() {
-        assert!(Theme::from_toml("[colors]\nforeground = \"nope\"").is_err());
-        assert!(Theme::from_toml("[colors]\nforeground = [\"#000000\"]").is_err());
-        assert!(Theme::from_toml("[colors]\nansi = [\"zzz\"]").is_err());
+        // Bad colour entries are skipped, not fatal; syntax errors still are.
+        let t = Theme::from_toml("[colors]\nforeground = \"nope\"\nbackground = \"#000001\"").unwrap();
+        assert_eq!((t.colors.foreground, t.colors.background), (None, Some(Rgb(0, 0, 1))));
+        assert_eq!(Theme::from_toml("[colors]\nforeground = [\"#000000\"]").unwrap().colors.foreground, None);
+        assert_eq!(Theme::from_toml("[colors]\nansi = [\"zzz\"]").unwrap().colors.ansi[0], None);
+        assert!(Theme::from_toml("[colors\nforeground =").is_err());
     }
 
     #[test]

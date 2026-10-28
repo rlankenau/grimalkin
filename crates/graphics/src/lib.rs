@@ -29,7 +29,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 /// Maximum accepted image width or height in pixels.
-pub(crate) const MAX_DIMENSION: u32 = 10_000;
+pub const MAX_DIMENSION: u32 = 10_000;
 /// Default image memory quota (matches kitty).
 pub const DEFAULT_MEMORY_LIMIT: usize = 320 * 1024 * 1024;
 const FALLBACK_CELL_W: u32 = 8;

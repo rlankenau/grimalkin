@@ -14,6 +14,8 @@ mod util;
 mod tests;
 #[cfg(test)]
 mod review_tests;
+#[cfg(test)]
+mod limits_tests;
 
 pub use cell::{
     default_palette_rgb, Cell, CellWidth, Color, Flags, LineMark, MarkKind, Row, Style, Underline,
@@ -21,5 +23,6 @@ pub use cell::{
 pub use grid::Grid;
 pub use term::{
     ColorTable, Cursor, CursorShape, Damage, Direction, Hyperlink, Modes, MouseEncoding,
-    MouseMode, Rgb, Screen, TermEvent, Terminal,
+    MouseMode, Rgb, Screen, TermEvent, Terminal, MAX_CLIPBOARD_BYTES, MAX_COMBINING,
+    MAX_STRING_BODY,
 };

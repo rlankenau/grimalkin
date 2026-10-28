@@ -18,12 +18,13 @@
 //! clears the screen and uses absolute `CSI H` positioning to put the cursor
 //! below the first image after the placed copy.
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal;
 use flate2::{write::ZlibEncoder, Compression};
+use grimalkin_graphics::MAX_DIMENSION;
 
 const HELP: &str = "\
 gcat - display images with the kitty graphics protocol
@@ -61,6 +62,7 @@ struct Opts {
     id: u32,
     conpty: bool,
     cell_h: u32,
+    term_cols: u32,
     term_rows: u32,
 }
 
@@ -157,6 +159,92 @@ fn cell_height() -> u32 {
     h
 }
 
+/// Read whatever the terminal sends back, waiting at most `wait` for the first
+/// byte and a short moment for the rest. Never blocks beyond that: replies may
+/// be stripped (older ConPTY) or absent (terminal without support). Reply
+/// bytes are collected as key presses, so an ESC introducing them may be
+/// folded into the following key's modifiers; callers match on the body.
+fn read_reply(wait: Duration) -> String {
+    if !std::io::stdin().is_terminal() || terminal::enable_raw_mode().is_err() {
+        return String::new();
+    }
+    let mut got = String::new();
+    let mut left = wait;
+    while event::poll(left).unwrap_or(false) {
+        match event::read() {
+            Ok(Event::Key(k)) => match k.code {
+                KeyCode::Char(c) => got.push(c),
+                KeyCode::Esc => got.push('\x1b'),
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        left = Duration::from_millis(40);
+    }
+    let _ = terminal::disable_raw_mode();
+    got
+}
+
+/// Print a graphics reply (only errors are expected: gcat sends `q=1`).
+fn report_reply(id: u32) {
+    let got = read_reply(Duration::from_millis(120));
+    let text: String = got.chars().filter(|c| !c.is_control()).collect();
+    if !text.is_empty() {
+        eprintln!("gcat: terminal replied for image {id}: {text}");
+    }
+}
+
+/// Terminal size in cells via `CSI 18 t` (reply `CSI 8 ; rows ; cols t`),
+/// falling back to the ioctl/console size.
+fn term_size_cells() -> Option<(u32, u32)> {
+    if !std::io::stdout().is_terminal() {
+        return terminal::size().ok().map(|(c, r)| (c as u32, r as u32));
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b[18t");
+    let _ = out.flush();
+    let got = read_reply(Duration::from_millis(300));
+    if let Some(i) = got.rfind("[8;") {
+        let body = got[i + 3..].trim_end_matches('t');
+        let mut it = body.split(';').map(|v| v.trim().parse::<u32>());
+        if let (Some(Ok(r)), Some(Ok(c))) = (it.next(), it.next()) {
+            if r > 0 && c > 0 {
+                return Some((c, r));
+            }
+        }
+    }
+    terminal::size().ok().map(|(c, r)| (c as u32, r as u32))
+}
+
+/// Clamp a `--place` rectangle to the terminal, warning when it changes.
+fn clamp_place(p: (u32, u32, u32, u32), term: Option<(u32, u32)>) -> (u32, u32, u32, u32) {
+    let Some((tc, tr)) = term.filter(|&(c, r)| c > 0 && r > 0) else {
+        return p;
+    };
+    let (c, r, x, y) = p;
+    let x2 = x.min(tc - 1);
+    let y2 = y.min(tr - 1);
+    let c2 = c.clamp(1, tc - x2);
+    let r2 = r.clamp(1, tr - y2);
+    if (c2, r2, x2, y2) != p {
+        eprintln!(
+            "gcat: warning: --place {c}x{r}@{x}x{y} does not fit the {tc}x{tr} terminal; using {c2}x{r2}@{x2}x{y2}"
+        );
+    }
+    (c2, r2, x2, y2)
+}
+
+/// Pixel size of a PNG from its IHDR chunk.
+fn png_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((w, h))
+}
+
 /// Terminal rows covered by an image of `height_px` pixels.
 fn image_rows(o: &Opts, height_px: u32) -> u32 {
     if let Some((_, r, _, _)) = o.place {
@@ -167,6 +255,20 @@ fn image_rows(o: &Opts, height_px: u32) -> u32 {
 
 /// Transmit and display one image. `payload` is raw pixels (f=32) or PNG bytes (f=100).
 fn send(out: &mut impl Write, payload: &[u8], dims: Option<(u32, u32)>, o: &Opts, id: u32) {
+    if let Some((w, h)) = dims.or_else(|| png_dims(payload)) {
+        if w > MAX_DIMENSION || h > MAX_DIMENSION {
+            eprintln!(
+                "gcat: image {id} is {w}x{h} pixels; the protocol allows at most \
+                 {MAX_DIMENSION}x{MAX_DIMENSION}. Not sent (resize it first)."
+            );
+            return;
+        }
+    }
+    let mut o = o.clone();
+    if let Some(p) = o.place {
+        o.place = Some(clamp_place(p, (o.term_cols > 0).then_some((o.term_cols, o.term_rows))));
+    }
+    let o = &o;
     let mut data = payload.to_vec();
     if o.zlib {
         let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -174,7 +276,7 @@ fn send(out: &mut impl Write, payload: &[u8], dims: Option<(u32, u32)>, o: &Opts
         data = e.finish().unwrap();
     }
     let enc = b64(&data);
-    let mut keys = format!("a=T,q=2,i={id}");
+    let mut keys = format!("a=T,q=1,i={id}");
     match dims {
         Some((w, h)) => keys += &format!(",f=32,s={w},v={h}"),
         None => keys += ",f=100",
@@ -182,7 +284,8 @@ fn send(out: &mut impl Write, payload: &[u8], dims: Option<(u32, u32)>, o: &Opts
     if o.zlib {
         keys += ",o=z";
     }
-    if let Some((c, r, x, y)) = o.place {
+    if let Some(place) = o.place {
+        let (c, r, x, y) = place;
         keys += &format!(",c={c},r={r}");
         let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
     }
@@ -198,7 +301,7 @@ fn send(out: &mut impl Write, payload: &[u8], dims: Option<(u32, u32)>, o: &Opts
         if i == 0 {
             let _ = write!(out, "\x1b_G{keys},m={more};");
         } else {
-            let _ = write!(out, "\x1b_Gq=2,m={more};");
+            let _ = write!(out, "\x1b_Gq=1,m={more};");
         }
         let _ = out.write_all(ch);
         let _ = out.write_all(b"\x1b\\");
@@ -215,6 +318,7 @@ fn send(out: &mut impl Write, payload: &[u8], dims: Option<(u32, u32)>, o: &Opts
         let _ = out.write_all(b"\n");
     }
     let _ = out.flush();
+    report_reply(id);
 }
 
 fn demo_image() -> (Vec<u8>, u32, u32) {
@@ -335,8 +439,13 @@ fn main() {
         println!("no kitty graphics support");
         std::process::exit(1);
     }
+    if let Some((c, r)) = term_size_cells() {
+        o.term_cols = c;
+        o.term_rows = r;
+    } else {
+        o.term_rows = 24;
+    }
     if o.conpty {
-        o.term_rows = terminal::size().map_or(24, |(_, r)| r as u32);
         o.cell_h = cell_height();
     }
     if do_demo {
