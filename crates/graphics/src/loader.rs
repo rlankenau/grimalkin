@@ -106,7 +106,7 @@ pub(crate) fn load(cmd: &Cmd, payload: &[u8], memory_limit: usize) -> Result<Dec
             data
         } else {
             let mut v = Vec::with_capacity(data.len() / 3 * 4);
-            for px in data.chunks_exact(3) {
+            for px in data.as_chunks::<3>().0 {
                 v.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
             v

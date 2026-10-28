@@ -788,9 +788,7 @@ impl Terminal {
     }
     pub fn clear_damage(&mut self) {
         self.full_redraw = false;
-        for d in &mut self.dirty {
-            *d = false;
-        }
+        self.dirty.fill(false);
     }
     /// How long synchronized output has been active, if it is.
     pub fn sync_elapsed(&self) -> Option<Duration> {
