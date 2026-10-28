@@ -1,0 +1,15 @@
+grimalkin is dual-licensed under either of
+
+  * the MIT license (see LICENSE-MIT), or
+  * the Apache License, Version 2.0 (see LICENSE-APACHE),
+
+at your option (SPDX: MIT OR Apache-2.0).
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in grimalkin by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
+
+The Windows installer and portable zip also bundle Microsoft's ConPTY
+redistributable (conpty.dll and OpenConsole.exe), which is MIT licensed; see
+LICENSE-ConPTY.txt.

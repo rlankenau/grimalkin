@@ -24,6 +24,44 @@ core works, many conveniences are missing.
 Not done: no tabs or splits, no ligatures, no IME, no `U=1` unicode
 placeholders, no animation frames (`a=f`).
 
+## Installing on Windows
+
+Download `grimalkin-setup-x64.exe` from the
+[Releases](https://github.com/rlankenau/grimalkin/releases) page and run it. It
+installs per user by default (into `%LOCALAPPDATA%\Programs\grimalkin`, no
+administrator prompt); the first page offers "install for all users" if you
+want Program Files instead. The installer:
+
+- installs `grimalkin.exe` and `grimalkin.com` (the console launcher, see
+  [Windows: two files](#windows-two-files)) together, plus Microsoft's ConPTY
+  redistributable (`conpty.dll` and `OpenConsole.exe`) beside them. The bundled
+  ConPTY is what makes the kitty graphics protocol work on Windows 10 (see
+  [Windows: kitty graphics need a newer ConPTY](#windows-kitty-graphics-need-a-newer-conpty));
+  nothing extra to download
+- adds a Start Menu shortcut, and optionally a desktop icon
+- optionally adds grimalkin to your `PATH` so `grimalkin` works from any shell
+- optionally adds an "Open grimalkin here" entry to Explorer's folder and
+  folder-background right-click menus (it runs
+  `grimalkin.exe --working-directory "<folder>"`)
+- can launch grimalkin when it finishes
+- upgrades in place: run a newer installer over an old one (a running grimalkin
+  is closed first); uninstall from Settings, Apps, which also removes the PATH
+  entry and context-menu keys. Your config in `%APPDATA%\grimalkin` is kept
+
+Silent install, for scripts: `grimalkin-setup-x64.exe /VERYSILENT /TASKS="addtopath,contextmenu"`
+(add `/ALLUSERS` for a machine-wide install).
+
+Prefer no installer? `grimalkin-portable-x64.zip` has the same files
+(including the ConPTY pair); unzip it anywhere and run `grimalkin.exe`.
+
+**Releases.** Pushing a tag matching `v*` (for example `v0.2.0`) runs CI, which
+publishes everything to the GitHub release: the installer
+(`grimalkin-setup-x64.exe`, versioned from the tag), the portable zip, and the
+plain `grimalkin.exe` / `grimalkin.com`. The same files are available as
+workflow artifacts on every trunk build. The installer is built from
+`installer/windows/grimalkin.iss` with Inno Setup; the ConPTY package version
+and SHA256 are pinned in `.github/workflows/ci.yml`.
+
 ## Requirements
 
 - Rust stable 1.92+
@@ -340,4 +378,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for details. Tests: `cargo test --workspa
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0: see [LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE). The bundled ConPTY redistributable is MIT
+licensed by Microsoft: see
+[installer/windows/LICENSE-ConPTY.txt](installer/windows/LICENSE-ConPTY.txt).
