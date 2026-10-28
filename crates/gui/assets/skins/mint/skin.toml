@@ -1,0 +1,38 @@
+name = "Mint"
+author = "grimalkin"
+
+# 9-slice frame. Corners are fixed; the tileable edge segments repeat every 8 px,
+# so `tile` stretches without seams.  frame.png is 320x244 at 1x.
+[frame]
+image = "frame.png"
+slices = { left = 16, right = 24, top = 28, bottom = 24 }
+edge_mode = "tile"
+viewport_inset = { left = 16, right = 24, top = 28, bottom = 24 }
+viewport_background = "#0f2a24"
+viewport_opacity = 1.0
+
+[titlebar]
+rect = { x = 0, y = 0, w = -1, h = 28 }
+double_click = "maximize"
+# title text sits in the chrome title plate; its right end stops where the buttons begin
+text = { x = 26, y = 9, w = -90, font_px = 11, color = "#1f5446", align = "left" }
+
+# buttons.png: one column per button, normal / hover / pressed stacked vertically,
+# each cell exactly the rect size (12x12).
+[buttons]
+sheet = "buttons.png"
+close    = { rect = { x = -34, y = 7, w = 12, h = 12 }, sprite = [0, 0] }
+minimize = { rect = { x = -50, y = 7, w = 12, h = 12 }, sprite = [12, 0] }
+shade    = { rect = { x = -66, y = 7, w = 12, h = 12 }, sprite = [24, 0] }
+maximize = { rect = { x = -82, y = 7, w = 12, h = 12 }, sprite = [36, 0] }
+
+[resize]
+grip = { x = -24, y = -24, w = 16, h = 16 }
+border = 5
+
+# shade.png is the top 28 rows of the frame, closed off along the bottom, 320 px wide
+# (left/right 16 px are caps, the middle repeats every 8 px).  The titlebar and button rects
+# above apply to it unchanged.
+[shade]
+image = "shade.png"
+height = 28
