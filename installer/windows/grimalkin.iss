@@ -254,8 +254,8 @@ var
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    { {app} is still resolvable here. Edit the Path of the mode this install
-      used; nothing happens if the entry is absent. }
+    // The app folder is still resolvable here. Edit the Path of the mode this
+    // install used; nothing happens if the entry is absent.
     if IsAdminInstallMode then
       Changed := RemoveFromPath(ExpandConstant('{app}'), True)
     else
