@@ -12,7 +12,7 @@
 //!   the selection hooks and the wheel/scrollback handling.
 
 use winit::event::KeyEvent;
-use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
 
 /// Font zoom operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,8 +56,17 @@ pub struct KeyInput<'a> {
     pub physical: PhysicalKey,
     pub text: Option<&'a str>,
     pub pressed: bool,
-    #[allow(dead_code)] // for the kitty keyboard agent (event types)
     pub repeat: bool,
+    /// Where on the keyboard the key is (keypad keys have their own codes in
+    /// the kitty protocol).
+    pub location: KeyLocation,
+    /// The key with all modifiers (Shift, Ctrl, Alt, Caps) undone, when the
+    /// platform can tell us (the kitty protocol's "unshifted key").
+    pub unmodified: Option<char>,
+    /// Lock modifier state; winit 0.30 does not report it, so these are only
+    /// set by callers that track it themselves.
+    pub caps_lock: bool,
+    pub num_lock: bool,
 }
 
 impl<'a> KeyInput<'a> {
@@ -68,8 +77,33 @@ impl<'a> KeyInput<'a> {
             text: ev.text.as_deref(),
             pressed: ev.state.is_pressed(),
             repeat: ev.repeat,
+            location: ev.location,
+            unmodified: unmodified_key(ev),
+            caps_lock: false,
+            num_lock: false,
         }
     }
+}
+
+/// The single character of `key_without_modifiers`, where winit offers it.
+#[cfg(any(windows, target_os = "macos", all(unix, not(any(target_os = "android", target_os = "ios", target_os = "redox")))))]
+fn unmodified_key(ev: &KeyEvent) -> Option<char> {
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    match ev.key_without_modifiers() {
+        Key::Character(s) => {
+            let mut it = s.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", all(unix, not(any(target_os = "android", target_os = "ios", target_os = "redox"))))))]
+fn unmodified_key(_ev: &KeyEvent) -> Option<char> {
+    None
 }
 
 pub const IS_MAC: bool = cfg!(target_os = "macos");
@@ -80,14 +114,15 @@ pub fn translate(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> Ke
     if let Some(a) = shortcut(input, mods, st) {
         return a;
     }
-    // Swallow unbound Cmd combinations on macOS instead of sending garbage.
-    if IS_MAC && mods.super_key() {
-        return KeyAction::None;
-    }
     if st.kitty_flags != 0 {
-        if let Some(bytes) = encode_kitty(st.kitty_flags, input, mods) {
+        if let Some(bytes) = encode_kitty(st.kitty_flags, input, kitty_mods(input, mods, st)) {
             return KeyAction::Send(bytes);
         }
+    }
+    // Swallow unbound Cmd combinations on macOS instead of sending garbage
+    // (the kitty protocol can report Super, so it gets them above).
+    if IS_MAC && mods.super_key() {
+        return KeyAction::None;
     }
     if !input.pressed {
         return KeyAction::None;
@@ -96,6 +131,22 @@ pub fn translate(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> Ke
         Some(b) => KeyAction::Send(b),
         None => KeyAction::None,
     }
+}
+
+/// Modifiers as the kitty encoder should see them: Alt that only composes
+/// text (macOS Option without `option_as_alt`) and AltGr (reported by Windows
+/// as Ctrl+Alt) are not modifiers when they produced printable text.
+fn kitty_mods(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> ModifiersState {
+    let printable = input.text.is_some_and(|t| !t.is_empty() && !t.chars().any(char::is_control));
+    let mut m = mods;
+    if printable && mods.alt_key() {
+        if cfg!(windows) && mods.control_key() {
+            m.remove(ModifiersState::ALT | ModifiersState::CONTROL);
+        } else if !st.alt_is_meta {
+            m.remove(ModifiersState::ALT);
+        }
+    }
+    m
 }
 
 /// Is this physical key one of the "plus" keys (= with or without shift, or
@@ -147,22 +198,424 @@ fn shortcut(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> Option<
     None
 }
 
-/// Kitty keyboard protocol encoder.
-///
-/// TODO(kitty keyboard agent): implement https://sw.kovidgoyal.net/kitty/keyboard-protocol/
-/// for the flags in `flags` (1 disambiguate, 2 report event types, 4 report
-/// alternate keys, 8 report all keys as escape codes, 16 report associated
-/// text). Called for press, repeat *and release* events whenever the terminal
-/// has pushed non-zero flags. `mods` carries shift/ctrl/alt/super; use
-/// `input.physical` for the unshifted key code and `input.text` for associated
-/// text. Return `None` to fall back to the legacy encoding (which is correct
-/// for keys the protocol leaves alone, e.g. plain text with flags == 1).
-pub fn encode_kitty(_flags: u8, _input: &KeyInput, _mods: ModifiersState) -> Option<Vec<u8>> {
-    None
+// ---------------------------------------------------------------------------
+// Kitty keyboard protocol
+// ---------------------------------------------------------------------------
+
+/// Kitty keyboard protocol flag bits (`Terminal::keyboard_flags()`).
+#[allow(dead_code)]
+pub const KITTY_DISAMBIGUATE: u8 = 1;
+pub const KITTY_EVENT_TYPES: u8 = 2;
+pub const KITTY_ALTERNATE_KEYS: u8 = 4;
+pub const KITTY_ALL_KEYS: u8 = 8;
+pub const KITTY_ASSOCIATED_TEXT: u8 = 16;
+
+/// Modifier bits as defined by the protocol (the wire value is `1 + bits`).
+const K_SHIFT: u8 = 1;
+const K_ALT: u8 = 2;
+const K_CTRL: u8 = 4;
+const K_SUPER: u8 = 8;
+const K_CAPS_LOCK: u8 = 64;
+const K_NUM_LOCK: u8 = 128;
+
+const PRESS: u8 = 1;
+const REPEAT: u8 = 2;
+const RELEASE: u8 = 3;
+
+/// A functional key: the number and the final byte (`u`, `~` or a letter).
+/// Letter forms use number 1 (`CSI 1;mods A`, `1` omitted without modifiers).
+type FKey = (u32, u8);
+
+fn kitty_mod_bits(mods: ModifiersState) -> u8 {
+    (mods.shift_key() as u8) * K_SHIFT
+        + (mods.alt_key() as u8) * K_ALT
+        + (mods.control_key() as u8) * K_CTRL
+        + (mods.super_key() as u8) * K_SUPER
 }
 
+/// Modifier key events as (key number, modifier bit).
+fn kitty_modifier_key(input: &KeyInput) -> Option<(u32, u8)> {
+    let PhysicalKey::Code(c) = input.physical else { return None };
+    Some(match c {
+        KeyCode::ShiftLeft => (57441, K_SHIFT),
+        KeyCode::ControlLeft => (57442, K_CTRL),
+        KeyCode::AltLeft => (57443, K_ALT),
+        KeyCode::SuperLeft => (57444, K_SUPER),
+        KeyCode::ShiftRight => (57447, K_SHIFT),
+        KeyCode::ControlRight => (57448, K_CTRL),
+        KeyCode::AltRight => (57449, K_ALT),
+        KeyCode::SuperRight => (57450, K_SUPER),
+        _ => return None,
+    })
+}
+
+/// Keypad key number from the physical key.
+fn kitty_keypad_number(code: KeyCode) -> Option<u32> {
+    Some(match code {
+        KeyCode::Numpad0 => 57399,
+        KeyCode::Numpad1 => 57400,
+        KeyCode::Numpad2 => 57401,
+        KeyCode::Numpad3 => 57402,
+        KeyCode::Numpad4 => 57403,
+        KeyCode::Numpad5 => 57404,
+        KeyCode::Numpad6 => 57405,
+        KeyCode::Numpad7 => 57406,
+        KeyCode::Numpad8 => 57407,
+        KeyCode::Numpad9 => 57408,
+        KeyCode::NumpadDecimal => 57409,
+        KeyCode::NumpadDivide => 57410,
+        KeyCode::NumpadMultiply => 57411,
+        KeyCode::NumpadSubtract => 57412,
+        KeyCode::NumpadAdd => 57413,
+        KeyCode::NumpadEnter => 57414,
+        KeyCode::NumpadEqual => 57415,
+        KeyCode::NumpadComma => 57416,
+        _ => return None,
+    })
+}
+
+/// Functional (non-text) keys.
+fn kitty_functional_key(input: &KeyInput) -> Option<FKey> {
+    let Key::Named(n) = input.logical else { return None };
+    let kp = input.location == KeyLocation::Numpad;
+    // Navigation keys with a legacy `CSI n ~` form; the keypad variants only
+    // exist as `CSI n u`.
+    let tilde = |legacy: u32, keypad: u32| if kp { (keypad, b'u') } else { (legacy, b'~') };
+    let letter = |l: u8, keypad: u32| if kp { (keypad, b'u') } else { (1, l) };
+    let k = match n {
+        NamedKey::Escape => (27, b'u'),
+        NamedKey::Enter => {
+            if kp || matches!(input.physical, PhysicalKey::Code(KeyCode::NumpadEnter)) {
+                (57414, b'u')
+            } else {
+                (13, b'u')
+            }
+        }
+        NamedKey::Tab => (9, b'u'),
+        NamedKey::Backspace => (127, b'u'),
+        NamedKey::Insert => tilde(2, 57425),
+        NamedKey::Delete => tilde(3, 57426),
+        NamedKey::PageUp => tilde(5, 57421),
+        NamedKey::PageDown => tilde(6, 57422),
+        NamedKey::ArrowLeft => letter(b'D', 57417),
+        NamedKey::ArrowRight => letter(b'C', 57418),
+        NamedKey::ArrowUp => letter(b'A', 57419),
+        NamedKey::ArrowDown => letter(b'B', 57420),
+        NamedKey::Home => letter(b'H', 57423),
+        NamedKey::End => letter(b'F', 57424),
+        NamedKey::Clear if kp => (1, b'E'),
+        NamedKey::F1 => (1, b'P'),
+        NamedKey::F2 => (1, b'Q'),
+        NamedKey::F3 => (13, b'~'),
+        NamedKey::F4 => (1, b'S'),
+        NamedKey::F5 => (15, b'~'),
+        NamedKey::F6 => (17, b'~'),
+        NamedKey::F7 => (18, b'~'),
+        NamedKey::F8 => (19, b'~'),
+        NamedKey::F9 => (20, b'~'),
+        NamedKey::F10 => (21, b'~'),
+        NamedKey::F11 => (23, b'~'),
+        NamedKey::F12 => (24, b'~'),
+        NamedKey::F13 => (57376, b'u'),
+        NamedKey::F14 => (57377, b'u'),
+        NamedKey::F15 => (57378, b'u'),
+        NamedKey::F16 => (57379, b'u'),
+        NamedKey::F17 => (57380, b'u'),
+        NamedKey::F18 => (57381, b'u'),
+        NamedKey::F19 => (57382, b'u'),
+        NamedKey::F20 => (57383, b'u'),
+        NamedKey::F21 => (57384, b'u'),
+        NamedKey::F22 => (57385, b'u'),
+        NamedKey::F23 => (57386, b'u'),
+        NamedKey::F24 => (57387, b'u'),
+        NamedKey::F25 => (57388, b'u'),
+        NamedKey::F26 => (57389, b'u'),
+        NamedKey::F27 => (57390, b'u'),
+        NamedKey::F28 => (57391, b'u'),
+        NamedKey::F29 => (57392, b'u'),
+        NamedKey::F30 => (57393, b'u'),
+        NamedKey::F31 => (57394, b'u'),
+        NamedKey::F32 => (57395, b'u'),
+        NamedKey::F33 => (57396, b'u'),
+        NamedKey::F34 => (57397, b'u'),
+        NamedKey::F35 => (57398, b'u'),
+        NamedKey::CapsLock => (57358, b'u'),
+        NamedKey::ScrollLock => (57359, b'u'),
+        NamedKey::NumLock => (57360, b'u'),
+        NamedKey::PrintScreen => (57361, b'u'),
+        NamedKey::Pause => (57362, b'u'),
+        NamedKey::ContextMenu => (57363, b'u'),
+        NamedKey::MediaPlay => (57428, b'u'),
+        NamedKey::MediaPause => (57429, b'u'),
+        NamedKey::MediaPlayPause => (57430, b'u'),
+        NamedKey::MediaStop => (57432, b'u'),
+        NamedKey::MediaFastForward => (57433, b'u'),
+        NamedKey::MediaRewind => (57434, b'u'),
+        NamedKey::MediaTrackNext => (57435, b'u'),
+        NamedKey::MediaTrackPrevious => (57436, b'u'),
+        NamedKey::MediaRecord => (57437, b'u'),
+        NamedKey::AudioVolumeDown => (57438, b'u'),
+        NamedKey::AudioVolumeUp => (57439, b'u'),
+        NamedKey::AudioVolumeMute => (57440, b'u'),
+        NamedKey::AltGraph => (57453, b'u'),
+        _ => return None,
+    };
+    Some(k)
+}
+
+/// The key on a PC-101 (US) layout at this physical position, if it is one of
+/// the text-producing keys. This is the protocol's "base layout key".
+fn base_layout_char(code: KeyCode) -> Option<char> {
+    Some(match code {
+        KeyCode::KeyA => 'a',
+        KeyCode::KeyB => 'b',
+        KeyCode::KeyC => 'c',
+        KeyCode::KeyD => 'd',
+        KeyCode::KeyE => 'e',
+        KeyCode::KeyF => 'f',
+        KeyCode::KeyG => 'g',
+        KeyCode::KeyH => 'h',
+        KeyCode::KeyI => 'i',
+        KeyCode::KeyJ => 'j',
+        KeyCode::KeyK => 'k',
+        KeyCode::KeyL => 'l',
+        KeyCode::KeyM => 'm',
+        KeyCode::KeyN => 'n',
+        KeyCode::KeyO => 'o',
+        KeyCode::KeyP => 'p',
+        KeyCode::KeyQ => 'q',
+        KeyCode::KeyR => 'r',
+        KeyCode::KeyS => 's',
+        KeyCode::KeyT => 't',
+        KeyCode::KeyU => 'u',
+        KeyCode::KeyV => 'v',
+        KeyCode::KeyW => 'w',
+        KeyCode::KeyX => 'x',
+        KeyCode::KeyY => 'y',
+        KeyCode::KeyZ => 'z',
+        KeyCode::Digit0 => '0',
+        KeyCode::Digit1 => '1',
+        KeyCode::Digit2 => '2',
+        KeyCode::Digit3 => '3',
+        KeyCode::Digit4 => '4',
+        KeyCode::Digit5 => '5',
+        KeyCode::Digit6 => '6',
+        KeyCode::Digit7 => '7',
+        KeyCode::Digit8 => '8',
+        KeyCode::Digit9 => '9',
+        KeyCode::Minus => '-',
+        KeyCode::Equal => '=',
+        KeyCode::BracketLeft => '[',
+        KeyCode::BracketRight => ']',
+        KeyCode::Backslash => '\\',
+        KeyCode::Semicolon => ';',
+        KeyCode::Quote => '\'',
+        KeyCode::Backquote => '`',
+        KeyCode::Comma => ',',
+        KeyCode::Period => '.',
+        KeyCode::Slash => '/',
+        _ => return None,
+    })
+}
+
+fn single_char(s: &str) -> Option<char> {
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
+
+fn lowercase_char(c: char) -> char {
+    let mut it = c.to_lowercase();
+    match (it.next(), it.next()) {
+        (Some(l), None) => l,
+        _ => c,
+    }
+}
+
+fn uppercase_char(c: char) -> Option<char> {
+    let mut it = c.to_uppercase();
+    match (it.next(), it.next()) {
+        (Some(u), None) if u != c => Some(u),
+        _ => None,
+    }
+}
+
+/// Printable text of the event (no C0/C1 control codes), if any.
+fn printable_text<'a>(input: &KeyInput<'a>) -> Option<&'a str> {
+    let t = input.text?;
+    (!t.is_empty() && !t.chars().any(|c| c.is_control())).then_some(t)
+}
+
+/// Assemble `CSI number[:shifted[:base]] ; mods[:event] ; text terminator`.
+fn kitty_csi(
+    number: u32,
+    term: u8,
+    shifted: Option<u32>,
+    base: Option<u32>,
+    mod_bits: u8,
+    event: u8,
+    text: &[u32],
+) -> Vec<u8> {
+    let m = mod_bits as u32 + 1;
+    let has_mods = m > 1 || event > PRESS;
+    let mut s = String::from("\x1b[");
+    // Letter forms omit the leading 1 when nothing else follows.
+    if !(number == 1 && term != b'u' && term != b'~' && !has_mods && text.is_empty()) {
+        s.push_str(&number.to_string());
+    }
+    if shifted.is_some() || base.is_some() {
+        s.push(':');
+        if let Some(c) = shifted {
+            s.push_str(&c.to_string());
+        }
+        if let Some(c) = base {
+            s.push(':');
+            s.push_str(&c.to_string());
+        }
+    }
+    if has_mods || !text.is_empty() {
+        s.push(';');
+        if has_mods {
+            s.push_str(&m.to_string());
+            if event > PRESS {
+                s.push(':');
+                s.push_str(&event.to_string());
+            }
+        }
+    }
+    if !text.is_empty() {
+        s.push(';');
+        let parts: Vec<String> = text.iter().map(|c| c.to_string()).collect();
+        s.push_str(&parts.join(":"));
+    }
+    s.push(term as char);
+    s.into_bytes()
+}
+
+/// Kitty keyboard protocol encoder
+/// (<https://sw.kovidgoyal.net/kitty/keyboard-protocol/>).
+///
+/// Called for press, repeat and release events whenever the terminal has
+/// non-zero flags. Returns `Some(bytes)` for events encoded as escape codes,
+/// and `None` to fall back to the legacy path, which is correct for keys the
+/// protocol leaves alone (plain text without "report all keys"; Enter, Tab
+/// and Backspace without modifiers) and which drops release events.
+pub fn encode_kitty(flags: u8, input: &KeyInput, mods: ModifiersState) -> Option<Vec<u8>> {
+    let all = flags & KITTY_ALL_KEYS != 0;
+    let types = flags & KITTY_EVENT_TYPES != 0;
+    let alternates = flags & KITTY_ALTERNATE_KEYS != 0;
+    let assoc_text = flags & KITTY_ASSOCIATED_TEXT != 0;
+    let event = if !input.pressed {
+        RELEASE
+    } else if input.repeat {
+        REPEAT
+    } else {
+        PRESS
+    };
+    if event == RELEASE && !types {
+        return None;
+    }
+    // Without event types, repeats look like presses.
+    let event = if types { event } else { PRESS };
+
+    let mut bits = kitty_mod_bits(mods);
+    if all {
+        if input.caps_lock {
+            bits |= K_CAPS_LOCK;
+        }
+        if input.num_lock {
+            bits |= K_NUM_LOCK;
+        }
+    }
+
+    // Modifier keys themselves: only with "report all keys". The modifier
+    // bits reflect the state after the event.
+    if let Some((number, bit)) = kitty_modifier_key(input) {
+        if !all {
+            return None;
+        }
+        let b = if input.pressed { bits | bit } else { bits & !bit };
+        return Some(kitty_csi(number, b'u', None, None, b, event, &[]));
+    }
+
+    if let Some((number, term)) = kitty_functional_key(input) {
+        // Enter, Tab and Backspace stay legacy without modifiers (so `reset`
+        // still works) and never report releases; with modifiers they use
+        // CSI u.
+        let legacy_key = term == b'u' && matches!(number, 13 | 9 | 127 | 57414);
+        if legacy_key && !all && (event == RELEASE || bits == 0) {
+            return None;
+        }
+        // Caps/Num lock are modifier-like: only with "report all keys".
+        if matches!(number, 57358 | 57360) && !all {
+            return None;
+        }
+        return Some(kitty_csi(number, term, None, None, bits, event, &[]));
+    }
+
+    // Text keys (and keypad text keys).
+    let (logical_char, is_space) = match input.logical {
+        Key::Character(s) => (single_char(s), false),
+        Key::Named(NamedKey::Space) => (Some(' '), true),
+        _ => return None,
+    };
+    let non_shift = mods.alt_key() || mods.control_key() || mods.super_key();
+    if !all && !non_shift {
+        // Plain and Shift+text is sent as text by the legacy path.
+        return None;
+    }
+
+    let keypad_number = match (input.location, input.physical) {
+        (KeyLocation::Numpad, PhysicalKey::Code(c)) => kitty_keypad_number(c),
+        _ => None,
+    };
+    let unmodified = input
+        .unmodified
+        .or(logical_char.filter(|c| !c.is_control()))
+        .map(lowercase_char);
+    let (number, shifted, base) = if let Some(k) = keypad_number {
+        (k, None, None)
+    } else {
+        let number = unmodified.map_or(0, |c| c as u32);
+        let mut shifted = None;
+        let mut base = None;
+        if alternates {
+            if mods.shift_key() && !is_space {
+                // The platform's logical key may be altered by Alt (macOS
+                // Option composes), so derive the shifted letter ourselves.
+                let cand = match unmodified {
+                    Some(u) if u.is_alphabetic() => uppercase_char(u),
+                    _ => logical_char.filter(|c| !c.is_control()),
+                };
+                shifted = cand.filter(|c| Some(*c) != unmodified).map(|c| c as u32);
+            }
+            if let PhysicalKey::Code(c) = input.physical {
+                base = base_layout_char(c).filter(|b| Some(*b) != unmodified).map(|b| b as u32);
+            }
+        }
+        (number, shifted, base)
+    };
+
+    let mut text_cps: Vec<u32> = Vec::new();
+    if all && assoc_text && event != RELEASE && !non_shift {
+        if let Some(t) = printable_text(input) {
+            text_cps = t.chars().map(|c| c as u32).collect();
+        }
+    }
+    if number == 0 && text_cps.is_empty() {
+        // Unknown key without text: nothing sensible to report.
+        return None;
+    }
+    Some(kitty_csi(number, b'u', shifted, base, bits, event, &text_cps))
+}
+
+// ---------------------------------------------------------------------------
+// Mouse reporting
+// ---------------------------------------------------------------------------
+
 /// A mouse event in terminal coordinates, for mouse reporting.
-#[allow(dead_code)] // fields are consumed by the mouse reporting agent
 #[derive(Clone, Copy, Debug)]
 pub struct MouseEvent {
     pub kind: MouseKind,
@@ -171,6 +624,7 @@ pub struct MouseEvent {
     pub col: usize,
     pub row: usize,
     /// Pixel position within the terminal area.
+    #[allow(dead_code)] // for SGR-pixels (1016), not implemented
     pub px: (f64, f64),
     pub mods: ModifiersState,
 }
@@ -195,20 +649,70 @@ pub enum MouseBtn {
     None,
 }
 
-/// Mouse reporting encoder.
-///
-/// TODO(mouse agent): encode `ev` according to `mode`/`encoding` and return
-/// the bytes to write to the pty, or `None` if the event should not be
-/// reported (mouse mode off, motion not requested by the mode, ...). While
-/// this returns `None` for everything, `app.rs` falls back to selection and
-/// scrollback handling. By convention holding Shift bypasses reporting; the
-/// caller checks that before calling.
+/// Mouse reporting encoder: bytes for the pty, or `None` if the event is not
+/// reported (mouse mode off, motion not requested by the mode, coordinates
+/// not representable in the legacy encoding, ...). Holding Shift bypasses
+/// reporting; the caller checks that before calling.
 pub fn encode_mouse(
-    _mode: grimalkin_vt::MouseMode,
-    _encoding: grimalkin_vt::MouseEncoding,
-    _ev: &MouseEvent,
+    mode: grimalkin_vt::MouseMode,
+    encoding: grimalkin_vt::MouseEncoding,
+    ev: &MouseEvent,
 ) -> Option<Vec<u8>> {
-    None
+    use grimalkin_vt::{MouseEncoding, MouseMode};
+    let motion = ev.kind == MouseKind::Motion;
+    match mode {
+        MouseMode::None => return None,
+        MouseMode::Press if motion => return None,
+        MouseMode::Drag if motion && ev.button == MouseBtn::None => return None,
+        _ => {}
+    }
+    let release = ev.kind == MouseKind::Release;
+    let sgr = encoding == MouseEncoding::Sgr;
+    let mut code: u32 = match ev.button {
+        MouseBtn::Left => 0,
+        MouseBtn::Middle => 1,
+        MouseBtn::Right => 2,
+        MouseBtn::None => 3,
+        MouseBtn::WheelUp => 64,
+        MouseBtn::WheelDown => 65,
+    };
+    if release && !sgr {
+        // Legacy encodings do not say which button was released.
+        code = 3;
+    }
+    if ev.mods.shift_key() {
+        code += 4;
+    }
+    if ev.mods.alt_key() {
+        code += 8;
+    }
+    if ev.mods.control_key() {
+        code += 16;
+    }
+    if motion {
+        code += 32;
+    }
+    let (x, y) = (ev.col as u32 + 1, ev.row as u32 + 1);
+    let out = match encoding {
+        MouseEncoding::Sgr => format!("\x1b[<{code};{x};{y}{}", if release { 'm' } else { 'M' }).into_bytes(),
+        MouseEncoding::Urxvt => format!("\x1b[{};{x};{y}M", code + 32).into_bytes(),
+        MouseEncoding::Utf8 => {
+            let mut s = String::from("\x1b[M");
+            for v in [code + 32, x + 32, y + 32] {
+                // The protocol caps UTF-8 coordinates at 2015.
+                s.push(char::from_u32(v.min(2047))?);
+            }
+            s.into_bytes()
+        }
+        MouseEncoding::Default => {
+            let (b, cx, cy) = (code + 32, x + 32, y + 32);
+            if b > 255 || cx > 255 || cy > 255 {
+                return None;
+            }
+            vec![0x1b, b'[', b'M', b as u8, cx as u8, cy as u8]
+        }
+    };
+    Some(out)
 }
 
 fn xterm_mod_param(mods: ModifiersState) -> u8 {
@@ -505,6 +1009,10 @@ mod tests {
             text: None,
             pressed: true,
             repeat: false,
+            location: KeyLocation::Standard,
+            unmodified: None,
+            caps_lock: false,
+            num_lock: false,
         };
         let cs = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert_eq!(translate(&key(KeyCode::KeyC), cs, &s), KeyAction::Copy);
