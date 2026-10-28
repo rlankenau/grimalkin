@@ -3,7 +3,7 @@
 //! A theme is looked up by name, first in `<config_dir>/grimalkin/themes/`
 //! (`<name>.toml`, then `<name>.conf` in kitty's theme format), then in the
 //! set embedded in the binary from `assets/themes/`. The `[colors]` table of
-//! `grimalkin.toml` is applied on top, key by key (see [`resolve`]). The file
+//! `grimalkin.toml` is applied on top, key by key (see [`resolve_for_skin`]). The file
 //! formats are documented in `docs/SKINS.md` and `docs/grimalkin.example.toml`.
 
 use std::collections::BTreeMap;
@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 
-use crate::config::{Config, CursorShapeCfg, OneOrMany, Rgb, DEFAULT_ANSI};
+use crate::config::{Config, CursorShapeCfg, FontConfig, OneOrMany, Rgb, DEFAULT_ANSI};
+use crate::skin::winamp::SkinTheme;
+use crate::skin::Skin;
 
 /// Name of the theme used when `theme` is not set (and the fallback when a
 /// named theme cannot be found).
@@ -338,7 +340,7 @@ pub struct Palette {
     pub ansi: [Rgb; 16],
 }
 
-fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+pub(crate) fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Rgb(m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
 }
@@ -367,7 +369,7 @@ impl Palette {
     }
 }
 
-/// The outcome of [`resolve`].
+/// The outcome of [`resolve_for_skin`].
 pub struct Resolved {
     /// Theme actually used (after fallback).
     pub name: String,
@@ -380,18 +382,48 @@ pub struct Resolved {
 /// `cfg.theme` (falling back to `default` with an error in the log), then the
 /// `[colors]` table of the config on top, key by key. The theme's `[font]`
 /// and `[cursor]` keys, when present, replace the config's.
-pub fn resolve(cfg: &Config) -> Resolved {
-    resolve_in(cfg, user_dir().as_deref())
+///
+/// For a window that runs `skin`, an imported skin that brings a theme
+/// (WinAMP `pledit.txt`) supplies the base colours unless the user picked a
+/// theme of their own.
+pub fn resolve_for_skin(cfg: &Config, skin: Option<&Skin>) -> Resolved {
+    resolve_with(cfg, user_dir().as_deref(), skin.and_then(|s| s.theme.as_ref()))
 }
 
+#[cfg(test)]
 pub fn resolve_in(cfg: &Config, dir: Option<&Path>) -> Resolved {
+    resolve_with(cfg, dir, None)
+}
+
+/// The skin's theme laid over the built-in default (a skin theme sets only
+/// some colours), with the ANSI palette when the user opted in.
+fn skin_base_theme(cfg: &Config, st: &SkinTheme) -> Theme {
+    let mut theme = load(DEFAULT_THEME, None).expect("built-in default theme parses");
+    let mut over = st.theme.colors.clone();
+    if cfg.winamp_viscolor_palette {
+        over.ansi = st.ansi;
+    }
+    theme.colors = theme.colors.overlaid(&over);
+    theme.name = st.theme.name.clone();
+    // The font hint only stands in for the default font, never for one the
+    // user configured.
+    if st.theme.font.family.is_some() && cfg.font.family == FontConfig::default().family {
+        theme.font = st.theme.font.clone();
+    }
+    theme
+}
+
+fn resolve_with(cfg: &Config, dir: Option<&Path>, skin_theme: Option<&SkinTheme>) -> Resolved {
     let wanted = cfg.theme.as_str();
-    let theme = match load(wanted, dir) {
-        Ok(t) => t,
-        Err(e) => {
-            log::error!("{e}; using the default theme");
-            load(DEFAULT_THEME, None).expect("built-in default theme parses")
-        }
+    let theme = match skin_theme.filter(|_| wanted == DEFAULT_THEME) {
+        Some(st) => skin_base_theme(cfg, st),
+        None => match load(wanted, dir) {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("{e}; using the default theme");
+                load(DEFAULT_THEME, None).expect("built-in default theme parses")
+            }
+        },
     };
     let colors = theme.colors.overlaid(&cfg.colors);
     let mut config = cfg.clone();

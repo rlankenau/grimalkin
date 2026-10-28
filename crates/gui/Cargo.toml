@@ -27,8 +27,10 @@ dirs = "7"
 sys-locale = "0.3"
 open = "5"
 bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 notify = "8"
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 
 # Windows clips the skinned window with a window region (skin/win.rs).
 [target.'cfg(windows)'.dependencies]

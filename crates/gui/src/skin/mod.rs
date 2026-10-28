@@ -5,6 +5,7 @@
 //! * `hit`     pure geometry: 9-slice mapping, layout, hit testing, shape rects
 //! * `chrome`  the GPU pass that draws frame, buttons and title
 //! * `win`     Windows only: `SetWindowRgn` from the shape mask
+//! * `winamp`   importer for WinAMP 2.x `.wsz` skins (docs/WINAMP_SKINS.md)
 //!
 //! This module loads skins (user directory first, then the built-ins that
 //! `build.rs` embeds from `assets/skins/`) and holds [`SkinRuntime`], the
@@ -15,6 +16,7 @@ pub mod chrome;
 pub mod hit;
 pub mod parse;
 pub mod win;
+pub mod winamp;
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -131,6 +133,9 @@ pub struct Skin {
     pub sheet: Option<Image>,
     /// Where it was loaded from (for logs).
     pub origin: String,
+    /// Colours (and font hint) the skin brings along; used while the skin is
+    /// active unless the user chose a theme. Only imported skins have one.
+    pub theme: Option<winamp::SkinTheme>,
 }
 
 impl Skin {
@@ -142,6 +147,9 @@ impl Skin {
 
     pub fn load_from(name: &str, user_dir: Option<&Path>) -> Result<Skin, String> {
         let name = name.trim();
+        if let Some(r) = winamp::resolve(name, user_dir) {
+            return r;
+        }
         let source = if name.contains('/') || name.contains('\\') {
             Source::Dir(PathBuf::from(name))
         } else if name.is_empty() || name.starts_with('.') {
@@ -201,6 +209,7 @@ impl Skin {
             frame2,
             shade_img,
             sheet,
+            theme: None,
         };
         log::info!("loaded skin {:?} from {}", skin.name, skin.origin);
         Ok(skin)

@@ -247,3 +247,71 @@ The Skin Museum API (`POST https://api.webamp.org/graphql`,
 `skins.webamp.org/skin/<md5>/<name>.wsz` returned an HTML page when fetched
 with curl, so use the `r2.webampskins.org/skins/<md5>.wsz` URL for raw files.
 **Do not commit** these files; tests download them on demand.
+
+## 7. As implemented (deviations from the plan above)
+
+Code: `crates/gui/src/skin/winamp.rs` with submodules `archive` (zip or
+unpacked directory), `compose` (sprite table, frame/shade/sheet), `text`
+(`pledit.txt`, `viscolor.txt`, derived theme) and `install` (CLI). All seven
+sample skins load and were checked visually against their playlist windows.
+
+* **API**: `winamp::from_wsz(bytes, name, font_ok) -> Result<Skin, String>`.
+  The theme travels inside the skin (`Skin.theme: Option<SkinTheme>`), so there
+  is no `(Skin, Theme)` tuple. `theme::resolve_for_skin` uses it as the base
+  when `theme` is still `"default"`; `[colors]` overrides still win. The
+  unit tests synthesise a 280x186 BMP/zip; real-skin tests read
+  `GRIMALKIN_WSZ_SAMPLE_DIR` (default: the session scratch directory) and skip
+  silently when the files are absent. `GRIMALKIN_WSZ_DUMP_DIR=dir cargo test
+  dump_composed` writes the composed frame/shade/sheet PNGs for inspection.
+* **Viewport inset**: the engine already draws the viewport over the 9-slice
+  caps, so no engine change was needed for `viewport_inset` < slices; the only
+  requirement is that the viewport covers the centre patch. Hence
+  `viewport_inset.top` is 20 (not 23) and `bottom` is 38: Winamp's 3 px of
+  padding above the list are simply list-background colour inside the viewport.
+  The hidden part of the left and right columns is painted `NormalBG`.
+* **Engine extensions** (additive, TOML-visible, see SKINS.md):
+  `[titlebar] image = { sprite, size, align }` draws the 100x20 title art
+  (read from the button sheet) centred on the titlebar, and
+  `shaded_sprite` on a button picks another sprite while shaded (the shade
+  button shows WinAMP's *expand* art on the shade bar). No title text is drawn.
+* **Button sheet**: 100 x 47; columns close, shade, expand (9 px each), rows
+  normal, hover, pressed; the title art sits at y = 27. Hover is the normal art
+  (WinAMP has no hover art); pressed comes from the dedicated sprites. The
+  normal art is cropped from the focused top-right corner (close at
+  corner-x 14, shade at 4) and from the shade bar's right cap (expand at 29).
+* **shade.png** is 300 px wide (not 275) so the engine's 3-slice with the
+  frame's 125/150 caps keeps the 25 px left cap and 50 px right cap intact; the
+  middle is the tiled `SHADE_BACKGROUND`.
+* **Not used**: the unfocused variants (the engine has no focus state), the
+  visualiser background, menu pop-up sprites, scroll thumb, `region.txt`,
+  `main.bmp`. The frame is always opaque and rectangular.
+* **Theme**: contrast rules as in section 3 (selection text falls back to
+  `Current` when `Normal` has contrast < 3 on `SelectedBG`); additionally the
+  cursor falls back to `Normal` when `Current` has contrast < 1.5 on `NormalBG`
+  (a few skins use list-coloured `Current`). The `Font=` hint is applied only
+  if the family is installed **and monospaced** (fontdb's flag; almost every
+  skin says Arial, which would break the cell grid) and only while `[font]
+  family` is the default. The probe (`fonts::monospace_family_installed`)
+  uses the font index, so only matching font files are opened.
+* **ANSI palette**: the config key is `winamp_viscolor_palette = true` (top
+  level of `grimalkin.toml`), not `winamp_ansi`. `cyan` is
+  `lerp(green, c[19], 0.5)` (the spec's `c[10]` alternative was dropped).
+  Skins without `viscolor.txt` use the stock table.
+* **Lookup**: besides `winamp:<name>` and a path to a `.wsz`, `winamp:<path>`
+  and an unpacked directory (any depth up to 4) containing `pledit.bmp` (and no
+  `skin.toml`) work. Names are matched against the skins directory listing,
+  never joined into a path.
+* **Limits**: 8 MiB per entry, 64 MiB inflated per archive (and as file size),
+  20 000 entries, images at most 4096 x 4096. Entries are never written to disk.
+* **CLI**: `--install-skin` accepts a local file or an `https://` URL
+  (plain `http://` is refused), downloads with a 30 s timeout and a **20 MB**
+  cap (not 8 MiB), requires `PK\x03\x04`, validates by running the importer,
+  writes `<name>.wsz` via a temp file, refuses to overwrite without `--force`
+  and prints `Installed. Add to grimalkin.toml:  skin = "winamp:<name>"`.
+  Museum page links map to `r2.webampskins.org/skins/<md5>.wsz`; the name comes
+  from the page URL when it has one, else the hash. `--list-skins` prints the
+  built-ins, user skin folders and `winamp:<name>` for each installed `.wsz`.
+* **Windows**: everything is portable code (no OS-specific parts). The release
+  build uses the GUI subsystem, so like `--help` and `--list-themes` the CLI
+  output of `--install-skin` is not visible from a console there; the exit
+  code is correct.

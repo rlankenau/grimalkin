@@ -46,6 +46,8 @@ cargo run --release -p grimalkin -- [OPTIONS] [-e COMMAND [ARGS...]]
 | `--skin NAME` | Use a window skin (llama, grimalkin, mint, or a path; `none` = normal window) |
 | `--theme NAME` | Use this color theme (overrides `theme` in the config) |
 | `--list-themes` | List built-in and user themes, then exit |
+| `--list-skins` | List built-in skins and installed WinAMP skins, then exit |
+| `--install-skin PATH_OR_URL` | Install a WinAMP `.wsz` (local file or https URL) and exit; `--force` overwrites |
 | `-h`, `--help` / `-V`, `--version` | Help / version |
 
 The release binary is `target/release/grimalkin`.
@@ -117,6 +119,35 @@ optionally `shade.png` and `frame@2x.png`; put yours in
 built-in skins are drawn. On a skinned window the grid starts at the skin's
 viewport inset plus `[window] padding`; the skin's `viewport_background` is the
 terminal background unless you chose a theme or `[colors] background`.
+
+### WinAMP skins
+
+Classic WinAMP 2.x skins (`.wsz`) work as window frames. Grimalkin uses the
+artwork of the **playlist editor** window (`pledit.bmp`), the one WinAMP window
+that resizes, so the terminal sits inside a real WinAMP playlist frame (title
+art, close and windowshade buttons, the bottom bar), and `pledit.txt` supplies
+the colors. Browse thousands of skins at the
+[Skin Museum](https://skins.webamp.org), then:
+
+```sh
+grimalkin --install-skin https://skins.webamp.org/skin/<md5>/     # a museum page, a direct .wsz URL or a local file
+grimalkin --list-skins
+```
+
+and put the name it prints in `grimalkin.toml`:
+
+```toml
+skin = "winamp:base-2.91"          # <config dir>/grimalkin/skins/base-2.91.wsz
+# skin = "C:/skins/Cool.wsz"       # a path to a .wsz, or to an unpacked folder with pledit.bmp, also works
+# winamp_viscolor_palette = true   # optionally take the 16 ANSI colors from the skin's viscolor.txt
+```
+
+While a WinAMP skin is active its `pledit.txt` colors (text, list background,
+selection, current-track color) become the theme, unless you set `theme =` (or
+`--theme`) yourself; `[colors]` overrides still apply on top. A `Font=` hint is
+used only if that font is installed *and* monospaced. Skins are read from the
+archive on every launch and never extracted to disk. Details and deviations
+from the original spec: [docs/WINAMP_SKINS.md](docs/WINAMP_SKINS.md).
 
 ### Themes and live reload
 

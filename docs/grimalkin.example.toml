@@ -13,6 +13,11 @@ scrollback_lines = 10000
 # for the normal OS window. Built-ins: llama, grimalkin, mint (and debug).
 # `grimalkin --skin NAME` overrides it.
 skin = "none"
+# WinAMP skins: `skin = "winamp:NAME"` loads <config dir>/grimalkin/skins/NAME.wsz
+# (install one with `grimalkin --install-skin PATH_OR_URL`); a path to a .wsz also
+# works. Their pledit.txt colors become the theme unless you set `theme`.
+# With this on, the skin's viscolor.txt also sets the 16 ANSI colors.
+winamp_viscolor_palette = false
 
 # Program to run in the terminal. Empty means your default shell ($SHELL on
 # Unix; pwsh, powershell or cmd on Windows). `grimalkin -e CMD ARGS...`

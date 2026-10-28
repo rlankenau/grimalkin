@@ -320,6 +320,32 @@ impl Chrome {
         // Button sprites: normal / hover / pressed stacked vertically.
         if let Some(sheet) = &skin.sheet {
             let start = self.insts.len();
+            // Titlebar picture (not on the thin shade bar).
+            if let (false, Some(img), Some(tb)) = (
+                view.shaded,
+                skin.def.titlebar.as_ref().and_then(|t| t.image),
+                layout.titlebar,
+            ) {
+                let (w, h) = (img.size[0] * scale, img.size[1] * scale);
+                if img.size[0] > 0
+                    && img.size[1] > 0
+                    && img.sprite[0] + img.size[0] <= sheet.w
+                    && img.sprite[1] + img.size[1] <= sheet.h
+                {
+                    let dx = match img.align {
+                        Align::Left => 0,
+                        Align::Center => (tb.w - w as i32) / 2,
+                        Align::Right => tb.w - w as i32,
+                    };
+                    let (x, y) = (tb.x + dx.max(0), tb.y + ((tb.h - h as i32) / 2).max(0));
+                    self.insts.push(ChromeInst {
+                        dst: [x as f32, y as f32, w as f32, h as f32],
+                        src: [img.sprite[0] as f32, img.sprite[1] as f32, img.size[0] as f32, img.size[1] as f32],
+                        params: [1, 1, scale, 0],
+                        color: [255; 4],
+                    });
+                }
+            }
             let b = &skin.def.buttons;
             for (kind, def) in [
                 (ButtonKind::Close, b.close),
@@ -340,16 +366,17 @@ impl Chrome {
                     0
                 };
                 let mut state = state;
+                let sprite = if view.shaded { def.shaded_sprite.unwrap_or(def.sprite) } else { def.sprite };
                 // Sheets without hover/pressed rows fall back to normal.
-                if def.sprite[1] + (state + 1) * h > sheet.h {
+                if sprite[1] + (state + 1) * h > sheet.h {
                     state = 0;
                 }
-                if def.sprite[0] + w > sheet.w || def.sprite[1] + h > sheet.h {
+                if sprite[0] + w > sheet.w || sprite[1] + h > sheet.h {
                     continue;
                 }
                 self.insts.push(ChromeInst {
                     dst: [r.x as f32, r.y as f32, r.w as f32, r.h as f32],
-                    src: [def.sprite[0] as f32, (def.sprite[1] + state * h) as f32, w as f32, h as f32],
+                    src: [sprite[0] as f32, (sprite[1] + state * h) as f32, w as f32, h as f32],
                     params: [1, 1, scale, 0],
                     color: [255; 4],
                 });

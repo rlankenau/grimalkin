@@ -282,6 +282,10 @@ pub struct Config {
     /// or the built-ins, a directory path, or `"none"` for the normal OS
     /// window. Overridden by `--skin`.
     pub skin: String,
+    /// WinAMP skins (`skin = "winamp:<name>"`) also set the ANSI palette from
+    /// their `viscolor.txt`. Off by default: the result is a mood, not a
+    /// calibrated palette.
+    pub winamp_viscolor_palette: bool,
     /// Program to run; empty means the user's default shell.
     pub shell: String,
     pub shell_args: Vec<String>,
@@ -301,6 +305,7 @@ impl Default for Config {
             pty: PtyConfig::default(),
             scrollback_lines: 10_000,
             skin: "none".to_string(),
+            winamp_viscolor_palette: false,
             shell: String::new(),
             shell_args: Vec::new(),
         }

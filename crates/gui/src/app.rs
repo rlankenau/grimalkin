@@ -103,7 +103,7 @@ impl App {
             None
         };
         // The theme's font/cursor settings are folded into the effective config.
-        let resolved = theme::resolve(&self.cfg);
+        let resolved = theme::resolve_for_skin(&self.cfg, skin.as_deref());
         let palette = skin_palette(resolved.palette, &self.cfg, skin.as_deref());
         let cfg = &resolved.config;
         let mut attrs = Window::default_attributes()
@@ -622,9 +622,9 @@ impl Running {
             raw.skin = s.clone();
         }
         self.swap_skin(&raw.skin);
-        let resolved = theme::resolve(&raw);
-        log::info!("config reloaded (theme: {})", resolved.name);
         let skin = self.skin.as_ref().map(|r| r.skin.clone());
+        let resolved = theme::resolve_for_skin(&raw, skin.as_deref());
+        log::info!("config reloaded (theme: {})", resolved.name);
         let palette = skin_palette(resolved.palette, &raw, skin.as_deref());
         apply_palette(&mut self.term, &mut self.renderer, &palette);
         let new = resolved.config;
