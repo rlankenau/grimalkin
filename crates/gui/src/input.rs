@@ -32,6 +32,8 @@ pub enum KeyAction {
     Copy,
     Paste,
     Zoom(ZoomOp),
+    /// Cmd+, (macOS) / Ctrl+, (elsewhere): open the Preferences window.
+    OpenPreferences,
     /// Scroll the scrollback by this many pages (positive = older).
     ScrollPages(i32),
 }
@@ -163,17 +165,34 @@ fn is_zoom_reset(code: KeyCode) -> bool {
     matches!(code, KeyCode::Digit0 | KeyCode::Numpad0)
 }
 
+/// Ctrl+, off macOS (on macOS Cmd+, is the menu's accelerator and is matched
+/// below as a Cmd shortcut so it also works when the menu is missing).
+fn is_prefs_key(code: KeyCode, mods: ModifiersState) -> bool {
+    code == KeyCode::Comma
+        && if IS_MAC {
+            mods.super_key() && !mods.control_key() && !mods.alt_key() && !mods.shift_key()
+        } else {
+            mods.control_key() && !mods.shift_key() && !mods.alt_key() && !mods.super_key()
+        }
+}
+
 fn shortcut(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> Option<KeyAction> {
     let PhysicalKey::Code(code) = input.physical else { return None };
     if !input.pressed {
         // Releases of shortcut keys are swallowed so the kitty protocol hook
         // never sees half of a shortcut.
-        let is_shortcut_key = matches!(code, KeyCode::KeyC | KeyCode::KeyV)
+        if is_prefs_key(code, mods) {
+            return Some(KeyAction::None);
+        }
+        let is_shortcut_key = matches!(code, KeyCode::KeyC | KeyCode::KeyV | KeyCode::Comma)
             || is_zoom_in(code)
             || is_zoom_out(code)
             || is_zoom_reset(code);
         let combo = (mods.control_key() && mods.shift_key()) || (IS_MAC && mods.super_key());
         return (is_shortcut_key && combo).then_some(KeyAction::None);
+    }
+    if is_prefs_key(code, mods) {
+        return Some(KeyAction::OpenPreferences);
     }
     let ctrl_shift = mods.control_key() && mods.shift_key() && !mods.alt_key() && !mods.super_key();
     let cmd = IS_MAC && mods.super_key() && !mods.control_key() && !mods.alt_key();
@@ -1026,6 +1045,14 @@ mod tests {
             translate(&key(KeyCode::PageUp), ModifiersState::SHIFT, &s),
             KeyAction::ScrollPages(1)
         );
+        let prefs = if IS_MAC { ModifiersState::SUPER } else { ModifiersState::CONTROL };
+        assert_eq!(translate(&key(KeyCode::Comma), prefs, &s), KeyAction::OpenPreferences);
+        let mut rel = key(KeyCode::Comma);
+        rel.pressed = false;
+        assert_eq!(translate(&rel, prefs, &s), KeyAction::None);
+        // Plain comma and Ctrl+Shift+, are not the shortcut.
+        assert_ne!(translate(&key(KeyCode::Comma), ModifiersState::empty(), &s), KeyAction::OpenPreferences);
+        assert_ne!(translate(&key(KeyCode::Comma), prefs | ModifiersState::SHIFT, &s), KeyAction::OpenPreferences);
         let mut alt = s;
         alt.alt_screen = true;
         assert_eq!(

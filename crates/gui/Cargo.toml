@@ -29,6 +29,7 @@ open = "5"
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 notify = "8"
+toml_edit = "0.25"
 zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
 ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 
@@ -42,3 +43,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSGeometry", "NSArray"] }
 objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSScreen", "NSWindow", "NSView", "NSResponder"] }
+
+# Native menus: the macOS menu bar, and the right-click context menu on macOS
+# and Windows. Linux (GTK-only in muda) has no menus yet. The window handle is
+# needed to anchor a context menu to the native view/HWND.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+muda = { version = "0.21", default-features = false }
+raw-window-handle = "0.6"

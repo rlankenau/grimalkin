@@ -10,6 +10,7 @@
 //! * Timers (cursor blink, the synchronized-output poll) use
 //!   `ControlFlow::WaitUntil` from `about_to_wait`; nothing busy-loops.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -26,9 +27,11 @@ use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, ResizeDirection, UserAttentionType, Window, WindowId};
 
 use crate::config::{Config, CursorShapeCfg};
+use crate::config_edit::ConfigEditor;
 use crate::graphics_glue::Graphics;
 use crate::input::{self, EncodeState, KeyAction, KeyInput, MouseBtn, MouseEvent, MouseKind, ZoomOp};
 use crate::links;
+use crate::menu::{AppMenus, MenuAction};
 use crate::reload::{self, ReloadCtx};
 use crate::theme;
 use crate::renderer::{FrameStatus, Renderer, ViewState};
@@ -40,7 +43,7 @@ use crate::skin::{self, Action, Skin, SkinRuntime};
 use crate::LaunchOptions;
 
 /// Events delivered to the loop through its `EventLoopProxy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserEvent {
     /// The pty produced output or exited.
     PtyWake,
@@ -51,6 +54,37 @@ pub enum UserEvent {
     ConfigChanged,
     /// Step `n` of the `GRIMALKIN_DEBUG_SCRIPT` test script.
     Debug(usize),
+    /// Cmd+, / Ctrl+, was pressed in the terminal window.
+    OpenPreferences,
+    /// A menu item (menu bar or context menu) was chosen.
+    MenuAction(MenuAction),
+}
+
+/// What a secondary window wants after handling an event.
+#[allow(dead_code)] // stage 2 (Preferences window) is the first implementer
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondaryFlow {
+    Keep,
+    /// Drop the window (and so close it).
+    Close,
+}
+
+/// A window besides the terminal: Preferences, About, ... The app routes its
+/// `WindowEvent`s here by `WindowId`; the terminal window keeps its own path.
+#[allow(dead_code)] // stage 2 (Preferences window) is the first implementer
+pub trait SecondaryWindow {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) -> SecondaryFlow;
+    /// Ask the window to repaint (also used to re-read the config after it changed).
+    fn request_redraw(&self);
+    fn window(&self) -> &Window;
+}
+
+/// Open a file, folder or URL with the OS default handler.
+fn open_in_os(target: impl AsRef<std::ffi::OsStr>) {
+    let target = target.as_ref();
+    if let Err(e) = open::that_detached(target) {
+        log::error!("cannot open {}: {e}", target.to_string_lossy());
+    }
 }
 
 /// Max bytes of pty output processed per wake so input and redraws stay
@@ -67,6 +101,10 @@ pub struct App {
     proxy: EventLoopProxy<UserEvent>,
     wake_pending: Arc<AtomicBool>,
     running: Option<Running>,
+    /// Windows other than the terminal, by id.
+    secondary: HashMap<WindowId, Box<dyn SecondaryWindow>>,
+    /// Menu bar / context menu (built once the loop runs; main thread only).
+    menus: Option<AppMenus>,
     fatal: Option<String>,
     /// `GRIMALKIN_DEBUG_SCRIPT` commands (empty normally).
     debug_cmds: Vec<String>,
@@ -81,8 +119,103 @@ impl App {
             proxy,
             wake_pending: Arc::new(AtomicBool::new(false)),
             running: None,
+            secondary: HashMap::new(),
+            menus: None,
             fatal: None,
             debug_cmds,
+        }
+    }
+
+    /// Show a window besides the terminal: its events are routed to it.
+    #[allow(dead_code)] // stage 2 (Preferences window)
+    pub fn add_secondary(&mut self, w: Box<dyn SecondaryWindow>) {
+        self.secondary.insert(w.window().id(), w);
+    }
+
+    /// The config file the app edits and watches (`--config` or the default).
+    fn config_path(&self) -> Option<PathBuf> {
+        self.launch.config_path.clone().or_else(Config::default_path)
+    }
+
+    /// Run `f` on the user's config file and save it; the reload watcher
+    /// applies the change to the running window.
+    fn edit_config(&self, what: &str, f: impl FnOnce(&mut ConfigEditor) -> std::io::Result<()>) {
+        let Some(path) = self.config_path() else {
+            log::error!("{what}: no config file location");
+            return;
+        };
+        let result = ConfigEditor::open_at(&path).and_then(|mut ed| {
+            f(&mut ed)?;
+            ed.save()
+        });
+        if let Err(e) = result {
+            log::error!("{what}: cannot update {}: {e}", path.display());
+        }
+    }
+
+    /// Write `key = value` to the config, unless it is already set that way
+    /// (then only a reload is requested, so a `--theme` override that was just
+    /// dropped still takes effect).
+    fn set_config_string(&self, key: &str, value: &str) {
+        self.edit_config(&format!("set {key}"), |ed| {
+            if ed.get(key).and_then(|v| v.as_str()) == Some(value) {
+                let _ = self.proxy.send_event(UserEvent::ConfigChanged);
+                return Ok(());
+            }
+            ed.set(key, value)?;
+            Ok(())
+        });
+    }
+
+    fn open_preferences(&mut self) {
+        log::info!("Preferences: not implemented yet (stage 2)");
+    }
+
+    fn menu_action(&mut self, action: MenuAction) {
+        log::debug!("menu action {action:?}");
+        match action {
+            MenuAction::OpenPreferences => self.open_preferences(),
+            MenuAction::SetTheme(name) => {
+                // An explicit pick beats the `--theme` launch option.
+                if let Some(r) = self.running.as_mut() {
+                    r.reload.theme_override = None;
+                }
+                self.set_config_string("theme", &name);
+            }
+            MenuAction::SetSkin(name) => {
+                if let Some(r) = self.running.as_mut() {
+                    r.reload.skin_override = None;
+                }
+                self.set_config_string("skin", &name);
+            }
+            MenuAction::ZoomIn | MenuAction::ZoomOut | MenuAction::ZoomReset | MenuAction::Copy | MenuAction::Paste => {
+                if let Some(r) = self.running.as_mut() {
+                    match action {
+                        MenuAction::ZoomIn => r.zoom(ZoomOp::In),
+                        MenuAction::ZoomOut => r.zoom(ZoomOp::Out),
+                        MenuAction::ZoomReset => r.zoom(ZoomOp::Reset),
+                        MenuAction::Copy => r.copy(),
+                        _ => r.paste(),
+                    }
+                }
+            }
+            MenuAction::OpenConfigFile => {
+                // Creates the file from the example first if it is missing.
+                let Some(path) = self.config_path() else { return };
+                match ConfigEditor::open_at(&path) {
+                    Ok(ed) => open_in_os(ed.path()),
+                    Err(e) => log::error!("cannot open {}: {e}", path.display()),
+                }
+            }
+            MenuAction::RevealThemesFolder => {
+                let Some(dir) = theme::user_dir() else { return };
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    log::error!("cannot create {}: {e}", dir.display());
+                    return;
+                }
+                open_in_os(&dir);
+            }
+            MenuAction::About => open_in_os(env!("CARGO_PKG_REPOSITORY")),
         }
     }
 
@@ -248,6 +381,8 @@ impl App {
             proxy: self.proxy.clone(),
             wake_pending: self.wake_pending.clone(),
             exit_requested: false,
+            menu_accels: false,
+            context_menu_requested: false,
         };
         running.update_skin_min_size();
         Ok(running)
@@ -261,6 +396,10 @@ impl ApplicationHandler<UserEvent> for App {
         }
         match self.start(event_loop) {
             Ok(mut r) => {
+                // NSApp exists now: install the menu bar (macOS) and build the
+                // context menu.
+                self.menus = AppMenus::new(self.proxy.clone(), &r.cfg.theme, &r.cfg.skin);
+                r.menu_accels = self.menus.as_ref().is_some_and(AppMenus::has_menu_bar);
                 r.redraw();
                 self.running = Some(r);
             }
@@ -277,24 +416,52 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Debug(i) => self.debug_cmds.get(i).cloned(),
             _ => None,
         };
+        let event = match event {
+            UserEvent::OpenPreferences => return self.open_preferences(),
+            UserEvent::MenuAction(action) => return self.menu_action(action),
+            e => e,
+        };
         let Some(r) = self.running.as_mut() else { return };
         match event {
             UserEvent::Debug(_) => {
                 if let Some(c) = cmd {
                     r.debug_command(&c);
                 }
+                if std::mem::take(&mut r.context_menu_requested) {
+                    if let Some(m) = self.menus.as_ref() {
+                        m.show_context_menu(&r.window);
+                    }
+                }
             }
             UserEvent::PtyWake => r.on_pty_wake(),
             UserEvent::Redraw => r.window.request_redraw(),
-            UserEvent::ConfigChanged => r.reload_config(),
+            UserEvent::ConfigChanged => {
+                r.reload_config();
+                if let Some(m) = self.menus.as_mut() {
+                    m.sync(&r.cfg.theme, &r.cfg.skin);
+                }
+                for w in self.secondary.values() {
+                    w.request_redraw();
+                }
+            }
+            UserEvent::OpenPreferences | UserEvent::MenuAction(_) => {}
         }
         if r.exit_requested {
             event_loop.exit();
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let Some(w) = self.secondary.get_mut(&id) {
+            if w.window_event(event_loop, event) == SecondaryFlow::Close {
+                self.secondary.remove(&id);
+            }
+            return;
+        }
         let Some(r) = self.running.as_mut() else { return };
+        if r.window.id() != id {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -334,6 +501,11 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => r.on_wheel(delta),
             WindowEvent::DroppedFile(path) => r.on_dropped_file(path),
             _ => {}
+        }
+        if std::mem::take(&mut r.context_menu_requested) {
+            if let Some(m) = self.menus.as_ref() {
+                m.show_context_menu(&r.window);
+            }
         }
         if r.exit_requested {
             event_loop.exit();
@@ -405,6 +577,12 @@ struct Running {
     proxy: EventLoopProxy<UserEvent>,
     wake_pending: Arc<AtomicBool>,
     exit_requested: bool,
+    /// The menu bar owns the Cmd+C/V/+/-/0/, accelerators (macOS): ignore
+    /// those key events here so an action never runs twice.
+    menu_accels: bool,
+    /// A right click asked for the context menu (at the pointer); the
+    /// app shows it (it owns the menus) once the event is handled.
+    context_menu_requested: bool,
 }
 
 /// The skin's `viewport_background` stands in for the terminal background
@@ -874,9 +1052,16 @@ impl Running {
                 self.reset_blink();
                 self.send(&bytes);
             }
+            // With menu accelerators the menu already ran these for the same
+            // keystroke; Ctrl+Shift+C and friends still come through here.
+            KeyAction::Copy | KeyAction::Paste | KeyAction::Zoom(_) | KeyAction::OpenPreferences
+                if self.menu_accels && self.mods.super_key() => {}
             KeyAction::Copy => self.copy(),
             KeyAction::Paste => self.paste(),
             KeyAction::Zoom(op) => self.zoom(op),
+            KeyAction::OpenPreferences => {
+                let _ = self.proxy.send_event(UserEvent::OpenPreferences);
+            }
             KeyAction::ScrollPages(p) => {
                 let page = self.term.rows().saturating_sub(1).max(1) as i32;
                 if self.term.scroll_display(p * page) {
@@ -1083,6 +1268,14 @@ impl Running {
                     self.on_mouse_button(ElementState::Released, MouseButton::Left);
                 }
             }
+            // `menu:ID` runs a menu action (ids as in menu.rs) through the real
+            // menu path; `rightclick` opens the context menu at the pointer.
+            "menu" => {
+                if let Some(action) = MenuAction::from_id(arg) {
+                    let _ = self.proxy.send_event(UserEvent::MenuAction(action));
+                }
+            }
+            "rightclick" => self.on_mouse_button(ElementState::Pressed, MouseButton::Right),
             "shade" => self.run_skin_action(Action::ToggleShade),
             "size" => {
                 if let Some((w, h)) = arg.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))) {
@@ -1461,6 +1654,14 @@ impl Running {
             _ => return,
         };
         let pressed = state == ElementState::Pressed;
+        // Right click opens the context menu unless the program is using the
+        // mouse (Shift always bypasses reporting, so Shift+right click opens it).
+        if button == MouseButton::Right && (self.term.mouse_mode() == grimalkin_vt::MouseMode::None || self.mods.shift_key()) {
+            if pressed {
+                self.context_menu_requested = true;
+            }
+            return;
+        }
         if button == MouseButton::Left && self.skin_mouse_button(pressed) {
             return;
         }

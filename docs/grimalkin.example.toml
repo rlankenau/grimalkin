@@ -25,6 +25,17 @@ winamp_viscolor_palette = false
 shell = ""
 shell_args = []
 
+# Color theme: a built-in name (run `grimalkin --list-themes`: default,
+# catppuccin-mocha, dracula, gruvbox-dark, solarized-light, nord, tokyo-night)
+# or a file of your own. Themes are looked up in
+#   <config dir>/grimalkin/themes/NAME.toml   (grimalkin format, see below)
+#   <config dir>/grimalkin/themes/NAME.conf   (kitty format: drop in any theme
+#                                              from kitty-themes)
+# and then among the built-ins. `grimalkin --theme NAME` overrides this.
+# The config file is watched: saving it (or a theme file) re-applies the theme,
+# colors and font without restarting.
+theme = "default"
+
 [font]
 # Families in fallback order. The first installed one defines the cell size.
 # A single string also works: family = "JetBrains Mono"
@@ -49,17 +60,6 @@ opacity = 1.0
 title = "grimalkin"
 # Follow window titles set by programs (OSC 0/2).
 dynamic_title = true
-
-# Color theme: a built-in name (run `grimalkin --list-themes`: default,
-# catppuccin-mocha, dracula, gruvbox-dark, solarized-light, nord, tokyo-night)
-# or a file of your own. Themes are looked up in
-#   <config dir>/grimalkin/themes/NAME.toml   (grimalkin format, see below)
-#   <config dir>/grimalkin/themes/NAME.conf   (kitty format: drop in any theme
-#                                              from kitty-themes)
-# and then among the built-ins. `grimalkin --theme NAME` overrides this.
-# The config file is watched: saving it (or a theme file) re-applies the theme,
-# colors and font without restarting.
-theme = "default"
 
 # Per-key overrides applied on top of the theme. Everything is optional; the
 # values shown are those of the "default" theme.

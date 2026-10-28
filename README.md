@@ -203,6 +203,16 @@ and a normal window needs a restart). A file with a syntax error is reported
 in the log and the running settings are kept. (`--theme` and `--skin` keep
 winning over the file.)
 
+## Menus
+
+macOS has a menu bar: Settings... (Cmd+,), Edit (Copy, Paste), View (zoom,
+and Themes / Skins submenus that switch live by editing `grimalkin.toml` in
+place, keeping its comments), Window and Help (open the config file, reveal
+the themes folder). On macOS and Windows, right-click opens the same items as a
+context menu (when the program is not using the mouse; Shift+right-click
+always). Windows keeps the skinned window chrome-free, so it has no menu bar.
+Linux has no menus yet.
+
 ## Key bindings
 
 "Mod" is Ctrl+Shift on Windows/Linux, and Cmd (or Ctrl+Shift) on macOS.
@@ -213,6 +223,7 @@ winning over the file.)
 | Mod+V, Shift+Insert | Paste |
 | Mod++ / Mod+- | Zoom in / out |
 | Mod+0 | Reset zoom |
+| Cmd+, (macOS) / Ctrl+, | Preferences (stub for now) |
 | Shift+PageUp / Shift+PageDown | Scroll a page (main screen) |
 | Mouse wheel | Scroll scrollback (or sent to the app in mouse mode) |
 

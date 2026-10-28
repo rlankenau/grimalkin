@@ -142,9 +142,50 @@ impl Source {
 }
 
 /// Names of the skins embedded in the binary.
-#[allow(dead_code)] // for tooling / docs
 pub fn builtin_names() -> Vec<&'static str> {
     BUILTIN_SKINS.iter().map(|(n, _)| *n).collect()
+}
+
+/// Every skin the user can pick, as `(config value, menu label)`, in groups
+/// (no skin; built-ins; skins in the user directory; installed WinAMP
+/// `.wsz`). Empty groups are left out. The internal `debug` skin is hidden.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))] // only the native menus list skins
+pub fn choices(user_dir: Option<&Path>) -> Vec<Vec<(String, String)>> {
+    let builtins = builtin_names()
+        .into_iter()
+        .filter(|n| *n != "debug")
+        .map(|n| (n.to_string(), n.to_string()))
+        .collect();
+    let mut user: Vec<(String, String)> = Vec::new();
+    let mut winamp: Vec<(String, String)> = Vec::new();
+    if let Some(dir) = user_dir {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if e.path().join("skin.toml").is_file() && !name.starts_with('.') {
+                    user.push((name.clone(), name));
+                }
+            }
+        }
+        user.sort_by_key(|(n, _)| n.to_lowercase());
+        winamp = winamp::installed(dir)
+            .into_iter()
+            .map(|(n, _)| (format!("winamp:{n}"), format!("WinAMP: {n}")))
+            .collect();
+    }
+    let mut groups = vec![vec![("none".to_string(), "None (system window)".to_string())], builtins, user, winamp];
+    groups.retain(|g| !g.is_empty());
+    groups
+}
+
+/// Is the `skin` config value `current` the menu choice `value`?
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+pub fn same_choice(current: &str, value: &str) -> bool {
+    let (c, v) = (current.trim(), value.trim());
+    if !is_active(c) || !is_active(v) {
+        return !is_active(c) && !is_active(v);
+    }
+    c.eq_ignore_ascii_case(v)
 }
 
 /// `<config_dir>/grimalkin/skins`.

@@ -10,7 +10,8 @@
 //! Commands: `move:X,Y` (window pixels), `hover:BUTTON`, `down`, `up`,
 //! `click`, `dblclick`, `press:BUTTON` (move onto the button and press
 //! without releasing), `shade`, `maximize`, `size:WxH` (physical inner size), `check` (log whether
-//! chrome and window agree), `dump:PATH` (redirect the frame dump), `exit`.
+//! chrome and window agree), `dump:PATH` (redirect the frame dump), `menu:ID` (run a menu action, e.g.
+//! `menu:theme:nord`), `rightclick` (context menu at the pointer), `exit`.
 
 use std::time::Duration;
 

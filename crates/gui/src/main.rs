@@ -1,7 +1,8 @@
 //! Grimalkin: a GPU-accelerated terminal emulator.
 //!
 //! Module map (each is meant to be extended independently):
-//! * `config`        TOML configuration
+//! * `config`        TOML configuration; `config_edit` edits the file in place
+//! * `menu`          native menu bar (macOS) and context menu
 //! * `app`           window/event loop glue, pty + terminal ownership
 //! * `renderer`      wgpu renderer (grid instances, cursor); `glyphs` fonts/atlas;
 //!   `boxdraw` procedural box/block characters
@@ -18,6 +19,7 @@ mod app;
 mod bell;
 mod boxdraw;
 mod config;
+mod config_edit;
 mod debug_script;
 mod fonts;
 mod glyphs;
@@ -25,6 +27,7 @@ mod graphics_glue;
 mod images;
 mod input;
 mod links;
+mod menu;
 mod pointer;
 mod reload;
 mod renderer;
