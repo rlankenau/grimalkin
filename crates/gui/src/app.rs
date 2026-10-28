@@ -130,7 +130,7 @@ impl App {
             cmd,
             args,
             cwd: self.launch.working_directory.clone(),
-            env: Vec::new(),
+            env: crate::terminfo::child_env(),
             cols: cols as u16,
             rows: rows as u16,
             pixel_width: (cols as u32 * cw).min(u16::MAX as u32) as u16,
@@ -174,6 +174,7 @@ impl App {
             blink_deadline: None,
             sync_poll: None,
             redraw_retry: None,
+            retries: 0,
             cfg: cfg.clone(),
             proxy: self.proxy.clone(),
             wake_pending: self.wake_pending.clone(),
@@ -216,6 +217,11 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                // A minimized window reports 0x0 on some platforms: keep the
+                // grid (and the child's idea of its size) as it was.
+                if size.width == 0 || size.height == 0 {
+                    return;
+                }
                 r.renderer.resize(size.width, size.height);
                 r.apply_grid_resize();
                 r.window.request_redraw();
@@ -223,7 +229,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 r.renderer.set_scale_factor(scale_factor, r.cfg.window.padding);
                 let s = r.window.inner_size();
-                r.renderer.resize(s.width, s.height);
+                if s.width > 0 && s.height > 0 {
+                    r.renderer.resize(s.width, s.height);
+                }
                 r.apply_grid_resize();
                 r.window.request_redraw();
             }
@@ -292,10 +300,20 @@ struct Running {
     blink_deadline: Option<Instant>,
     sync_poll: Option<Instant>,
     redraw_retry: Option<Instant>,
+    /// Consecutive `FrameStatus::Retry` results.
+    retries: u8,
     cfg: Config,
     proxy: EventLoopProxy<UserEvent>,
     wake_pending: Arc<AtomicBool>,
     exit_requested: bool,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        // Window closed (or the child exited): make sure no child outlives us.
+        // Bounded so closing the window can never hang.
+        self.pty.shutdown(Duration::from_millis(300));
+    }
 }
 
 impl Running {
@@ -449,11 +467,12 @@ impl Running {
         }
         if self.last_pty_size != (cols, rows) {
             self.last_pty_size = (cols, rows);
+            let clamp16 = |v: u64| v.min(u16::MAX as u64) as u16;
             let _ = self.pty.resize(
-                cols as u16,
-                rows as u16,
-                (cols as u32 * cw).min(u16::MAX as u32) as u16,
-                (rows as u32 * ch).min(u16::MAX as u32) as u16,
+                clamp16(cols as u64).max(1),
+                clamp16(rows as u64).max(1),
+                clamp16(cols as u64 * cw as u64),
+                clamp16(rows as u64 * ch as u64),
             );
         }
     }
@@ -517,10 +536,23 @@ impl Running {
         let status = self.renderer.render(&mut self.term, &view, self.gfx.protocol_mut());
         log::debug!("frame status: {status:?}");
         match status {
-            FrameStatus::Retry => self.window.request_redraw(),
+            // The surface was reconfigured: try again right away, but if that
+            // keeps failing back off to a timer instead of spinning.
+            FrameStatus::Retry => {
+                self.retries = self.retries.saturating_add(1);
+                if self.retries <= 3 {
+                    self.window.request_redraw();
+                } else {
+                    self.redraw_retry = Some(now + FRAME_RETRY);
+                }
+            }
             FrameStatus::Timeout => self.redraw_retry = Some(now + FRAME_RETRY),
             // Occluded: wait for WindowEvent::Occluded(false).
-            FrameStatus::Presented | FrameStatus::Occluded => {}
+            FrameStatus::Occluded => {}
+            FrameStatus::Presented => {}
+        }
+        if matches!(status, FrameStatus::Presented | FrameStatus::Occluded) {
+            self.retries = 0;
         }
         if !self.shown {
             self.shown = true;

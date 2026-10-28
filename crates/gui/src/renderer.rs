@@ -304,7 +304,8 @@ impl Renderer {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
+            // One frame in flight: lowest input-to-photon latency.
+            desired_maximum_frame_latency: 1,
             alpha_mode,
             view_formats: vec![],
         };
@@ -1077,8 +1078,17 @@ impl Renderer {
         }
         drop(data);
         buf.unmap();
-        if let Err(e) = image::save_buffer(path, &img, w, h, image::ColorType::Rgba8) {
-            log::warn!("frame dump failed: {e}");
+        // Write then rename so a reader (or a kill) never sees a torn file.
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp.png");
+        let tmp = std::path::PathBuf::from(tmp);
+        match image::save_buffer(&tmp, &img, w, h, image::ColorType::Rgba8) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, path) {
+                    log::warn!("frame dump rename failed: {e}");
+                }
+            }
+            Err(e) => log::warn!("frame dump failed: {e}"),
         }
     }
 

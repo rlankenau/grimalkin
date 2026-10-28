@@ -15,7 +15,7 @@ grimalkin-vt = { path = "../vt" }
 grimalkin-graphics = { path = "../graphics" }
 grimalkin-pty = { path = "../pty" }
 winit = "0.30"
-wgpu = "30"
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12", "vulkan", "metal"] }
 cosmic-text = "0.19"
 arboard = { version = "3", default-features = false }
 toml = "1"

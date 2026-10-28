@@ -22,6 +22,7 @@ mod input;
 mod links;
 mod renderer;
 mod selection;
+mod terminfo;
 
 use std::path::PathBuf;
 

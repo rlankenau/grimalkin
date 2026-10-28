@@ -114,7 +114,9 @@ pub struct SpawnConfig {
 /// Cloneable, thread-safe, non-blocking handle to the child's stdin (the pty
 /// master). Writes are queued and performed by a background thread in order.
 /// If that thread hits an I/O error (typically because the child is gone),
-/// later writes fail with [`io::ErrorKind::BrokenPipe`].
+/// later writes fail with [`io::ErrorKind::BrokenPipe`]. Writes also fail
+/// with `BrokenPipe` once the child has exited (no later than the delivery of
+/// [`PtyEvent::Exited`]).
 #[derive(Clone)]
 pub struct PtyWriter {
     tx: Sender<Vec<u8>>,
@@ -277,6 +279,7 @@ impl Pty {
         let reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
         let writer = PtyWriter::new(pair.master.take_writer().map_err(io::Error::other)?)?;
 
+        let dead = writer.failed.clone();
         let wake: Option<Arc<dyn Fn() + Send + Sync>> = cfg.on_wake.map(Arc::from);
         let status = Arc::new(Mutex::new(None));
         let reader_state = Arc::new((Mutex::new(ReaderState::default()), Condvar::new()));
@@ -313,6 +316,10 @@ impl Pty {
                     {
                         let mut c = closed.lock().unwrap_or_else(|p| p.into_inner());
                         *c = true;
+                        // Writes after exit fail deterministically on every
+                        // platform (Linux may otherwise accept them into the
+                        // pty buffer indefinitely).
+                        dead.store(true, Ordering::SeqCst);
                         let _ = tx.send(PtyEvent::Exited(code));
                     }
                     if let Some(w) = &wake {
@@ -395,6 +402,39 @@ impl Pty {
             }
         }
         r
+    }
+
+    /// Kill the child and wait up to `grace` for it to exit; on Unix a child
+    /// that ignores SIGHUP is then SIGKILLed. Use this on application exit,
+    /// where the detached escalation thread started by `kill` would be torn
+    /// down with the process and leave the child orphaned.
+    pub fn shutdown(&mut self, grace: Duration) {
+        let _ = self.kill();
+        let deadline = Instant::now() + grace;
+        while self.try_wait().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        #[cfg(unix)]
+        if self.try_wait().is_none() {
+            if let Some(pid) = self.pid {
+                // `status` is only set after the child is reaped, so the pid
+                // cannot have been recycled while it is still None.
+                let guard = self.status.lock().unwrap_or_else(|p| p.into_inner());
+                if guard.is_none() {
+                    // The child is a session leader (its pgid is its pid), so
+                    // this also takes down whatever it started.
+                    unsafe {
+                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
+            // Give the wait thread a moment to reap it.
+            let reap_deadline = Instant::now() + Duration::from_millis(200);
+            while self.try_wait().is_none() && Instant::now() < reap_deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
     }
 
     /// Non-blocking exit check. `None` while the child runs; `Some(code)` once

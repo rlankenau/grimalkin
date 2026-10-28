@@ -354,3 +354,16 @@ fn concurrent_spawns_do_not_race_in_openpty() {
         h.join().unwrap();
     }
 }
+
+#[test]
+fn shutdown_kills_child_that_ignores_hup() {
+    let (tx, rx) = channel();
+    let args = vec!["-c".to_string(), "trap '' HUP TERM; echo ready; while :; do sleep 1; done".to_string()];
+    let mut pty = Pty::spawn("/bin/sh", &args, None, &[], 80, 24, tx).unwrap();
+    let (out, _) = read_until(&rx, Duration::from_secs(10), |o| contains(o, "ready"));
+    assert!(contains(&out, "ready"));
+    let start = Instant::now();
+    pty.shutdown(Duration::from_millis(300));
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(!pty.is_alive());
+}

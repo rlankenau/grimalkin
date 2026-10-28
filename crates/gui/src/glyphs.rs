@@ -481,7 +481,9 @@ impl GlyphCache {
             if pw == 0 || ph == 0 {
                 continue;
             }
-            let (kind, data): (AtlasKind, Vec<u8>) = match img.content {
+            let mut pw = pw;
+            let mut ph = ph;
+            let (kind, mut data): (AtlasKind, Vec<u8>) = match img.content {
                 SwashContent::Mask => (AtlasKind::Mask, img.data.clone()),
                 SwashContent::Color => {
                     let mut d = img.data.clone();
@@ -504,6 +506,23 @@ impl GlyphCache {
                     (AtlasKind::Mask, d)
                 }
             };
+            if kind == AtlasKind::Color {
+                // Color bitmaps (emoji) are much larger than a cell. Shrink
+                // them on the CPU with an area-aware filter; letting the GPU
+                // sample the full-size bitmap with plain bilinear filtering
+                // aliases badly. The data is premultiplied, which is the
+                // right space to filter in.
+                let box_w = self.metrics.cell_w as f32 * ncells;
+                let s = (box_w / pw as f32).min(cell_h / ph as f32);
+                if s < 1.0 && data.len() == pw as usize * ph as usize * 4 {
+                    let (nw, nh) = (((pw as f32 * s).floor() as u32).max(1), ((ph as f32 * s).floor() as u32).max(1));
+                    if let Some(src) = image::RgbaImage::from_raw(pw, ph, std::mem::take(&mut data)) {
+                        data = image::imageops::resize(&src, nw, nh, image::imageops::FilterType::Triangle).into_raw();
+                        pw = nw;
+                        ph = nh;
+                    }
+                }
+            }
             let atlas = match kind {
                 AtlasKind::Mask => &mut self.mask,
                 AtlasKind::Color => &mut self.color,
