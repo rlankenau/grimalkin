@@ -1,0 +1,11 @@
+[package]
+name = "grimalkin-graphics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kitty graphics protocol implementation and image store for grimalkin"
+
+[dependencies]
+flate2 = "1.1"
+image = { version = "0.25", default-features = false, features = ["png"] }

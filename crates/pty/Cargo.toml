@@ -8,3 +8,6 @@ description = "Thin PTY (ConPTY / forkpty) wrapper for the grimalkin terminal em
 
 [dependencies]
 portable-pty = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
