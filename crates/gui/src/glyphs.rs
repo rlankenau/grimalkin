@@ -496,7 +496,7 @@ impl GlyphCache {
                 SwashContent::Mask => (AtlasKind::Mask, img.data.clone()),
                 SwashContent::Color => {
                     let mut d = img.data.clone();
-                    for px in d.chunks_exact_mut(4) {
+                    for px in d.as_chunks_mut::<4>().0 {
                         let a = px[3] as u32;
                         px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
                         px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
@@ -509,7 +509,9 @@ impl GlyphCache {
                     // to coverage if it ever shows up.
                     let d = img
                         .data
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .map(|p| ((p[0] as u32 + p[1] as u32 + p[2] as u32) / 3) as u8)
                         .collect();
                     (AtlasKind::Mask, d)

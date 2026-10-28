@@ -1068,7 +1068,7 @@ impl Renderer {
         let mut img = Vec::with_capacity((w * h * 4) as usize);
         for y in 0..h as usize {
             let row = &data[y * bpr as usize..y * bpr as usize + (w * 4) as usize];
-            for px in row.chunks_exact(4) {
+            for px in row.as_chunks::<4>().0 {
                 if bgra {
                     img.extend_from_slice(&[px[2], px[1], px[0], 255]);
                 } else {
