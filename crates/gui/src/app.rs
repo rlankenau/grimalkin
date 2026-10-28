@@ -163,6 +163,7 @@ impl App {
             last_pty_size: (cols, rows),
             mouse_px: (0.0, 0.0),
             left_down: false,
+            last_mouse_cell: None,
             wheel_accum: 0.0,
             cursor_shape_event: None,
             blink_epoch: Instant::now(),
@@ -271,6 +272,8 @@ struct Running {
     last_pty_size: (usize, usize),
     mouse_px: (f64, f64),
     left_down: bool,
+    /// Cell of the last reported mouse event (motion is reported per cell).
+    last_mouse_cell: Option<(usize, usize)>,
     wheel_accum: f64,
     /// Cursor shape last set by the program (DECSCUSR); `None` = config default.
     cursor_shape_event: Option<CursorShape>,
@@ -637,19 +640,22 @@ impl Running {
         }
     }
 
-    /// Offer an event to mouse reporting. Shift bypasses reporting.
+    /// Offer an event to mouse reporting. Shift bypasses reporting. Returns
+    /// true if the event belongs to the application (reporting is active),
+    /// whether or not anything was sent, so it never also drives selection.
     fn report_mouse(&mut self, ev: &MouseEvent) -> bool {
         use grimalkin_vt::MouseMode;
         if self.term.mouse_mode() == MouseMode::None || self.mods.shift_key() {
             return false;
         }
-        match input::encode_mouse(self.term.mouse_mode(), self.term.mouse_encoding(), ev) {
-            Some(bytes) => {
-                self.send(&bytes);
-                true
-            }
-            None => false,
+        if ev.kind == MouseKind::Motion && self.last_mouse_cell == Some((ev.col, ev.row)) {
+            return true;
         }
+        if let Some(bytes) = input::encode_mouse(self.term.mouse_mode(), self.term.mouse_encoding(), ev) {
+            self.last_mouse_cell = Some((ev.col, ev.row));
+            self.send(&bytes);
+        }
+        true
     }
 
     fn on_cursor_moved(&mut self, x: f64, y: f64) {
