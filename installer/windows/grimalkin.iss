@@ -68,7 +68,7 @@ LicenseFile=..\..\dist\LICENSE
 ; so its files can be replaced. Do not relaunch it automatically.
 CloseApplications=yes
 RestartApplications=no
-; Broadcasts WM_SETTINGCHANGE after install/uninstall when the PATH task ran.
+; Broadcasts GmSettingChangeMsg after install/uninstall when the PATH task ran.
 ChangesEnvironment=yes
 
 [Languages]
@@ -126,9 +126,9 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Worki
 const
   UserEnvKey = 'Environment';
   MachineEnvKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
-  HWND_BROADCAST = $FFFF;
-  WM_SETTINGCHANGE = $001A;
-  SMTO_ABORTIFHUNG = $0002;
+  GmBroadcastHwnd = $FFFF;
+  GmSettingChangeMsg = $001A;
+  GmAbortIfHung = $0002;
 
 function SendMessageTimeout(hWnd: LongWord; Msg: LongWord; wParam: LongWord;
   lParam: String; fuFlags: LongWord; uTimeout: LongWord;
@@ -142,8 +142,8 @@ procedure BroadcastEnvironmentChange;
 var
   Res: LongWord;
 begin
-  SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment',
-    SMTO_ABORTIFHUNG, 5000, Res);
+  SendMessageTimeout(GmBroadcastHwnd, GmSettingChangeMsg, 0, 'Environment',
+    GmAbortIfHung, 5000, Res);
 end;
 
 { Returns the registry root and key holding the Path for this install mode. }
