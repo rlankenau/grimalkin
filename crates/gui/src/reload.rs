@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecursiveMode, Watcher};
 
@@ -16,6 +16,50 @@ use crate::config::Config;
 
 /// Quiet period after the last file event before reloading.
 const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Pure debounce state machine: coalesces events until `window` has passed
+/// with no new event, then reports one firing. Takes timestamps as inputs so
+/// it can be tested without a filesystem or sleeping.
+#[derive(Debug)]
+struct Debouncer {
+    window: Duration,
+    last_event: Option<Instant>,
+}
+
+impl Debouncer {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            last_event: None,
+        }
+    }
+
+    /// Record an event at `now`, extending the quiet period.
+    fn on_event(&mut self, now: Instant) {
+        self.last_event = Some(now);
+    }
+
+    /// When the pending burst (if any) becomes due.
+    fn deadline(&self) -> Option<Instant> {
+        self.last_event.map(|t| t + self.window)
+    }
+
+    /// True exactly once per burst, once the quiet period has elapsed.
+    fn due(&mut self, now: Instant) -> bool {
+        match self.deadline() {
+            Some(d) if now >= d => {
+                self.last_event = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Is `p` the config file or inside the themes/skins directories?
+fn is_relevant(p: &Path, file: &Path, themes: Option<&Path>, skins: Option<&Path>) -> bool {
+    p == file || themes.is_some_and(|t| p.starts_with(t)) || skins.is_some_and(|t| p.starts_with(t))
+}
 
 /// Keeps the watcher (and so the debounce thread) alive; dropping it stops both.
 pub struct ConfigWatcher {
@@ -39,7 +83,10 @@ fn canon(p: &Path) -> PathBuf {
     if let Ok(c) = p.canonicalize() {
         return c;
     }
-    match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
+    match (
+        p.parent().and_then(|d| d.canonicalize().ok()),
+        p.file_name(),
+    ) {
         (Some(d), Some(n)) => d.join(n),
         _ => p.to_path_buf(),
     }
@@ -56,29 +103,30 @@ pub fn watch(path: Option<&Path>, on_change: impl Fn() + Send + 'static) -> Opti
     let relevant_file = file.clone();
     let relevant_themes = themes.clone();
     let relevant_skins = config_dir.as_ref().map(|d| d.join("skins"));
-    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let Ok(ev) = res else { return };
-        if matches!(ev.kind, EventKind::Access(_)) {
-            return;
-        }
-        let hit = ev
-            .paths
-            .iter()
-            .any(|p| {
-                *p == relevant_file
-                    || relevant_themes.as_ref().is_some_and(|t| p.starts_with(t))
-                    || relevant_skins.as_ref().is_some_and(|t| p.starts_with(t))
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(ev) = res else { return };
+            if matches!(ev.kind, EventKind::Access(_)) {
+                return;
+            }
+            let hit = ev.paths.iter().any(|p| {
+                is_relevant(
+                    p,
+                    &relevant_file,
+                    relevant_themes.as_deref(),
+                    relevant_skins.as_deref(),
+                )
             });
-        if hit {
-            let _ = tx.send(());
-        }
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            log::warn!("config hot-reload unavailable: {e}");
-            return None;
-        }
-    };
+            if hit {
+                let _ = tx.send(());
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("config hot-reload unavailable: {e}");
+                return None;
+            }
+        };
 
     let mut watching = false;
     let mut add = |dir: &Path, mode: RecursiveMode| {
@@ -106,15 +154,20 @@ pub fn watch(path: Option<&Path>, on_change: impl Fn() + Send + 'static) -> Opti
         .name("config-watch".into())
         .spawn(move || {
             // Ends when the watcher (and with it the sender) is dropped.
-            while rx.recv().is_ok() {
-                loop {
-                    match rx.recv_timeout(DEBOUNCE) {
-                        Ok(()) => continue,
-                        Err(mpsc::RecvTimeoutError::Timeout) => break,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
+            let mut deb = Debouncer::new(DEBOUNCE);
+            loop {
+                let got = match deb.deadline() {
+                    None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                    Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
+                };
+                match got {
+                    Ok(()) => deb.on_event(Instant::now()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
-                on_change();
+                if deb.due(Instant::now()) {
+                    on_change();
+                }
             }
         })
         .ok()?;
@@ -126,10 +179,69 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Instant;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
 
     #[test]
-    fn debounced_callback_fires_once_per_burst() {
+    fn burst_within_window_fires_once() {
+        let t0 = Instant::now();
+        let mut d = Debouncer::new(ms(150));
+        let mut fired = 0;
+        for i in 0..5 {
+            let now = t0 + ms(i * 20);
+            d.on_event(now);
+            fired += usize::from(d.due(now));
+        }
+        // Poll every 10ms for a second: exactly one firing, after the last event (+80ms) + window.
+        for k in 0..100 {
+            let now = t0 + ms(80 + k * 10);
+            if d.due(now) {
+                assert!(now >= t0 + ms(230));
+                fired += 1;
+            }
+        }
+        assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn events_apart_fire_separately() {
+        let t0 = Instant::now();
+        let mut d = Debouncer::new(ms(150));
+        d.on_event(t0);
+        assert!(d.due(t0 + ms(150)));
+        d.on_event(t0 + ms(1000));
+        assert!(!d.due(t0 + ms(1100)));
+        assert!(d.due(t0 + ms(1150)));
+        assert!(!d.due(t0 + ms(2000)));
+    }
+
+    #[test]
+    fn idle_debouncer_never_fires() {
+        let mut d = Debouncer::new(ms(150));
+        assert_eq!(d.deadline(), None);
+        assert!(!d.due(Instant::now() + ms(10_000)));
+    }
+
+    #[test]
+    fn unrelated_paths_are_filtered() {
+        let file = Path::new("/c/grimalkin.toml");
+        let themes = Path::new("/c/themes");
+        let skins = Path::new("/c/skins");
+        let rel = |p: &str| is_relevant(Path::new(p), file, Some(themes), Some(skins));
+        assert!(rel("/c/grimalkin.toml"));
+        assert!(rel("/c/themes/dark.toml"));
+        assert!(rel("/c/skins/x/skin.toml"));
+        assert!(!rel("/c/other.txt"));
+        assert!(!is_relevant(Path::new("/c/themes/a"), file, None, None));
+    }
+
+    /// Smoke test against the real watcher: only asserts that at least one
+    /// callback arrives; exact counts depend on OS timing and are covered by
+    /// the `Debouncer` tests above.
+    #[test]
+    fn watcher_fires_at_least_once() {
         let dir = std::env::temp_dir().join(format!("grimalkin-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -141,20 +253,12 @@ mod tests {
             h.fetch_add(1, Ordering::SeqCst);
         });
         assert!(w.is_some());
-        // Unrelated files do not trigger; a burst of writes triggers once.
-        std::fs::write(dir.join("other.txt"), "x").unwrap();
-        for i in 0..5 {
-            std::fs::write(&file, format!("scrollback_lines = {i}")).unwrap();
-        }
+        std::fs::write(&file, "scrollback_lines = 1").unwrap();
         let t0 = Instant::now();
         while hits.load(Ordering::SeqCst) == 0 && t0.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(400));
-        // Under CI load the burst can straddle one debounce window, so allow a
-        // split, but five writes must never produce five callbacks.
-        let n = hits.load(Ordering::SeqCst);
-        assert!((1..=2).contains(&n), "expected the burst to coalesce, got {n} callbacks");
+        assert!(hits.load(Ordering::SeqCst) >= 1, "no callback within 5s");
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
