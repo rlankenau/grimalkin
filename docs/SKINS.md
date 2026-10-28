@@ -161,3 +161,43 @@ committed under `crates/gui/assets/skins/`)
 The generator must produce pixel-art-quality images (no blur, crisp 1px
 lines, limited palette), at 1x; the engine scales. Each skin ships a 160x60
 `preview.png` for docs.
+
+## Engine notes (as implemented in `crates/gui/src/skin/`)
+
+Details the format above leaves open, for skin authors:
+
+* **Rect syntax** (frame space, 1x pixels): `x < 0` / `y < 0` count from the
+  right / bottom edge; `w = -1` / `h = -1` extend to the right / bottom edge;
+  `w < -1` / `h < -1` leave a margin of `-w` / `-h` pixels at that edge.
+* **Lookup**: `skin = "name"` checks `<config_dir>/grimalkin/skins/<name>/`,
+  then the built-ins (every directory under `crates/gui/assets/skins/` with a
+  `skin.toml` is embedded by `build.rs`; no Rust edit needed). A value with a
+  path separator is read as a skin directory. `--skin NAME` overrides the
+  config; an unknown skin logs an error and falls back to a normal window.
+* **Scale**: `scale = max(1, round(dpi))`. `frame@2x.png` (exactly twice the
+  size of `frame.png`) is used only when `scale == 2`; otherwise `frame.png`
+  is replicated by the integer scale. `buttons.png`, `shade.png` are 1x only.
+* **Hit testing priority**: buttons, viewport, outside-the-mask (alpha < 128),
+  grip, window-edge resize zone (`border` px; corner zones reach `2*border`),
+  titlebar, other chrome (dragging the plain frame moves the window). The
+  viewport and buttons always count as inside the shape.
+* **Buttons**: normal / hover / pressed sprites are stacked vertically in
+  `buttons.png`, `rect.h` apart, starting at `sprite`. A press only fires on
+  release over the same button. A sheet that is too short for the hover and
+  pressed rows falls back to the normal sprite.
+* **Windowshade**: the shaded window is the full width and `[shade] height`
+  pixels tall. `shade.png` is 3-sliced horizontally using the frame's left
+  and right `slices`; without it the top `height` rows of `frame.png` are
+  used. Without a `[shade]` section the bar is as tall as the titlebar rect.
+  Titlebar, title text and button rects that do not fit the thin bar (taller
+  than it) are shrunk and vertically centred on it. The grid, and the size the
+  child sees, are unchanged while shaded.
+* **Viewport background**: `viewport_background` applies when the user has not
+  set `[colors] background`; otherwise the configured background is used.
+  `viewport_opacity` (times `[window] opacity`) is the alpha of that fill.
+* **Surface alpha**: the chrome pass renders premultiplied alpha (what
+  CAMetalLayer and compositors expect, including for wgpu's `PostMultiplied`
+  mode on Metal). Pixels outside the shape are alpha 0 because the frame is
+  the only thing drawn there; terminal content is confined to the viewport.
+* **macOS**: winit has no `drag_resize_window`, so edge/grip resizing is done
+  by hand from pointer motion there.

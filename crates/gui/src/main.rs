@@ -8,6 +8,7 @@
 //! * `input`         keyboard/wheel encoding, mouse + kitty keyboard hooks
 //! * `selection`     text selection; `links` hyperlink detection; `bell` audible bell
 //! * `graphics_glue` kitty graphics protocol glue (stub)
+//! * `skin`         undecorated, non-rectangular window skins (docs/SKINS.md)
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -23,6 +24,7 @@ mod input;
 mod links;
 mod renderer;
 mod selection;
+mod skin;
 mod terminfo;
 
 use std::path::PathBuf;
@@ -39,6 +41,8 @@ pub struct LaunchOptions {
     pub command: Option<Vec<String>>,
     pub config_path: Option<PathBuf>,
     pub working_directory: Option<PathBuf>,
+    /// Window skin given with `--skin` (overrides the config file).
+    pub skin: Option<String>,
 }
 
 pub enum Parsed {
@@ -55,6 +59,7 @@ Options:
   -e, --command CMD [ARGS...]   Run CMD instead of the shell (consumes the rest of the arguments)
       --config PATH             Use this config file
       --working-directory DIR   Start in DIR
+      --skin NAME               Use the window skin NAME (none = normal window)
   -h, --help                    Show this help
   -V, --version                 Show the version
 ";
@@ -83,6 +88,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Parsed {
                 Some(p) => opts.config_path = Some(PathBuf::from(p)),
                 None => return Parsed::Error("--config requires a path".into()),
             },
+            "--skin" => match inline.or_else(|| it.next()) {
+                Some(s) => opts.skin = Some(s),
+                None => return Parsed::Error("--skin requires a name".into()),
+            },
             "--working-directory" => match inline.or_else(|| it.next()) {
                 Some(p) => opts.working_directory = Some(PathBuf::from(p)),
                 None => return Parsed::Error("--working-directory requires a path".into()),
@@ -107,7 +116,10 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let config = Config::load(opts.config_path.as_deref());
+    let mut config = Config::load(opts.config_path.as_deref());
+    if let Some(s) = &opts.skin {
+        config.skin = s.clone();
+    }
 
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(l) => l,
@@ -145,6 +157,19 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn parses_skin_flag() {
+        match parse_args(args(&["--skin", "debug", "-e", "sh"])) {
+            Parsed::Run(o) => assert_eq!(o.skin.as_deref(), Some("debug")),
+            _ => panic!(),
+        }
+        match parse_args(args(&["--skin=none"])) {
+            Parsed::Run(o) => assert_eq!(o.skin.as_deref(), Some("none")),
+            _ => panic!(),
+        }
+        assert!(matches!(parse_args(args(&["--skin"])), Parsed::Error(_)));
     }
 
     #[test]

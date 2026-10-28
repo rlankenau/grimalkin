@@ -1,0 +1,32 @@
+# Placeholder skin for exercising the skin engine: notched corners, striped
+# title band, a magenta centre that must never be visible.
+name = "Debug"
+author = "grimalkin"
+
+[frame]
+image = "frame.png"
+slices = { left = 8, right = 8, top = 16, bottom = 8 }
+edge_mode = "tile"
+viewport_inset = { left = 8, right = 8, top = 16, bottom = 8 }
+viewport_background = "#101820"
+viewport_opacity = 1.0
+
+[titlebar]
+rect = { x = 0, y = 0, w = -1, h = 16 }
+double_click = "shade"
+text = { x = 12, y = 3, w = -56, font_px = 10, color = "#ffe066", align = "center" }
+
+[buttons]
+sheet = "buttons.png"
+close    = { rect = { x = -14, y = 3, w = 10, h = 10 }, sprite = [0, 0] }
+minimize = { rect = { x = -26, y = 3, w = 10, h = 10 }, sprite = [10, 0] }
+shade    = { rect = { x = -38, y = 3, w = 10, h = 10 }, sprite = [20, 0] }
+maximize = { rect = { x = -50, y = 3, w = 10, h = 10 }, sprite = [30, 0] }
+
+[resize]
+grip = { x = -12, y = -12, w = 12, h = 12 }
+border = 4
+
+[shade]
+image = "shade.png"
+height = 12
