@@ -1,0 +1,61 @@
+# Grimalkin example configuration. Every setting is optional; the values shown
+# are the defaults (except where noted). Copy this file to:
+#   Unix:    ~/.config/grimalkin/grimalkin.toml   (or $XDG_CONFIG_HOME/grimalkin/)
+#   Windows: %APPDATA%\grimalkin\grimalkin.toml
+# or pass --config <path>.
+
+# Number of lines kept in the scrollback buffer (main screen only).
+scrollback_lines = 10000
+
+# Program to run in the terminal. Empty means your default shell ($SHELL on
+# Unix; pwsh, powershell or cmd on Windows). `grimalkin -e CMD ARGS...`
+# overrides both of these.
+shell = ""
+shell_args = []
+
+[font]
+# Families in fallback order. The first installed one defines the cell size.
+# A single string also works: family = "JetBrains Mono"
+# Defaults: macOS ["Menlo", "SF Mono", "Monaco"], Windows ["Cascadia Mono",
+# "Consolas", "Courier New"], Linux ["DejaVu Sans Mono", ...]. Emoji, CJK and
+# symbols fall back to system fonts automatically.
+family = ["Menlo", "SF Mono", "Monaco"]
+# Size in points.
+size = 13.0
+# Multiplier for the natural line height (ascent + descent).
+line_height = 1.0
+
+[window]
+# Initial size in character cells.
+cols = 120
+rows = 35
+# Padding around the text area in logical pixels.
+padding = 4.0
+# Background opacity: 1.0 is opaque, 0.0 fully transparent.
+opacity = 1.0
+
+[colors]
+foreground = "#dddddd"
+background = "#000000"
+cursor = "#cccccc"
+selection_bg = "#fffacd"
+selection_fg = "#000000"
+# The 16 ANSI colors: black, red, green, yellow, blue, magenta, cyan, white,
+# then the bright variants. A shorter list overrides only the first entries.
+ansi = [
+  "#000000", "#cc0403", "#19cb00", "#cecb00",
+  "#0d73cc", "#cb1ed1", "#0dcdcd", "#dddddd",
+  "#767676", "#f2201f", "#23fd00", "#fffd00",
+  "#1a8fff", "#fd28ff", "#14ffff", "#ffffff",
+]
+
+[cursor]
+# "block", "underline" or "bar". Programs can change this at runtime (DECSCUSR).
+shape = "block"
+# Blink the cursor (programs can also request blinking).
+blink = false
+
+[input]
+# macOS: use the Option key as Alt (sends ESC prefix) instead of composing
+# special characters.
+option_as_alt = true

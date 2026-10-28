@@ -1,0 +1,28 @@
+[package]
+name = "grimalkin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Grimalkin: GPU-accelerated terminal emulator"
+
+[[bin]]
+name = "grimalkin"
+path = "src/main.rs"
+
+[dependencies]
+grimalkin-vt = { path = "../vt" }
+grimalkin-graphics = { path = "../graphics" }
+grimalkin-pty = { path = "../pty" }
+winit = "0.30"
+wgpu = "30"
+cosmic-text = "0.19"
+arboard = { version = "3", default-features = false }
+toml = "1"
+serde = { version = "1", features = ["derive"] }
+pollster = "1"
+env_logger = "0.11"
+log = "0.4"
+dirs = "7"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
