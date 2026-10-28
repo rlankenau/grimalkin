@@ -232,7 +232,7 @@ Directory: `/private/tmp/claude-501/-Users-rlankenau-src-grimalkin/7e1104fd-b3d4
 | File | Bytes | md5 | pledit.bmp | Notes / source |
 |---|---|---|---|---|
 | base-2.91.wsz | 102133 | 2f245e741b6bd4e1a122a28489f0c7b7 | `PLEDIT.BMP` 8-bit 280x186 | the classic default skin, Nullsoft; green on black. https://raw.githubusercontent.com/captbaritone/webamp/master/packages/webamp-demo/skins/base-2.91.wsz |
-| Winamp3_Classified.wsz | 28323 | aec27704d023c2e21990cfc8f2dfb517 | `pledit.bmp` 24-bit 280x186 | dark grey; author unknown (Winamp3-style). https://r2.webampskins.org/skins/aec27704d023c2e21990cfc8f2dfb517.wsz (museum page https://skins.webamp.org/skin/aec27704d023c2e21990cfc8f2dfb517/) |
+| Winamp3_Classified.wsz | 206552 | aec27704d023c2e21990cfc8f2dfb517 | `pledit.bmp` 24-bit 280x186 | dark grey; author unknown (Winamp3-style). https://r2.webampskins.org/skins/aec27704d023c2e21990cfc8f2dfb517.wsz (museum page https://skins.webamp.org/skin/aec27704d023c2e21990cfc8f2dfb517/) |
 | MacOSXAqua1-5.wsz | 238877 | 88dbd4e043795c98625462a908a2d965 | `pledit.bmp` 24-bit | light skin, contact ak@smartftp.com per its pledit.txt; Normal black on white. webamp-demo/skins/MacOSXAqua1-5.wsz |
 | Skinner_Atlas.wsz | 104992 | 185c5fe89f505e17746919888589b061 | `PLEDIT.bmp` 24-bit | light grey with cyan current; webamp-demo/skins/Skinner_Atlas.wsz |
 | Green-Dimension-V2.wsz | 70273 | 4308a2fc648033bf5fe7c4d56a5c8823 | `PLEDIT.bmp` 24-bit | dark green, mixed-case names; webamp-demo/skins/Green-Dimension-V2.wsz |
@@ -274,6 +274,14 @@ sample skins load and were checked visually against their playlist windows.
   (read from the button sheet) centred on the titlebar, and
   `shaded_sprite` on a button picks another sprite while shaded (the shade
   button shows WinAMP's *expand* art on the shade bar). No title text is drawn.
+* **Top edge seam**: the frame's right 150 px start with tile phase 0 (they are
+  five top tiles plus the corner), so a plain tiled middle would cut a tile at
+  x = W-150 for any width that is not 275 + 25n; patterned skins (Skinner_Atlas)
+  showed a sliver there. The importer therefore uses `edge_mode = "tile_split"`
+  (SKINS.md): the left run tiles from the left cap, the right run ends exactly
+  at the right cap, and the one seam sits at the window centre under the
+  centred title art. Checked pixel by pixel against an independent composition
+  of `pledit.bmp` for all seven samples at 1x and 2x and at odd widths.
 * **Button sheet**: 100 x 47; columns close, shade, expand (9 px each), rows
   normal, hover, pressed; the title art sits at y = 27. Hover is the normal art
   (WinAMP has no hover art); pressed comes from the dedicated sprites. The

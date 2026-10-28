@@ -72,13 +72,18 @@ author = "..."
 [frame]
 image = "frame.png"
 slices = { left = 24, right = 24, top = 36, bottom = 28 }   # 9-slice insets (px)
-edge_mode = "tile"      # tile | stretch
+edge_mode = "tile"      # tile | stretch | tile_split (see below)
 viewport_inset = { left = 24, right = 24, top = 36, bottom = 28 }  # where the grid draws
 viewport_background = "#000000"   # drawn under the grid (theme background wins if set)
 viewport_opacity = 1.0
 # Non-rectangular shape: pixels with alpha < 128 in the (scaled) frame are
 # outside the window: not drawn, not clickable. Corners stay as drawn; edge
 # tiles repeat the mask too.
+# `tile_split` is `tile` with the top edge laid out in two runs that meet at
+# the window centre: the left run starts at the left cap, the right run ends
+# flush with the right cap, so no tile is cut at a corner whatever the window
+# width. The seam sits mid-edge; use it only with a centred `[titlebar] image`
+# that covers it (the WinAMP importer does).
 
 [titlebar]
 rect = { x = 0, y = 0, w = -1, h = 36 }    # w=-1 means "full width"; drag to move
