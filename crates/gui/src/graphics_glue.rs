@@ -4,7 +4,9 @@
 //! the protocol's actions to the [`Terminal`]:
 //!
 //! * `Respond(bytes)` -> `Terminal::push_response`
-//! * `MoveCursor { dcols, drows }` -> `Terminal::move_cursor_rel`
+//! * `MoveCursor { dcols, drows }` -> `Terminal::move_cursor_rel` (dropped when
+//!   `[pty] graphics_cursor` resolves to "none", see
+//!   [`crate::config::GraphicsCursor`]: ConPTY does not learn about the move)
 //! * `Dirty` -> a redraw is needed ([`Graphics::take_dirty`])
 //!
 //! Timing matters: vt queues `TermEvent::GraphicsCommand` while it parses, and
@@ -36,6 +38,9 @@ pub struct Graphics {
     last_clear_count: u64,
     /// Oldest retained absolute row per screen (`[main, alt]`).
     last_oldest: [u64; 2],
+    /// Apply the protocol's `MoveCursor` actions (false = behave as if every
+    /// placement had `C=1`).
+    move_cursor: bool,
 }
 
 fn map_screen(s: Screen) -> GScreen {
@@ -58,8 +63,15 @@ fn live_top(term: &Terminal) -> u64 {
 }
 
 impl Graphics {
+    #[cfg(test)]
     pub fn new() -> Graphics {
+        Graphics::with_cursor_moves(true)
+    }
+
+    /// Like [`Graphics::new`], choosing whether placements move the cursor.
+    pub fn with_cursor_moves(move_cursor: bool) -> Graphics {
         Graphics {
+            move_cursor,
             protocol: Protocol::new(),
             dirty: false,
             deferred: Vec::new(),
@@ -137,7 +149,11 @@ impl Graphics {
         for action in self.protocol.handle(payload, &ctx) {
             match action {
                 Action::Respond(bytes) => term.push_response(&bytes),
-                Action::MoveCursor { dcols, drows } => term.move_cursor_rel(dcols, drows),
+                Action::MoveCursor { dcols, drows } => {
+                    if self.move_cursor {
+                        term.move_cursor_rel(dcols, drows);
+                    }
+                }
                 Action::Dirty => self.dirty = true,
             }
         }
@@ -256,6 +272,22 @@ mod tests {
         assert_eq!(g.protocol_mut().placements_in(GS::Alt, 0..=u64::MAX).count(), 1);
         g.feed(&mut t, b"\x1b[?1049l");
         assert_eq!(g.protocol_mut().placements_in(GS::Alt, 0..=u64::MAX).count(), 0);
+    }
+
+    #[test]
+    fn cursor_moves_only_when_enabled() {
+        let cursor_after = |moves: bool| {
+            let mut t = Terminal::new(20, 5, 100);
+            t.set_cell_pixel_size(10, 20);
+            let mut g = Graphics::with_cursor_moves(moves);
+            g.feed(&mut t, PUT);
+            let c = t.cursor();
+            (c.col, t.cursor_abs_row())
+        };
+        let moved = cursor_after(true);
+        let still = cursor_after(false);
+        assert_ne!(moved, still);
+        assert_eq!(still, (0, 0));
     }
 
     #[test]

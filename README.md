@@ -255,6 +255,23 @@ the file. Passthrough needs the sideloaded ConPTY or Windows 11; if the ConPTY
 in use rejects the flag, Grimalkin logs a warning and starts without it.
 Passthrough is off by default.
 
+Tested facts (Windows 10, ConPTY package 1.25):
+
+- Stock Windows 10 ConPTY strips APC, so kitty graphics do not work at all.
+- Sideloading `Microsoft.Windows.Console.ConPTY` 1.25 (`conpty.dll` +
+  `OpenConsole.exe` next to `grimalkin.exe`) makes kitty graphics work.
+- The passthrough flag has no observable effect on 1.25.
+- The APC *reply* to a query (`a=q`) is stripped on the input side, so tools
+  must detect support through `TERM_PROGRAM=grimalkin` / `TERM=xterm-kitty`
+  rather than by querying.
+- Cursor position reports (CPR) are swallowed.
+- OpenConsole does not learn that a placement moved the cursor, so Grimalkin
+  does not move it after placements on Windows (`[pty] graphics_cursor = "auto"`;
+  set `"protocol"` to override). Tools then print their own newlines, e.g.
+  `gcat --conpty`.
+- `viu`'s kitty auto-detection hangs on Windows in any terminal (a bug in
+  viuer's input parsing); `viu -b` (block mode) works.
+
 ## Crate layout
 
 - `crates/vt` (`grimalkin-vt`): terminal state machine, no I/O or GUI

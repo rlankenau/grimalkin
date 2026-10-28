@@ -238,6 +238,44 @@ impl Default for ClipboardConfig {
 /// `on` force it on, `0`/`false`/`no`/`off` force it off).
 pub const CONPTY_PASSTHROUGH_ENV: &str = "GRIMALKIN_CONPTY_PASSTHROUGH";
 
+/// How the cursor behaves after a kitty graphics placement (`[pty]
+/// graphics_cursor`).
+///
+/// The protocol moves the cursor past a placed image unless the command has
+/// `C=1`. Windows ConPTY's OpenConsole never learns that an APC placement moved
+/// the cursor (it does not parse the sequence), so the next output is drawn too
+/// high, overlapping the image. Tools that print their own newlines (such as
+/// `gcat --conpty`) work if the terminal does not move the cursor either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphicsCursor {
+    /// `None` under ConPTY (every Windows session), `Protocol` elsewhere.
+    #[default]
+    Auto,
+    /// Apply the kitty protocol's cursor movement after placements.
+    Protocol,
+    /// Never move the cursor after a placement (`C=1` for every placement).
+    None,
+}
+
+impl GraphicsCursor {
+    /// Whether the cursor should follow the protocol's movement after a
+    /// placement, given whether this session runs under ConPTY.
+    pub fn follows_protocol(self, conpty: bool) -> bool {
+        match self {
+            GraphicsCursor::Protocol => true,
+            GraphicsCursor::None => false,
+            GraphicsCursor::Auto => !conpty,
+        }
+    }
+
+    /// [`follows_protocol`](Self::follows_protocol) for this platform: all
+    /// Windows sessions are ConPTY sessions.
+    pub fn follows_protocol_here(self) -> bool {
+        self.follows_protocol(cfg!(windows))
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct PtyConfig {
@@ -246,6 +284,9 @@ pub struct PtyConfig {
     /// (kitty graphics) and other sequences untouched. Needs a sideloaded
     /// `conpty.dll` + `OpenConsole.exe` or Windows 11. Ignored elsewhere.
     pub passthrough: bool,
+    /// Cursor movement after kitty graphics placements: `auto` (default),
+    /// `protocol` or `none`; see [`GraphicsCursor`].
+    pub graphics_cursor: GraphicsCursor,
 }
 
 impl PtyConfig {
@@ -452,6 +493,28 @@ mod tests {
         assert!(!passthrough_with_env(true, Some("0")));
         assert!(passthrough_with_env(true, Some("garbage")));
         assert!(!passthrough_with_env(false, Some("")));
+    }
+
+    #[test]
+    fn graphics_cursor_config_and_policy() {
+        assert_eq!(Config::from_toml("").unwrap().pty.graphics_cursor, GraphicsCursor::Auto);
+        for (v, want) in [
+            ("auto", GraphicsCursor::Auto),
+            ("protocol", GraphicsCursor::Protocol),
+            ("none", GraphicsCursor::None),
+        ] {
+            let c = Config::from_toml(&format!("[pty]\ngraphics_cursor = \"{v}\"")).unwrap();
+            assert_eq!(c.pty.graphics_cursor, want);
+        }
+        assert!(Config::from_toml("[pty]\ngraphics_cursor = \"bogus\"").is_err());
+        // auto: no movement under ConPTY, protocol movement elsewhere.
+        assert!(!GraphicsCursor::Auto.follows_protocol(true));
+        assert!(GraphicsCursor::Auto.follows_protocol(false));
+        assert!(GraphicsCursor::Protocol.follows_protocol(true));
+        assert!(GraphicsCursor::Protocol.follows_protocol(false));
+        assert!(!GraphicsCursor::None.follows_protocol(true));
+        assert!(!GraphicsCursor::None.follows_protocol(false));
+        assert_eq!(GraphicsCursor::Auto.follows_protocol_here(), !cfg!(windows));
     }
 
     #[test]
