@@ -28,10 +28,18 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  windows-release:
-    name: windows release exe
+  # Builds the Windows release binaries, bundles the ConPTY redistributable and
+  # produces the Inno Setup installer and the portable zip. Also uploads the
+  # plain exe+com pair as grimalkin-windows-x64 (the original artifact).
+  windows-installer:
+    name: windows installer
     runs-on: windows-latest
     needs: test
+    env:
+      # Microsoft.Windows.Console.ConPTY (Windows Terminal project, MIT). The
+      # hash pins the exact .nupkg downloaded from api.nuget.org.
+      CONPTY_VERSION: 1.25.260930003
+      CONPTY_SHA256: 02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,17 +51,116 @@ jobs:
           mkdir dist
           cp target/release/grimalkin.exe dist/grimalkin.exe
           cp target/release/grimalkin-launcher.exe dist/grimalkin.com
-      - uses: actions/upload-artifact@v4
+      - name: Upload plain exe and com
+        uses: actions/upload-artifact@v4
         with:
           name: grimalkin-windows-x64
           path: |
             dist/grimalkin.exe
             dist/grimalkin.com
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)".*/\1/p;}' Cargo.toml | head -n1)"
+          fi
+          if [[ -z "$version" ]]; then echo "could not determine version" >&2; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Version: $version"
+      - name: Fetch ConPTY redistributable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = $env:CONPTY_VERSION
+          $pkg = "microsoft.windows.console.conpty.$v.nupkg"
+          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/$v/$pkg"
+          Invoke-WebRequest -Uri $url -OutFile $pkg
+          $actual = (Get-FileHash -Algorithm SHA256 $pkg).Hash.ToLowerInvariant()
+          if ($actual -ne $env:CONPTY_SHA256) {
+            throw "SHA256 mismatch for ${pkg}: expected $($env:CONPTY_SHA256), got $actual"
+          }
+          # A .nupkg is a zip. Extract the x64 pair next to grimalkin.exe.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $wanted = @{
+            'runtimes/win-x64/native/conpty.dll'        = 'conpty.dll'
+            'build/native/runtimes/x64/OpenConsole.exe' = 'OpenConsole.exe'
+          }
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $pkg).Path)
+          try {
+            foreach ($name in $wanted.Keys) {
+              $entry = $zip.GetEntry($name)
+              if ($null -eq $entry) { throw "$name not found in $pkg" }
+              $dest = Join-Path (Resolve-Path dist).Path $wanted[$name]
+              [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+            }
+          } finally { $zip.Dispose() }
+          Copy-Item installer/windows/LICENSE-ConPTY.txt dist/
+          Copy-Item README.md, LICENSE, LICENSE-MIT, LICENSE-APACHE dist/
+          Get-ChildItem dist | Format-Table Name, Length
+      - name: Portable zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/* -DestinationPath grimalkin-portable-x64.zip
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Inno Setup 6 is preinstalled on the windows runner images.
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            Write-Host 'Inno Setup 6 not preinstalled; installing with choco'
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'choco install innosetup failed' }
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" installer/windows/grimalkin.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-Item installer-out/grimalkin-setup-x64.exe
+      - name: Smoke-test installer (silent install, check, uninstall)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Resolve-Path installer-out/grimalkin-setup-x64.exe).Path
+          # Per-user silent install with the optional tasks turned on.
+          $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=addtopath,contextmenu','/LOG=install.log'
+          if ($p.ExitCode -ne 0) { Get-Content install.log; throw "installer exit code $($p.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\grimalkin'
+          foreach ($f in 'grimalkin.exe','grimalkin.com','conpty.dll','OpenConsole.exe','LICENSE-ConPTY.txt','README.md','unins000.exe') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "missing after install: $f" }
+          }
+          $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+          if (-not (($userPath -split ';') -contains $dir)) { throw "install dir not on user PATH: $userPath" }
+          $cmd = (Get-ItemProperty 'HKCU:\Software\Classes\Directory\Background\shell\grimalkin\command').'(default)'
+          Write-Host "context menu command: $cmd"
+          if ($cmd -notlike '*--working-directory*') { throw 'context menu command missing' }
+          & (Join-Path $dir 'grimalkin.com') --version
+          if ($LASTEXITCODE -ne 0) { throw "grimalkin.com --version failed: $LASTEXITCODE" }
+          # Uninstall (_?= runs it in place so -Wait really waits).
+          $u = Start-Process (Join-Path $dir 'unins000.exe') -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"_?=$dir"
+          if ($u.ExitCode -ne 0) { throw "uninstaller exit code $($u.ExitCode)" }
+          $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+          if (($userPath -split ';') -contains $dir) { throw 'install dir still on user PATH after uninstall' }
+          if (Test-Path 'HKCU:\Software\Classes\Directory\shell\grimalkin') { throw 'context menu key left behind' }
+          if (Test-Path 'HKCU:\Software\Classes\Directory\Background\shell\grimalkin') { throw 'background context menu key left behind' }
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: grimalkin-setup-x64
+          path: installer-out/grimalkin-setup-x64.exe
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: grimalkin-portable-x64
+          path: grimalkin-portable-x64.zip
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            installer-out/grimalkin-setup-x64.exe
+            grimalkin-portable-x64.zip
             dist/grimalkin.exe
             dist/grimalkin.com
 
