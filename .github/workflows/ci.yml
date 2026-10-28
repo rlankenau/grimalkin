@@ -56,3 +56,37 @@ jobs:
           files: |
             dist/grimalkin.exe
             dist/grimalkin.com
+
+  # Verifies the exe resources (build.rs / winresource): the icon group and the
+  # version info must actually be in the shipped binaries.
+  windows-exe-resources:
+    name: windows exe icon and version info
+    runs-on: windows-latest
+    needs: windows-release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: grimalkin-windows-x64
+          path: dist
+      - name: Check icon and version resources
+        shell: pwsh
+        run: |
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class IconProbe {
+            [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+            public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint n);
+          }
+          '@
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          foreach ($name in 'grimalkin.exe', 'grimalkin.com') {
+            $path = (Resolve-Path "dist/$name").Path
+            $icons = [IconProbe]::ExtractIconEx($path, -1, $null, $null, 0)
+            $info = (Get-Item $path).VersionInfo
+            Write-Host "$name icons=$icons product=$($info.ProductName) file=$($info.FileVersion) desc=$($info.FileDescription)"
+            if ($icons -lt 1) { throw "$name has no embedded icon" }
+            if ($info.ProductName -ne 'Grimalkin') { throw "$name: unexpected ProductName" }
+            if ($info.FileVersion -ne $version) { throw "$name: FileVersion $($info.FileVersion) != $version" }
+          }

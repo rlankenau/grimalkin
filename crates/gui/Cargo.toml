@@ -61,3 +61,9 @@ objc2-app-kit = { version = "0.2", default-features = false, features = ["std", 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 muda = { version = "0.21", default-features = false }
 
+# Windows executable resources (icon, version info); see build.rs. Only used
+# when the build target is Windows, but a build script's dependencies cannot be
+# gated on the target, so it is compiled everywhere (it is small).
+[build-dependencies]
+winresource = "0.1"
+

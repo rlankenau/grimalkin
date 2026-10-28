@@ -301,6 +301,7 @@ impl App {
         let mut attrs = Window::default_attributes()
             .with_title(cfg.window.title.as_str())
             .with_inner_size(LogicalSize::new(900.0, 600.0))
+            .with_window_icon(crate::icon::window_icon())
             .with_visible(false);
         if cfg.window.opacity < 1.0 {
             attrs = attrs.with_transparent(true);

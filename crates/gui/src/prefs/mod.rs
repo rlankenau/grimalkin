@@ -66,6 +66,7 @@ impl PreferencesWindow {
             .with_title(TITLE)
             .with_inner_size(LogicalSize::new(SIZE.0, SIZE.1))
             .with_min_inner_size(LogicalSize::new(MIN_SIZE.0, MIN_SIZE.1))
+            .with_window_icon(crate::icon::window_icon())
             .with_visible(false);
         if let Some(pos) = args.anchor.and_then(|(p, s)| centred(event_loop, p, s)) {
             attrs = attrs.with_position(pos);
