@@ -197,7 +197,10 @@ impl Perform for Terminal {
                         self.erase_rows(0, r);
                         self.erase_cells(r, 0, c + 1);
                     }
-                    2 => self.erase_rows(0, rows),
+                    2 => {
+                        self.display_clear_count += 1;
+                        self.erase_rows(0, rows);
+                    }
                     3 => {
                         self.grid_mut().clear_scrollback();
                         self.scroll_display_to_bottom();

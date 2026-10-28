@@ -16,6 +16,7 @@ mod boxdraw;
 mod config;
 mod glyphs;
 mod graphics_glue;
+mod images;
 mod input;
 mod renderer;
 mod selection;

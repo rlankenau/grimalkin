@@ -274,6 +274,7 @@ pub struct Terminal {
     pub(crate) last_char: Option<char>,
     pub(crate) cell_px: (u32, u32),
     alt_enter_count: u64,
+    pub(crate) display_clear_count: u64,
     sync_since: Option<Instant>,
     pub(crate) clip_selection: String,
     drawn_cursor: (Cursor, bool, CursorShape, bool),
@@ -331,6 +332,7 @@ impl Terminal {
             last_char: None,
             cell_px: (8, 16),
             alt_enter_count: 0,
+            display_clear_count: 0,
             sync_since: None,
             clip_selection: "c".into(),
             drawn_cursor: (Cursor::default(), true, CursorShape::Block, true),
@@ -540,6 +542,11 @@ impl Terminal {
     /// Number of times the alternate screen has been entered.
     pub fn alt_enter_count(&self) -> u64 {
         self.alt_enter_count
+    }
+    /// Incremented on every ED 2 (erase whole display) and RIS, so a host can
+    /// drop things that live outside the grid (kitty graphics placements).
+    pub fn display_clear_count(&self) -> u64 {
+        self.display_clear_count
     }
     pub fn hyperlink(&self, id: u32) -> Option<&Hyperlink> {
         self.hyperlinks.get(id as usize)
@@ -1364,6 +1371,7 @@ impl Terminal {
 
     /// Full reset (RIS). Keeps size and scrollback.
     pub(crate) fn full_reset(&mut self) {
+        self.display_clear_count += 1;
         if self.active == Screen::Alt {
             self.leave_alt(false);
         }
