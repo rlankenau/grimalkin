@@ -340,7 +340,18 @@ impl App {
         renderer.set_palette(&palette);
         renderer.set_skin(skin.clone());
         // Size the window for the configured grid now that the cell size is known.
-        let (w, h) = renderer.surface_size_for(cfg.window.cols as usize, cfg.window.rows as usize);
+        let (want_cols, want_rows) = (cfg.window.cols as usize, cfg.window.rows as usize);
+        let (fx, fy) = renderer.surface_size_for(0, 0);
+        let work = skin::work_area(&window);
+        let (cols0, rows0) = fit_grid_to_area(want_cols, want_rows, renderer.cell_size_px(), (fx, fy), (work.w, work.h));
+        if (cols0, rows0) != (want_cols, want_rows) {
+            log::warn!(
+                "requested window of {want_cols}x{want_rows} cells does not fit the {}x{} px work area at this font size; using {cols0}x{rows0}",
+                work.w,
+                work.h
+            );
+        }
+        let (w, h) = renderer.surface_size_for(cols0, rows0);
         if let Some(size) = window.request_inner_size(skin::clamp_size(w, h)) {
             renderer.resize(size.width, size.height);
         } else {
@@ -1147,6 +1158,7 @@ impl Running {
             kitty_flags: self.term.keyboard_flags(),
             alt_screen: self.term.screen() == Screen::Alt,
             alt_is_meta: !input::IS_MAC || self.cfg.input.option_as_alt,
+            ctrl_v_paste: self.cfg.input.ctrl_v_paste,
         };
         match input::translate(&KeyInput::from_event(ev), self.mods, &st) {
             KeyAction::None => {}
@@ -1909,5 +1921,50 @@ mod cwd_tests {
         assert_eq!(pick_cwd(p("/tmp"), p("/"), p("/Users/me")), p("/tmp"));
         assert_eq!(pick_cwd(None, p("/work"), p("/Users/me")), None);
         assert_eq!(pick_cwd(None, p("/"), None), p("/"));
+    }
+}
+
+/// Margin kept free of the initial window inside the work area, physical px:
+/// room for the OS title bar / frame and a little air.
+const WORK_MARGIN: (u32, u32) = (32, 80);
+
+/// Reduce `cols` x `rows` (at least 2x1) until the window they imply (cells
+/// plus `fixed` pixels of padding/chrome) fits inside `work` minus a margin.
+fn fit_grid_to_area(cols: usize, rows: usize, cell: (u32, u32), fixed: (u32, u32), work: (u32, u32)) -> (usize, usize) {
+    let fit = |want: usize, cell: u32, fixed: u32, work: u32, margin: u32, min: usize| -> usize {
+        let avail = u64::from(work.saturating_sub(margin).saturating_sub(fixed));
+        let fits = (avail / u64::from(cell.max(1))) as usize;
+        want.min(fits).max(min)
+    };
+    (
+        fit(cols, cell.0, fixed.0, work.0, WORK_MARGIN.0, 2),
+        fit(rows, cell.1, fixed.1, work.1, WORK_MARGIN.1, 1),
+    )
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::fit_grid_to_area;
+
+    #[test]
+    fn fits_unchanged_when_small() {
+        assert_eq!(fit_grid_to_area(120, 35, (10, 20), (0, 0), (2560, 1440)), (120, 35));
+    }
+
+    #[test]
+    fn huge_font_is_reduced_to_the_work_area() {
+        // 200 pt font: ~117x233 px cells on a 2560x1440 screen.
+        let (c, r) = fit_grid_to_area(120, 35, (117, 233), (16, 16), (2560, 1440));
+        assert!(c < 120 && r < 35);
+        assert!(c as u32 * 117 + 16 <= 2560 - 32);
+        assert!(r as u32 * 233 + 16 <= 1440 - 80);
+        assert_eq!((c, r), (21, 5));
+    }
+
+    #[test]
+    fn never_below_minimum_or_dividing_by_zero() {
+        assert_eq!(fit_grid_to_area(120, 35, (5000, 5000), (0, 0), (800, 600)), (2, 1));
+        assert_eq!(fit_grid_to_area(80, 24, (0, 0), (u32::MAX, u32::MAX), (800, 600)), (2, 1));
+        assert_eq!(fit_grid_to_area(80, 24, (10, 10), (0, 0), (0, 0)), (2, 1));
     }
 }

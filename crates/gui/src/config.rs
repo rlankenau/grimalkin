@@ -217,11 +217,17 @@ pub struct InputConfig {
     /// macOS only: treat the Option key as Alt (ESC prefix) instead of
     /// composing special characters.
     pub option_as_alt: bool,
+    /// Plain Ctrl+V is grimalkin's own (sanitised) paste instead of sending
+    /// 0x16 to the program. Default: on for Windows, off elsewhere.
+    pub ctrl_v_paste: bool,
 }
 
 impl Default for InputConfig {
     fn default() -> Self {
-        InputConfig { option_as_alt: true }
+        InputConfig {
+            option_as_alt: true,
+            ctrl_v_paste: cfg!(windows),
+        }
     }
 }
 

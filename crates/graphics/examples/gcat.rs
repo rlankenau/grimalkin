@@ -384,6 +384,22 @@ fn demo(out: &mut impl Write, o: &Opts) {
     }
 }
 
+/// Largest decoded RGBA buffer gcat will allocate.
+const MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Refuse oversized images from the header dimensions alone.
+fn check_dims(w: u32, h: u32) -> Result<(), String> {
+    if w > MAX_DIMENSION || h > MAX_DIMENSION {
+        return Err(format!(
+            "image is {w}x{h}; the terminal accepts at most {MAX_DIMENSION}x{MAX_DIMENSION}. Not sent (resize it first)."
+        ));
+    }
+    if u64::from(w) * u64::from(h) * 4 > MAX_DECODE_BYTES {
+        return Err(format!("image is {w}x{h}; decoding it needs more than 512 MiB. Not sent (resize it first)."));
+    }
+    Ok(())
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("gcat: {msg}\n\n{HELP}");
     std::process::exit(2)
@@ -454,6 +470,19 @@ fn main() {
     }
     for (i, f) in files.iter().enumerate() {
         let id = o.id + i as u32;
+        // Header-only dimension check before any decode or read of pixels.
+        match image::ImageReader::open(f).and_then(|r| r.with_guessed_format()).map_err(|e| e.to_string()).and_then(|r| r.into_dimensions().map_err(|e| e.to_string())) {
+            Ok((w, h)) => {
+                if let Err(msg) = check_dims(w, h) {
+                    eprintln!("gcat: {f}: {msg}");
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("gcat: {f}: {e}");
+                std::process::exit(1);
+            }
+        }
         let mut bytes = Vec::new();
         if let Err(e) = std::fs::File::open(f).and_then(|mut h| h.read_to_end(&mut bytes)) {
             eprintln!("gcat: {f}: {e}");
@@ -474,5 +503,18 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dimension_guards() {
+        assert!(check_dims(100, 100).is_ok());
+        assert!(check_dims(MAX_DIMENSION + 1, 10).is_err());
+        assert!(check_dims(10, MAX_DIMENSION + 1).is_err());
+        assert!(check_dims(MAX_DIMENSION, MAX_DIMENSION).is_ok());
     }
 }

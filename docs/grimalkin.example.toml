@@ -102,6 +102,11 @@ blink = false
 # macOS: use the Option key as Alt (sends ESC prefix) instead of composing
 # special characters.
 option_as_alt = true
+# Plain Ctrl+V pastes through grimalkin (sanitised, bracketed when the program
+# asks) instead of sending Ctrl+V to the program. Default: true on Windows
+# (stops PSReadLine pasting unsanitised), false elsewhere. Ctrl+Shift+V
+# always works.
+ctrl_v_paste = true
 
 [bell]
 # Flash the window for visual_ms milliseconds when a program rings the bell.

@@ -204,6 +204,7 @@ blink = true
 
 [input]
 option_as_alt = true   # macOS
+ctrl_v_paste = true    # plain Ctrl+V pastes via grimalkin (default on Windows)
 ```
 
 ## Skins & themes
@@ -326,6 +327,7 @@ between two skins is live).
 | --- | --- |
 | Mod+C | Copy selection |
 | Mod+V, Shift+Insert | Paste |
+| Ctrl+V (Windows; `input.ctrl_v_paste`, default on) | Paste, sanitised, instead of sending Ctrl+V to the shell |
 | Mod++ / Mod+- | Zoom in / out |
 | Mod+0 | Reset zoom |
 | Cmd+, (macOS) / Ctrl+, | Preferences |

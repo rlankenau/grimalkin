@@ -48,6 +48,8 @@ pub struct EncodeState {
     pub alt_screen: bool,
     /// Treat Alt as a Meta/ESC prefix (false on macOS when Option composes).
     pub alt_is_meta: bool,
+    /// Plain Ctrl+V is grimalkin's paste (`input.ctrl_v_paste`).
+    pub ctrl_v_paste: bool,
 }
 
 /// The parts of a winit `KeyEvent` that the encoder needs (so it can be unit
@@ -176,6 +178,11 @@ fn is_prefs_key(code: KeyCode, mods: ModifiersState) -> bool {
         }
 }
 
+/// Ctrl held with no other modifier.
+fn is_plain_ctrl(mods: ModifiersState) -> bool {
+    mods.control_key() && !mods.shift_key() && !mods.alt_key() && !mods.super_key()
+}
+
 fn shortcut(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> Option<KeyAction> {
     let PhysicalKey::Code(code) = input.physical else { return None };
     if !input.pressed {
@@ -189,6 +196,9 @@ fn shortcut(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> Option<
             || is_zoom_out(code)
             || is_zoom_reset(code);
         let combo = (mods.control_key() && mods.shift_key()) || (IS_MAC && mods.super_key());
+        if code == KeyCode::KeyV && st.ctrl_v_paste && is_plain_ctrl(mods) {
+            return Some(KeyAction::None);
+        }
         return (is_shortcut_key && combo).then_some(KeyAction::None);
     }
     if is_prefs_key(code, mods) {
@@ -205,6 +215,9 @@ fn shortcut(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> Option<
             c if is_zoom_reset(c) => return Some(KeyAction::Zoom(ZoomOp::Reset)),
             _ => {}
         }
+    }
+    if st.ctrl_v_paste && code == KeyCode::KeyV && is_plain_ctrl(mods) {
+        return Some(KeyAction::Paste);
     }
     if mods.shift_key() && !mods.control_key() && !mods.alt_key() && !mods.super_key() {
         match code {
@@ -1036,6 +1049,32 @@ mod tests {
         let mut s = st();
         s.alt_is_meta = false;
         assert_eq!(enc(ch("∫"), Some("∫"), ModifiersState::ALT, &s).unwrap(), "∫".as_bytes());
+    }
+
+    #[test]
+    fn ctrl_v_paste_binding() {
+        let v = Key::Character("v".into());
+        let key = |pressed| KeyInput {
+            logical: &v,
+            physical: PhysicalKey::Code(KeyCode::KeyV),
+            text: None,
+            pressed,
+            repeat: false,
+            location: KeyLocation::Standard,
+            unmodified: None,
+            caps_lock: false,
+            num_lock: false,
+        };
+        let on = EncodeState { ctrl_v_paste: true, alt_is_meta: true, ..Default::default() };
+        let off = st();
+        let c = ModifiersState::CONTROL;
+        assert_eq!(translate(&key(true), c, &on), KeyAction::Paste);
+        assert_eq!(translate(&key(false), c, &on), KeyAction::None);
+        assert_eq!(translate(&key(true), c, &off), KeyAction::Send(vec![0x16]));
+        assert_eq!(translate(&key(true), c | ModifiersState::SHIFT, &on), KeyAction::Paste);
+        assert_eq!(translate(&key(true), c | ModifiersState::SHIFT, &off), KeyAction::Paste);
+        // Ctrl+Alt+V is not the paste key.
+        assert_ne!(translate(&key(true), c | ModifiersState::ALT, &on), KeyAction::Paste);
     }
 
     #[test]
