@@ -35,3 +35,10 @@ ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 # Windows clips the skinned window with a window region (skin/win.rs).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+
+# macOS: the screen's visible frame (work area) for the skin's own maximize.
+# The versions are the ones winit 0.30 already links.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSGeometry", "NSArray"] }
+objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSScreen", "NSWindow", "NSView", "NSResponder"] }

@@ -4,7 +4,8 @@
 //! * `parse`   the `skin.toml` schema
 //! * `hit`     pure geometry: 9-slice mapping, layout, hit testing, shape rects
 //! * `chrome`  the GPU pass that draws frame, buttons and title
-//! * `win`     Windows only: `SetWindowRgn` from the shape mask
+//! * `win`     Windows only: `SetWindowRgn` from the shape mask, work area
+//! * `winstate` normal / maximized / shaded as one state, and its geometry
 //! * `winamp`   importer for WinAMP 2.x `.wsz` skins (docs/WINAMP_SKINS.md)
 //!
 //! This module loads skins (user directory first, then the built-ins that
@@ -15,8 +16,11 @@
 pub mod chrome;
 pub mod drag;
 pub mod hit;
+#[cfg(target_os = "macos")]
+pub mod mac;
 pub mod parse;
 pub mod win;
+pub mod winstate;
 pub mod winamp;
 
 use std::borrow::Cow;
@@ -30,6 +34,29 @@ use self::hit::{ButtonKind, Hit, Layout, ResizeDir, SliceSpec, ALPHA_CUTOFF};
 use self::parse::{DoubleClick, Insets, SkinDef};
 
 include!(concat!(env!("OUT_DIR"), "/builtin_skins.rs"));
+
+/// The work area (screen minus taskbar / menu bar / Dock) of the window's
+/// monitor, physical pixels. Falls back to the whole monitor, then to the
+/// window itself.
+pub fn work_area(window: &winit::window::Window) -> winstate::Rect {
+    #[cfg(windows)]
+    let native = win::work_area(window);
+    #[cfg(target_os = "macos")]
+    let native = mac::work_area(window);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let native: Option<(i32, i32, u32, u32)> = None;
+    let (x, y, w, h) = native
+        .or_else(|| {
+            let m = window.current_monitor()?;
+            let (p, s) = (m.position(), m.size());
+            Some((p.x, p.y, s.width, s.height))
+        })
+        .unwrap_or_else(|| {
+            let (p, s) = (window.outer_position().unwrap_or_default(), window.inner_size());
+            (p.x, p.y, s.width, s.height)
+        });
+    winstate::Rect::new(x, y, w, h)
+}
 
 /// Two clicks on the titlebar within this time are a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -236,6 +263,15 @@ impl Skin {
             .unwrap_or(d.frame.slices.top.max(8))
     }
 
+    /// Is a window `height` physical pixels tall the windowshade bar? The
+    /// chrome (frame spec, layout, grid freeze) is derived from the window
+    /// size with this, never from a separate flag, so it cannot disagree with
+    /// the window: a normal window is always taller than the bar (its minimum
+    /// height is larger), and a window as thin as the bar can only show the bar.
+    pub fn is_shade_height(&self, height: u32, scale: u32) -> bool {
+        height <= (self.shade_height() * scale.max(1)).max(1)
+    }
+
     /// How to stretch the frame (or the shade bar) over a window at `scale`:
     /// the slice spec, the texture and destination pixels per texel.
     pub fn frame_spec(&self, shaded: bool, scale: u32) -> (SliceSpec, TexId, i32) {
@@ -327,7 +363,6 @@ pub struct SkinRuntime {
     pub layout: Layout,
     win: (u32, u32),
     scale: u32,
-    shaded: bool,
     resizable: bool,
     spec: (SliceSpec, TexId, i32),
     hover: Hit,
@@ -343,7 +378,6 @@ impl SkinRuntime {
             skin,
             win,
             scale,
-            shaded: false,
             resizable: true,
             hover: Hit::Outside,
             pressed: None,
@@ -354,8 +388,9 @@ impl SkinRuntime {
     }
 
     fn relayout(&mut self) {
-        self.layout = Layout::new(&self.skin.def, self.win.0, self.win.1, self.scale, self.shaded, self.resizable);
-        self.spec = self.skin.frame_spec(self.shaded, self.scale);
+        let shaded = self.shaded();
+        self.layout = Layout::new(&self.skin.def, self.win.0, self.win.1, self.scale, shaded, self.resizable);
+        self.spec = self.skin.frame_spec(shaded, self.scale);
     }
 
     /// The window (or the display scale) changed.
@@ -365,13 +400,10 @@ impl SkinRuntime {
         self.relayout();
     }
 
-    pub fn set_shaded(&mut self, shaded: bool) {
-        self.shaded = shaded;
-        self.relayout();
-    }
-
+    /// The window is the windowshade bar. Derived from the window size (see
+    /// `Skin::is_shade_height`), so the chrome always matches the window.
     pub fn shaded(&self) -> bool {
-        self.shaded
+        self.skin.is_shade_height(self.win.1, self.scale)
     }
 
     pub fn scale(&self) -> u32 {
@@ -497,7 +529,6 @@ impl SkinRuntime {
     pub fn view<'a>(&self, title: &'a str) -> chrome::ChromeView<'a> {
         chrome::ChromeView {
             title,
-            shaded: self.shaded,
             hover: self.hover_button(),
             pressed: self.pressed,
         }
@@ -507,7 +538,7 @@ impl SkinRuntime {
     pub fn apply_shape(&self, window: &winit::window::Window) {
         #[cfg(windows)]
         {
-            let rects = self.skin.shape_rects(self.win, self.scale, self.shaded);
+            let rects = self.skin.shape_rects(self.win, self.scale, self.shaded());
             win::set_window_region(window, &rects, self.win.0 as i32, self.win.1 as i32);
         }
         #[cfg(not(windows))]
@@ -654,11 +685,11 @@ mod tests {
     #[test]
     fn shaded_window_has_only_the_bar() {
         let mut rt = SkinRuntime::new(Arc::new(debug()), (300, 12), 1);
-        rt.set_shaded(true);
+        assert!(rt.shaded());
         assert_eq!(rt.hit_at(150.0, 6.0), Hit::Titlebar);
         assert_eq!(rt.hit_at(0.0, 0.0), Hit::Outside, "bar corner notch");
-        rt.set_shaded(false);
         rt.set_geometry((300, 200), 1);
+        assert!(!rt.shaded());
         assert_eq!(rt.hit_at(150.0, 100.0), Hit::Viewport);
     }
 
@@ -677,7 +708,7 @@ mod tests {
                 assert_eq!(rt.release(x, y), Some(Action::ToggleShade), "{name}");
                 // Shaded: the window is the bar, the shade button is still on it.
                 rt.set_geometry((900, bar), scale);
-                rt.set_shaded(true);
+                assert!(rt.shaded(), "{name}");
                 let b = rt.layout.button_rect(ButtonKind::Shade).unwrap();
                 assert!(b.y >= 0 && b.y + b.h <= bar as i32, "{name} @{scale}x: shade button off the bar: {b:?} bar {bar}");
                 let (x, y) = (b.x as f64 + b.w as f64 / 2.0, b.y as f64 + b.h as f64 / 2.0);
@@ -705,5 +736,54 @@ mod tests {
         let s = debug();
         let (w, h) = s.min_window(2, (8, 16));
         assert!(w >= 2 * (8 + 8) + 32 && h >= 2 * (16 + 8) + 32);
+    }
+
+    /// Regression: after maximize -> shade -> unshade the window was tall but
+    /// the chrome still drew the shade bar, tiled down the whole window. The
+    /// chrome is derived from the window height, whatever happened before.
+    #[test]
+    fn chrome_follows_the_window_height_not_the_history() {
+        for name in builtin_names() {
+            for scale in [1u32, 2] {
+                let skin = Arc::new(Skin::load_from(name, None).unwrap());
+                let bar = skin.shade_height() * scale;
+                let mut rt = SkinRuntime::new(skin.clone(), (1016, 597), scale);
+                // Every size a window goes through, in any order.
+                let sizes = [(1016, 597), (2560, 1410), (2560, bar), (1016, bar), (1016, 597), (700, 400), (700, bar), (2560, 1410)];
+                for (w, h) in sizes {
+                    rt.set_geometry((w, h), scale);
+                    let shaded = h <= bar;
+                    assert_eq!(rt.shaded(), shaded, "{name} @{scale}x {w}x{h}");
+                    assert_eq!(rt.layout.shaded, shaded, "{name} @{scale}x {w}x{h}");
+                    assert_eq!(skin.is_shade_height(h, scale), shaded);
+                    let tex = rt.spec.1;
+                    assert_eq!(tex == TexId::Shade || (shaded && tex == TexId::Frame1), shaded, "{name}: frame spec at {w}x{h}");
+                    // A tall window always has a viewport and no bar-only layout.
+                    assert_eq!(rt.layout.viewport.w > 0, !shaded, "{name} {w}x{h}");
+                }
+            }
+        }
+    }
+
+    fn bbox(rects: &[[i32; 4]]) -> [i32; 4] {
+        rects.iter().fold([i32::MAX, i32::MAX, i32::MIN, i32::MIN], |b, r| {
+            [b[0].min(r[0]), b[1].min(r[1]), b[2].max(r[2]), b[3].max(r[3])]
+        })
+    }
+
+    /// The Windows region covers the whole window where the art is opaque to
+    /// the edge (llama), and is exactly one pixel short on the right and
+    /// bottom where the art itself leaves a transparent last column and row
+    /// (mint, whose baked shadow ends one pixel inside the frame image).
+    #[test]
+    fn shape_region_bbox_matches_the_art() {
+        let llama = Skin::load_from("llama", None).unwrap();
+        assert_eq!(bbox(&llama.shape_rects((1016, 597), 1, false)), [0, 0, 1016, 597]);
+        let mint = Skin::load_from("mint", None).unwrap();
+        let img = mint.image(TexId::Frame1).unwrap();
+        let (w, h) = (img.w, img.h);
+        assert!((0..h).all(|y| img.alpha(w - 1, y) < ALPHA_CUTOFF), "mint's last column is transparent art");
+        assert!((0..w).all(|x| img.alpha(x, h - 1) < ALPHA_CUTOFF), "mint's last row is transparent art");
+        assert_eq!(bbox(&mint.shape_rects((1008, 585), 1, false)), [0, 0, 1007, 584]);
     }
 }

@@ -19,7 +19,6 @@ use crate::glyphs::{GlyphCache, GlyphQuad, Gpu};
 /// Per-frame UI state the chrome needs.
 pub struct ChromeView<'a> {
     pub title: &'a str,
-    pub shaded: bool,
     pub hover: Option<ButtonKind>,
     pub pressed: Option<ButtonKind>,
 }
@@ -287,14 +286,17 @@ impl Chrome {
     ) -> Option<TitleDraw> {
         let scale = scale.max(1);
         let skin = self.skin.clone();
-        let layout = Layout::new(&skin.def, win.0, win.1, scale, view.shaded, true);
+        // Shade or full frame follows the window height, so a stale flag can
+        // never tile the bar down a tall window.
+        let shaded = skin.is_shade_height(win.1, scale);
+        let layout = Layout::new(&skin.def, win.0, win.1, scale, shaded, true);
         self.insts.clear();
         self.batches.clear();
 
         // Frame.
-        let (spec, tex, k) = skin.frame_spec(view.shaded, scale);
+        let (spec, tex, k) = skin.frame_spec(shaded, scale);
         let start = self.insts.len();
-        for p in frame_patches(&spec, win, k, view.shaded) {
+        for p in frame_patches(&spec, win, k, shaded) {
             self.insts.push(ChromeInst {
                 dst: [p.dst[0] as f32, p.dst[1] as f32, p.dst[2] as f32, p.dst[3] as f32],
                 src: [p.src[0] as f32, p.src[1] as f32, p.src[2] as f32, p.src[3] as f32],
@@ -306,7 +308,7 @@ impl Chrome {
 
         // Viewport fill (under the terminal grid).
         let vp = layout.viewport;
-        if !view.shaded && vp.w > 0 && vp.h > 0 && fill[3] > 0 {
+        if !shaded && vp.w > 0 && vp.h > 0 && fill[3] > 0 {
             let start = self.insts.len();
             self.insts.push(ChromeInst {
                 dst: [vp.x as f32, vp.y as f32, vp.w as f32, vp.h as f32],
@@ -322,7 +324,7 @@ impl Chrome {
             let start = self.insts.len();
             // Titlebar picture (not on the thin shade bar).
             if let (false, Some(img), Some(tb)) = (
-                view.shaded,
+                shaded,
                 skin.def.titlebar.as_ref().and_then(|t| t.image),
                 layout.titlebar,
             ) {
@@ -366,7 +368,7 @@ impl Chrome {
                     0
                 };
                 let mut state = state;
-                let sprite = if view.shaded { def.shaded_sprite.unwrap_or(def.sprite) } else { def.sprite };
+                let sprite = if shaded { def.shaded_sprite.unwrap_or(def.sprite) } else { def.sprite };
                 // Sheets without hover/pressed rows fall back to normal.
                 if sprite[1] + (state + 1) * h > sheet.h {
                     state = 0;

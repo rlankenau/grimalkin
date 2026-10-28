@@ -35,6 +35,7 @@ use crate::renderer::{FrameStatus, Renderer, ViewState};
 use crate::selection::{CellPos, Selection};
 use crate::skin::drag::ResizeDrag;
 use crate::skin::hit::{Hit, ResizeDir};
+use crate::skin::winstate::{Plan, Rect, WinState};
 use crate::skin::{self, Action, Skin, SkinRuntime};
 use crate::LaunchOptions;
 
@@ -118,6 +119,15 @@ impl App {
             // The skin draws its own frame; the OS draws nothing. Windows
             // clips to the shape with a region and keeps an opaque swapchain.
             attrs = attrs.with_decorations(false).with_transparent(skin::needs_alpha_surface());
+            // No OS maximize (Aero Snap, Win+Up, the system menu): the skin
+            // maximizes by hand, and an OS zoom would leave the window
+            // rectangle 8 px larger than the client area the chrome and the
+            // shape are laid out for.
+            #[cfg(windows)]
+            {
+                use winit::window::WindowButtons;
+                attrs = attrs.with_enabled_buttons(WindowButtons::CLOSE | WindowButtons::MINIMIZE);
+            }
             #[cfg(target_os = "macos")]
             {
                 use winit::platform::macos::WindowAttributesExtMacOS;
@@ -195,8 +205,7 @@ impl App {
             chrome_cursor: false,
             manual_resize: None,
             scripted_pointer: false,
-            pre_shade: None,
-            unshade_pending: false,
+            win_state: WinState::Normal,
             window,
             renderer,
             term,
@@ -295,7 +304,6 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 r.renderer.resize(size.width, size.height);
-                r.finish_unshade(size);
                 r.apply_grid_resize();
                 r.skin_geometry_changed();
                 r.window.request_redraw();
@@ -355,10 +363,9 @@ struct Running {
     /// A debug script is driving the pointer: use its window coordinates
     /// instead of the real (global) pointer for manual resizes.
     scripted_pointer: bool,
-    /// Window size before the windowshade collapsed it.
-    pre_shade: Option<PhysicalSize<u32>>,
-    /// Un-shading: waiting for the restored size to arrive.
-    unshade_pending: bool,
+    /// Normal / maximized / shaded, with what each restores to. The OS zoom
+    /// is never used for a skinned window (see `skin::winstate`).
+    win_state: WinState,
     window: Arc<Window>,
     renderer: Renderer,
     term: Terminal,
@@ -669,7 +676,7 @@ impl Running {
         if name == self.cfg.skin && cur.skin.origin.starts_with("built-in") {
             return;
         }
-        if cur.shaded() {
+        if self.win_state.is_shaded() {
             log::info!("skin change deferred: restore the shaded window first");
             return;
         }
@@ -1017,6 +1024,27 @@ impl Running {
         self.debug_command_inner(cmd);
         let s = self.window.inner_size();
         log::info!("debug script: inner size {}x{}", s.width, s.height);
+        self.debug_report();
+    }
+
+    /// Assert after every scripted step that the chrome, the grid freeze and
+    /// the window agree (`consistent=true`), and log the state.
+    fn debug_report(&self) {
+        let s = self.window.inner_size();
+        let Some(sk) = self.skin.as_ref() else { return };
+        let bar = self.shade_bar();
+        let want = s.height <= bar;
+        let ok = sk.shaded() == want && self.renderer.chrome_shaded() == want;
+        log::info!(
+            "debug script: state {:?} shaded(chrome)={} shaded(renderer)={} window {}x{} bar {} consistent={}",
+            self.win_state,
+            sk.shaded(),
+            self.renderer.chrome_shaded(),
+            s.width,
+            s.height,
+            bar,
+            ok
+        );
     }
 
     fn debug_command_inner(&mut self, cmd: &str) {
@@ -1066,6 +1094,19 @@ impl Running {
                     }
                 }
             }
+            "check" => {
+                // Step delays let the window system deliver its Resized
+                // events first: the chrome must match the window by now.
+                let s = self.window.inner_size();
+                let want = s.height <= self.shade_bar();
+                let ok = self.skin.as_ref().is_none_or(|sk| sk.shaded() == want && self.renderer.chrome_shaded() == want);
+                log::info!("debug script: CHECK {}", if ok { "ok" } else { "FAIL" });
+            }
+            "maximize" => self.run_skin_action(Action::ToggleMaximize),
+            "dump" => {
+                self.renderer.set_dump_path(Some(PathBuf::from(arg)));
+                self.window.request_redraw();
+            }
             "exit" => self.exit_requested = true,
             _ => log::warn!("debug script: unknown command {cmd:?}"),
         }
@@ -1081,7 +1122,7 @@ impl Running {
     }
 
     fn update_skin_min_size(&mut self) {
-        if self.skin.as_ref().is_some_and(|s| !s.shaded()) {
+        if self.skin.is_some() && !self.win_state.is_shaded() {
             self.window.set_min_inner_size(self.skin_min_size());
         }
     }
@@ -1091,7 +1132,7 @@ impl Running {
     fn skin_geometry_changed(&mut self) {
         let scale = self.renderer.skin_scale();
         let size = self.window.inner_size();
-        let maximized = self.window.is_maximized();
+        let maximized = self.win_state.is_maximized();
         if let Some(sk) = self.skin.as_mut() {
             sk.set_geometry((size.width, size.height), scale);
             sk.set_resizable(!maximized);
@@ -1181,18 +1222,10 @@ impl Running {
         match action {
             Action::Close => self.exit_requested = true,
             Action::Minimize => self.window.set_minimized(true),
-            Action::ToggleMaximize => {
-                let max = self.window.is_maximized();
-                // A borderless NSWindow has no zoom button for `zoom:` to
-                // act on; winit sets the frame directly for non-resizable
-                // windows, so switch resizing off around the call.
-                #[cfg(target_os = "macos")]
-                self.window.set_resizable(false);
-                self.window.set_maximized(!max);
-                #[cfg(target_os = "macos")]
-                self.window.set_resizable(true);
-            }
+            Action::ToggleMaximize => self.toggle_maximize(),
             Action::ToggleShade => self.toggle_shade(),
+            // A maximized window stays where it is.
+            Action::DragMove if self.win_state.is_maximized() => {}
             Action::DragMove => {
                 if let Err(e) = self.window.drag_window() {
                     log::debug!("drag_window: {e}");
@@ -1269,52 +1302,67 @@ impl Running {
         }
     }
 
+    /// The window as the state machine sees it: outer position and inner size.
+    fn window_rect(&self) -> Rect {
+        let p = self.window.outer_position().unwrap_or_default();
+        let s = self.window.inner_size();
+        Rect::new(p.x, p.y, s.width, s.height)
+    }
+
+    /// Height of the shade bar in physical pixels.
+    fn shade_bar(&self) -> u32 {
+        self.skin.as_ref().map_or(1, |sk| (sk.skin.shade_height() * sk.scale()).max(1))
+    }
+
+    /// Maximize / restore, done by hand: fill the monitor's work area, or go
+    /// back to where the window was. Maximizing a shaded window unshades it.
+    fn toggle_maximize(&mut self) {
+        if self.skin.is_none() {
+            return;
+        }
+        let plan = self.win_state.toggle_maximize(self.window_rect(), skin::work_area(&self.window));
+        self.apply_plan(plan);
+    }
+
     /// Windowshade: collapse the window to the skin's shade bar, or restore
     /// the size it had before. The terminal keeps running; its grid (and the
     /// child's idea of the window size) stay as they were.
     fn toggle_shade(&mut self) {
-        let Some(sk) = self.skin.as_ref() else { return };
-        let (shaded, bar) = (sk.shaded(), (sk.skin.shade_height() * sk.scale()).max(1));
-        if !shaded {
-            let cur = self.window.inner_size();
-            self.pre_shade = Some(cur);
-            self.unshade_pending = false;
-            if let Some(sk) = self.skin.as_mut() {
-                sk.set_shaded(true);
-            }
-            self.renderer.set_shaded(true);
+        if self.skin.is_none() {
+            return;
+        }
+        let plan = self.win_state.toggle_shade(self.window_rect(), self.shade_bar(), skin::work_area(&self.window));
+        self.apply_plan(plan);
+    }
+
+    /// Move to the next window state and put the window where it says. The
+    /// chrome and the grid follow from the resulting window size.
+    fn apply_plan(&mut self, plan: Plan) {
+        log::debug!("window state {:?} -> {:?}, target {:?}", self.win_state, plan.state, plan.target);
+        self.win_state = plan.state;
+        let t = plan.target;
+        let min = if plan.state.is_shaded() {
             let min_w = self.skin_min_size().map_or(1, |m| m.width);
-            self.window.set_min_inner_size(Some(PhysicalSize::new(min_w, bar)));
-            if let Some(size) = self.window.request_inner_size(PhysicalSize::new(cur.width, bar)) {
-                self.renderer.resize(size.width, size.height);
-            }
+            Some(PhysicalSize::new(min_w, self.shade_bar()))
         } else {
-            if let Some(sk) = self.skin.as_mut() {
-                sk.set_shaded(false);
-            }
-            let target = self.pre_shade.take().unwrap_or(self.window.inner_size());
-            self.window.set_min_inner_size(self.skin_min_size());
-            self.unshade_pending = true;
-            if let Some(size) = self.window.request_inner_size(target) {
-                self.renderer.resize(size.width, size.height);
-                self.finish_unshade(size);
-            }
+            self.skin_min_size()
+        };
+        // The minimum size must never sit above the size being asked for:
+        // lower it before shrinking, raise it after growing.
+        if plan.state.is_shaded() {
+            self.window.set_min_inner_size(min);
+        }
+        if let Some(size) = self.window.request_inner_size(PhysicalSize::new(t.w, t.h)) {
+            self.renderer.resize(size.width, size.height);
+        }
+        // AppKit keeps the bottom-left corner on a resize: place the frame last.
+        self.window.set_outer_position(PhysicalPosition::new(t.x, t.y));
+        if !plan.state.is_shaded() {
+            self.window.set_min_inner_size(min);
         }
         self.apply_grid_resize();
         self.skin_geometry_changed();
         self.window.request_redraw();
-    }
-
-    /// The restored window size arrived: let the renderer re-derive the grid.
-    fn finish_unshade(&mut self, size: PhysicalSize<u32>) {
-        if !self.unshade_pending {
-            return;
-        }
-        let bar = self.skin.as_ref().map_or(0, |s| s.skin.shade_height() * s.scale());
-        if size.height > bar {
-            self.unshade_pending = false;
-            self.renderer.set_shaded(false);
-        }
     }
 
     // -- mouse -------------------------------------------------------------

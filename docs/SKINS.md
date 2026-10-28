@@ -222,6 +222,28 @@ Details the format above leaves open, for skin authors:
   the viewport must contain the centre patch, i.e. each inset is at most the
   matching slice.
 
+* **Window state** (`skin/winstate.rs`): normal / maximized / shaded is one
+  enum (`WinState`) with the geometry each state restores to. The OS zoom is
+  never used with a skin. On Windows `set_maximized` zooms the undecorated
+  `WS_THICKFRAME` window to a rectangle 8 px larger than the work area on
+  every side while the client area (what the chrome, hit tests and region
+  use) is the work area itself, so the frame would be painted 8 px off-screen
+  and `SetWindowRgn` (window coordinates) would be offset from it. Maximize is
+  done by hand: remember the outer position and size, then move and resize
+  the window to the monitor work area (`MonitorFromWindow` +
+  `GetMonitorInfoW` `rcWork` on Windows, `NSScreen.visibleFrame` on macOS,
+  the monitor rectangle elsewhere); restore goes back to the remembered
+  rectangle. The skinned window drops `WS_MAXIMIZEBOX` (no Aero Snap / Win+Up)
+  and keeps `WS_THICKFRAME` because winit's `drag_resize_window` needs it; the
+  region is additionally shifted by the client origin's offset inside the
+  window rectangle, so it stays correct even if the OS did move the window.
+  Maximize while shaded unshades first and ends maximized; unshade always
+  restores the pre-shade size (or the work area if it was maximized).
+* **Chrome follows the window size**: whether the shade bar or the full frame
+  is drawn (and whether the grid is frozen) is derived from the window height
+  (`height <= shade bar`) every frame, not from a stored flag, so the chrome
+  can never disagree with the window.
+
 ## Testing hooks
 
 Environment variables for frame dumps and automation (`crates/gui/src/debug_script.rs`):
@@ -230,7 +252,7 @@ Environment variables for frame dumps and automation (`crates/gui/src/debug_scri
 * `GRIMALKIN_DEBUG_SCRIPT="1500:hover:close;800:shade;1000:size:900x500"`
   runs `delay-ms:command` steps through the real input handlers: `move:X,Y`,
   `hover:BUTTON`, `press:BUTTON`, `down`, `up`, `click`, `dblclick`, `shade`,
-  `size:WxH`, `exit`. After each step the log (`RUST_LOG=grimalkin=info`) has a
+  `size:WxH`, `maximize`, `check`, `dump:PATH` (redirect `GRIMALKIN_DUMP_FRAME`, which must be set), `exit`. `check` logs `CHECK ok` or `CHECK FAIL` for chrome/window consistency (give it a delay so the window system delivers its resize first). After each step the log (`RUST_LOG=grimalkin=info`) has a
   `debug script: inner size WxH` line, e.g. a grip drag is
   `move:1006,587;down;move:1046,617;move:1086,647;up`. Combine with `GRIMALKIN_DUMP_FRAME` to inspect each state.
 * Hot reload: between two skins the window is re-skinned live (a skin read from

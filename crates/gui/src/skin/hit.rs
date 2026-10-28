@@ -634,4 +634,35 @@ mod tests {
         // Rows with identical runs merge into few rectangles.
         assert!(rects.len() <= 4, "{} rects", rects.len());
     }
+
+    /// Bounding box of a rect list.
+    fn bbox(rects: &[[i32; 4]]) -> [i32; 4] {
+        rects.iter().fold([i32::MAX, i32::MAX, i32::MIN, i32::MIN], |b, r| {
+            [b[0].min(r[0]), b[1].min(r[1]), b[2].max(r[2]), b[3].max(r[3])]
+        })
+    }
+
+    #[test]
+    fn shape_rects_reach_the_last_column_and_row() {
+        let spec = SliceSpec {
+            region: [0, 0, 10, 10],
+            caps: Insets { left: 2, right: 2, top: 2, bottom: 2 },
+            mode: EdgeMode::Tile,
+        };
+        // Opaque everywhere, and with a semi-transparent (alpha 180, above the
+        // cutoff) last column and row such as a baked drop shadow: the region
+        // spans the whole window (right / bottom are exclusive).
+        for edge in [255u8, 180] {
+            let alpha = move |x: u32, y: u32| if x == 9 || y == 9 { edge } else { 255 };
+            for (w, h) in [(20, 12), (1008, 585), (1016, 597)] {
+                let rects = shape_rects(&spec, w, h, 1, PxRect::default(), alpha);
+                assert_eq!(bbox(&rects), [0, 0, w, h], "edge alpha {edge}, {w}x{h}");
+            }
+        }
+        // A transparent last column / row (alpha below the cutoff) is really
+        // outside the shape: the region is one pixel smaller on that side.
+        let alpha = |x: u32, y: u32| if x == 9 || y == 9 { 0u8 } else { 255 };
+        let rects = shape_rects(&spec, 1008, 585, 1, PxRect::default(), alpha);
+        assert_eq!(bbox(&rects), [0, 0, 1007, 584]);
+    }
 }

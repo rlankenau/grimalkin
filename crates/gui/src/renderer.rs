@@ -205,8 +205,6 @@ pub struct Renderer {
     origin: (u32, u32),
     inset: (u32, u32),
     chrome: Option<Chrome>,
-    /// Windowshade: only the chrome is drawn and the grid size is frozen.
-    shaded: bool,
     chrome_mask: Vec<GlyphInst>,
     chrome_mask_buf: InstanceBuf,
 
@@ -513,7 +511,6 @@ impl Renderer {
             origin: (0, 0),
             inset: (0, 0),
             chrome: None,
-            shaded: false,
             chrome_mask: Vec::new(),
             chrome_mask_buf: InstanceBuf::new(&device, "chrome title"),
             opacity: cfg.window.opacity,
@@ -618,7 +615,7 @@ impl Renderer {
     }
 
     fn update_grid_dims(&mut self) {
-        if self.shaded {
+        if self.shaded() {
             // The window is just the title bar: keep the grid as it was.
             return;
         }
@@ -669,13 +666,22 @@ impl Renderer {
         self.apply_skin_insets();
     }
 
-    /// Switch the windowshade (title bar only) on or off.
-    pub fn set_shaded(&mut self, shaded: bool) {
-        if self.shaded != shaded {
-            self.shaded = shaded;
-            self.update_grid_dims();
-            self.force_full = true;
-        }
+    /// Windowshade: the surface is as thin as the skin's shade bar, so only
+    /// the chrome is drawn and the grid size is frozen. Derived from the
+    /// surface size, never stored, so it cannot go stale.
+    pub fn chrome_shaded(&self) -> bool {
+        self.shaded()
+    }
+
+    /// Debug aid: redirect (or stop) the frame dump.
+    pub fn set_dump_path(&mut self, path: Option<std::path::PathBuf>) {
+        self.dump_path = path;
+    }
+
+    fn shaded(&self) -> bool {
+        self.chrome
+            .as_ref()
+            .is_some_and(|c| c.skin().is_shade_height(self.surface_config.height, skin::pixel_scale(self.scale)))
     }
 
     /// Integer pixel scale the chrome is drawn at.
@@ -1296,7 +1302,7 @@ impl Renderer {
                 chrome.draw(&mut pass);
                 self.draw_glyphs(&mut pass, &self.mask_pipeline, chrome.title_bind(), &self.chrome_mask_buf);
             }
-            if !self.shaded {
+            if !self.shaded() {
                 self.draw_terminal(&mut pass);
             }
         }

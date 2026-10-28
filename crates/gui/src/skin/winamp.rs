@@ -292,7 +292,7 @@ mod tests {
         );
         // The shaded bar keeps both buttons on it.
         rt.set_geometry((700, 14), 1);
-        rt.set_shaded(true);
+        assert!(rt.shaded());
         let b = rt.layout.button_rect(ButtonKind::Shade).unwrap();
         assert!(b.y >= 0 && b.y + b.h <= 14);
     }

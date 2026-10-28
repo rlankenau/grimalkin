@@ -9,7 +9,8 @@
 //!
 //! Commands: `move:X,Y` (window pixels), `hover:BUTTON`, `down`, `up`,
 //! `click`, `dblclick`, `press:BUTTON` (move onto the button and press
-//! without releasing), `shade`, `size:WxH` (physical inner size), `exit`.
+//! without releasing), `shade`, `maximize`, `size:WxH` (physical inner size), `check` (log whether
+//! chrome and window agree), `dump:PATH` (redirect the frame dump), `exit`.
 
 use std::time::Duration;
 
