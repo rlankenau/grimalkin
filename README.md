@@ -18,7 +18,7 @@ core works, many conveniences are missing.
 - Kitty keyboard protocol (flag stack, query, key encoding)
 - Selection, clipboard copy/paste, clickable OSC 8 hyperlinks, visual bell
   (optional audible), cursor shapes/blink, runtime zoom
-- TOML config: fonts, colors, window size/padding/opacity/title, cursor, bell, OSC 52
+- Themes (TOML or kitty `.conf`) with live config reload; TOML config: fonts, colors, window size/padding/opacity/title, cursor, bell, OSC 52
 
 Not done: no tabs or splits, no ligatures, no IME, no `U=1` unicode
 placeholders, no animation frames (`a=f`).
@@ -42,6 +42,8 @@ cargo run --release -p grimalkin -- [OPTIONS] [-e COMMAND [ARGS...]]
 | `-e`, `--command CMD [ARGS...]` | Run CMD instead of the shell (consumes the remaining arguments) |
 | `--config PATH` | Use this config file |
 | `--working-directory DIR` | Start in DIR |
+| `--theme NAME` | Use this color theme (overrides `theme` in the config) |
+| `--list-themes` | List built-in and user themes, then exit |
 | `-h`, `--help` / `-V`, `--version` | Help / version |
 
 The release binary is `target/release/grimalkin`.
@@ -71,9 +73,10 @@ opacity = 0.95
 title = "grimalkin"      # shown until the shell sets one
 dynamic_title = true     # false: ignore OSC 0/2 titles
 
-[colors]
+theme = "catppuccin-mocha"
+
+[colors]            # per-key overrides on top of the theme
 background = "#101014"
-foreground = "#dddddd"
 
 [cursor]
 shape = "bar"
@@ -82,6 +85,30 @@ blink = true
 [input]
 option_as_alt = true   # macOS
 ```
+
+### Themes and live reload
+
+`theme = "NAME"` (or `--theme NAME`) selects a color theme: colors, optional
+cursor and font settings. Built in: `default`, `catppuccin-mocha`, `dracula`,
+`gruvbox-dark`, `solarized-light`, `nord`, `tokyo-night`. `grimalkin --list-themes`
+lists them along with your own.
+
+Your own themes go in `<config dir>/grimalkin/themes/` (the directory that holds
+`grimalkin.toml`):
+
+- `NAME.toml`: grimalkin format, a `name`, a `[colors]` table (`foreground`,
+  `background`, `cursor`, `cursor_text`, `selection_background`,
+  `selection_foreground`, `url`, `black` .. `bright_white` or `color0` ..
+  `color15`) and optional `[font]` / `[cursor]` tables.
+- `NAME.conf`: a kitty theme file. Drop in anything from
+  [kitty-themes](https://github.com/kovidgoyal/kitty-themes).
+
+The `[colors]` table of `grimalkin.toml` overrides the theme key by key.
+
+The config file and the themes directory are watched. Saving either re-applies
+the theme, colors, cursor and font (family, size, line height) in the running
+window, with no restart. A file with a syntax error is reported in the log and
+the running settings are kept. (`--theme` keeps winning over the file.)
 
 ## Key bindings
 

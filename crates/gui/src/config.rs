@@ -22,6 +22,9 @@ impl Rgb {
 
     pub fn parse(s: &str) -> Option<Rgb> {
         let s = s.trim().trim_start_matches('#');
+        if !s.is_ascii() {
+            return None;
+        }
         let hex = |t: &str| u8::from_str_radix(t, 16).ok();
         match s.len() {
             6 => Some(Rgb(hex(&s[0..2])?, hex(&s[2..4])?, hex(&s[4..6])?)),
@@ -48,9 +51,9 @@ impl<'de> Deserialize<'de> for Rgb {
 }
 
 /// Accept either `family = "Menlo"` or `family = ["Menlo", "Apple Color Emoji"]`.
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
-enum OneOrMany {
+pub enum OneOrMany {
     One(String),
     Many(Vec<String>),
 }
@@ -134,18 +137,12 @@ impl Default for WindowConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
-pub struct ColorsConfig {
-    pub foreground: Rgb,
-    pub background: Rgb,
-    pub cursor: Rgb,
-    pub selection_bg: Rgb,
-    pub selection_fg: Rgb,
-    /// The 16 ANSI colors (0-7 normal, 8-15 bright). A shorter list overrides
-    /// only the first N entries.
-    pub ansi: Vec<Rgb>,
-}
+/// The `[colors]` table: per-key overrides applied on top of the theme (see
+/// `theme.rs`). Keys: foreground, background, cursor, cursor_text,
+/// selection_background (`selection_bg`), selection_foreground
+/// (`selection_fg`), url, the ANSI names black..bright_white or
+/// color0..color15, and `ansi = [..]` (first N entries).
+pub use crate::theme::ThemeColors as ColorsConfig;
 
 /// kitty's default theme.
 pub const DEFAULT_ANSI: [Rgb; 16] = [
@@ -166,30 +163,6 @@ pub const DEFAULT_ANSI: [Rgb; 16] = [
     Rgb(0x14, 0xff, 0xff),
     Rgb(0xff, 0xff, 0xff),
 ];
-
-impl Default for ColorsConfig {
-    fn default() -> Self {
-        ColorsConfig {
-            foreground: Rgb(0xdd, 0xdd, 0xdd),
-            background: Rgb(0x00, 0x00, 0x00),
-            cursor: Rgb(0xcc, 0xcc, 0xcc),
-            selection_bg: Rgb(0xff, 0xfa, 0xcd),
-            selection_fg: Rgb(0x00, 0x00, 0x00),
-            ansi: DEFAULT_ANSI.to_vec(),
-        }
-    }
-}
-
-impl ColorsConfig {
-    /// The full 16-entry palette with partial user overrides applied.
-    pub fn palette16(&self) -> [Rgb; 16] {
-        let mut p = DEFAULT_ANSI;
-        for (i, c) in self.ansi.iter().take(16).enumerate() {
-            p[i] = *c;
-        }
-        p
-    }
-}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
@@ -296,6 +269,9 @@ pub struct Config {
     pub font: FontConfig,
     pub window: WindowConfig,
     pub colors: ColorsConfig,
+    /// Theme name: a user theme in `<config_dir>/grimalkin/themes/` or a
+    /// built-in one (`--list-themes`).
+    pub theme: String,
     pub cursor: CursorConfig,
     pub input: InputConfig,
     pub bell: BellConfig,
@@ -313,6 +289,7 @@ impl Default for Config {
             font: FontConfig::default(),
             window: WindowConfig::default(),
             colors: ColorsConfig::default(),
+            theme: crate::theme::DEFAULT_THEME.to_string(),
             cursor: CursorConfig::default(),
             input: InputConfig::default(),
             bell: BellConfig::default(),
@@ -326,8 +303,8 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Per-OS default config file location.
-    pub fn default_path() -> Option<PathBuf> {
+    /// Per-OS config directory (`.../grimalkin`): config file, `themes/`, `skins/`.
+    pub fn config_dir() -> Option<PathBuf> {
         #[cfg(windows)]
         let base = dirs::config_dir();
         #[cfg(not(windows))]
@@ -335,7 +312,26 @@ impl Config {
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
             .or_else(|| dirs::home_dir().map(|h| h.join(".config")));
-        base.map(|b| b.join("grimalkin").join("grimalkin.toml"))
+        base.map(|b| b.join("grimalkin"))
+    }
+
+    /// Per-OS default config file location.
+    pub fn default_path() -> Option<PathBuf> {
+        Config::config_dir().map(|d| d.join("grimalkin.toml"))
+    }
+
+    /// Read and parse the config file for a reload. Unlike [`Config::load`],
+    /// failure is returned so the caller can keep the running settings.
+    /// A missing file yields the defaults.
+    pub fn try_load(explicit: Option<&Path>) -> Result<Config, String> {
+        let Some(path) = explicit.map(Path::to_path_buf).or_else(Config::default_path) else {
+            return Ok(Config::default());
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Config::from_toml(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        }
     }
 
     /// Load the config. An explicit `path` that cannot be read or parsed is
@@ -403,7 +399,8 @@ mod tests {
         assert_eq!(c.window.cols, 120);
         assert_eq!(c.window.rows, 35);
         assert_eq!(c.scrollback_lines, 10_000);
-        assert_eq!(c.colors.palette16()[1], Rgb(0xcc, 0x04, 0x03));
+        assert_eq!(c.theme, "default");
+        assert_eq!(c.colors, ColorsConfig::default());
     }
 
     #[test]
@@ -424,11 +421,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.font.family, vec!["Fira Code".to_string()]);
-        assert_eq!(c.colors.background, Rgb(0x10, 0x20, 0x30));
-        let p = c.colors.palette16();
-        assert_eq!(p[0], Rgb(0, 0, 1));
-        assert_eq!(p[1], Rgb(255, 0, 0));
-        assert_eq!(p[2], DEFAULT_ANSI[2]);
+        assert_eq!(c.colors.background, Some(Rgb(0x10, 0x20, 0x30)));
+        let p = c.colors.ansi;
+        assert_eq!(p[0], Some(Rgb(0, 0, 1)));
+        assert_eq!(p[1], Some(Rgb(255, 0, 0)));
+        assert_eq!(p[2], None);
         assert_eq!(c.cursor.shape, CursorShapeCfg::Bar);
         assert!(c.cursor.blink);
         assert_eq!(c.scrollback_lines, 5);

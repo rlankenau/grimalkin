@@ -201,6 +201,10 @@ pub struct Renderer {
     // Theme.
     sel_bg: Rgb,
     sel_fg: Rgb,
+    /// Text color under a block cursor; `None` = the terminal background.
+    cursor_text: Option<Rgb>,
+    /// Hovered-link underline color; `None` = the text color.
+    url_color: Option<Rgb>,
     opacity: f32,
 
     // Instance caches.
@@ -490,8 +494,10 @@ impl Renderer {
             pad: 0,
             cols: 1,
             rows: 1,
-            sel_bg: cfg.colors.selection_bg.tuple(),
-            sel_fg: cfg.colors.selection_fg.tuple(),
+            sel_bg: (0xff, 0xfa, 0xcd),
+            sel_fg: (0, 0, 0),
+            cursor_text: None,
+            url_color: None,
             opacity: cfg.window.opacity,
             row_cache: Vec::new(),
             force_full: true,
@@ -617,6 +623,23 @@ impl Renderer {
             .reconfigure(&fam, pt * self.scale as f32, self.line_height);
         self.update_grid_dims();
         self.force_full = true;
+    }
+
+    /// Apply a theme's selection, block-cursor text and link colors (the
+    /// terminal's own default colors are set on the `Terminal`). Repaints all rows.
+    pub fn set_palette(&mut self, p: &crate::theme::Palette) {
+        self.sel_bg = p.selection_bg.tuple();
+        self.sel_fg = p.selection_fg.tuple();
+        self.cursor_text = p.cursor_text.map(|c| c.tuple());
+        self.url_color = p.url.map(|c| c.tuple());
+        self.force_full = true;
+    }
+
+    /// Change families, size (points) and line height, and rebuild the atlas.
+    pub fn set_font(&mut self, families: &[String], pt: f32, line_height: f32) {
+        self.families = families.to_vec();
+        self.line_height = line_height;
+        self.set_font_size(pt);
     }
 
     /// Force every row to be regenerated on the next frame (selection or
@@ -804,7 +827,9 @@ impl Renderer {
                     continue;
                 }
                 let cell = &term.visible_row(r).cells[c0];
-                let c = if cell.flags.contains(Flags::INVERSE) {
+                let c = if let Some(u) = self.url_color {
+                    u
+                } else if cell.flags.contains(Flags::INVERSE) {
                     colors.resolve(cell.bg, bg)
                 } else {
                     colors.resolve(cell.fg, fg)
@@ -889,7 +914,7 @@ impl Renderer {
                     if cell.flags.contains(Flags::ITALIC) {
                         style |= STYLE_ITALIC;
                     }
-                    let text_rgb = colors.background;
+                    let text_rgb = self.cursor_text.unwrap_or(colors.background);
                     // Box-drawing glyphs go through the rect path.
                     if !crate::boxdraw::draw(cell.ch, x, y, cw, chh, text_rgb, &mut self.cur_rect) {
                         let gpu = Gpu {

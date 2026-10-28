@@ -28,3 +28,4 @@ sys-locale = "0.3"
 open = "5"
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+notify = "8"
