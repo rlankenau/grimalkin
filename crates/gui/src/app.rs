@@ -201,7 +201,7 @@ impl App {
             pty,
             rx,
             writer,
-            gfx: Graphics::new(),
+            gfx: Graphics::with_cursor_moves(cfg.pty.graphics_cursor.follows_protocol_here()),
             clipboard: None,
             selection: Selection::new(),
             mods: ModifiersState::empty(),
