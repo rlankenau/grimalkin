@@ -484,6 +484,26 @@ fn scaling_with_c_and_r() {
 }
 
 #[test]
+fn dest_px_follows_native_size_and_c_r() {
+    let mut p = Protocol::new();
+    setup(&mut p, 1, 100, 50);
+    run(&mut p, "a=p,i=1,p=1"); // native
+    run(&mut p, "a=p,i=1,c=4,r=3,p=2"); // stretched to the cells (10x20 px each)
+    run(&mut p, "a=p,i=1,c=5,p=3"); // 50px wide => 25px high
+    run(&mut p, "a=p,i=1,r=2,p=4"); // 40px high => 80px wide
+    let get = |pid| {
+        p.placements_in(Screen::Main, 0..=u64::MAX)
+            .find(|x| x.placement_id == pid)
+            .map(|x| x.dest_px)
+            .unwrap()
+    };
+    assert_eq!(get(1), (100, 50));
+    assert_eq!(get(2), (40, 60));
+    assert_eq!(get(3), (50, 25));
+    assert_eq!(get(4), (80, 40));
+}
+
+#[test]
 fn source_rect_is_clamped_and_affects_size() {
     let mut p = Protocol::new();
     setup(&mut p, 1, 100, 100);

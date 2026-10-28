@@ -114,6 +114,10 @@ pub struct Placement {
     pub src_rect: Rect,
     /// `X`, `Y` pixel offset inside the first cell.
     pub pixel_offset: (u32, u32),
+    /// Size in pixels the source rectangle is stretched to when displayed
+    /// (native size without `c`/`r`; `c*cell_w` / `r*cell_h` otherwise, with
+    /// the other axis derived to keep the aspect ratio when only one is set).
+    pub dest_px: (u32, u32),
     /// Virtual placement for unicode placeholders (`U=1`); has no position.
     pub is_virtual: bool,
 }
@@ -602,6 +606,16 @@ impl Protocol {
         };
         let cols = cols.clamp(1, cap) as u32;
         let rows = rows.clamp(1, cap) as u32;
+        let dest_px = {
+            let (cc, rr) = (cc.min(cap), rr.min(cap));
+            let (dw, dh) = match (cc, rr) {
+                (0, 0) => (sw, sh),
+                (cc, 0) => (cc * cw, (cc * cw * sh + sw / 2) / sw),
+                (0, rr) => ((rr * ch * sw + sh / 2) / sh, rr * ch),
+                (cc, rr) => (cc * cw, rr * ch),
+            };
+            (dw.clamp(1, u32::MAX as u64) as u32, dh.clamp(1, u32::MAX as u64) as u32)
+        };
         let is_virtual = c.virt == 1;
 
         if pid != 0 {
@@ -618,6 +632,7 @@ impl Protocol {
             rows,
             src_rect: Rect { x: c.x, y: c.y, w, h },
             pixel_offset: (xoff as u32, yoff as u32),
+            dest_px,
             is_virtual,
         });
         self.changed = true;

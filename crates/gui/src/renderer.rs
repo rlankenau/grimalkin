@@ -2,10 +2,11 @@
 //! instance caching driven by vt damage.
 //!
 //! Draw order (one render pass):
+//!   0. kitty images with z < -2^30 (under even non-default backgrounds)
 //!   1. cell background rects
-//!   2. (PASS 2 hook) kitty images with z < 0        -- graphics agent
+//!   2. kitty images with -2^30 <= z < 0 (images.rs)
 //!   3. glyphs (mask atlas, then color atlas), then decorations
-//!   4. (PASS 4 hook) kitty images with z >= 0       -- graphics agent
+//!   4. kitty images with z >= 0 (images.rs)
 //!   5. cursor (rect, then the glyph under a block cursor in inverse color)
 //!
 //! Instances for the grid are cached per visible row and only regenerated for
@@ -25,6 +26,7 @@ use grimalkin_vt::{CellWidth, Damage, Flags, Terminal, Underline};
 use winit::window::Window;
 
 use crate::config::Config;
+use crate::images::{GridGeometry, ImageRenderer, Layer};
 use crate::glyphs::{AtlasKind, GlyphCache, Gpu, STYLE_BOLD, STYLE_ITALIC};
 use crate::selection::Selection;
 
@@ -181,6 +183,7 @@ pub struct Renderer {
     bound_versions: (u32, u32),
 
     glyphs: GlyphCache,
+    images: ImageRenderer,
 
     // Layout (physical pixels).
     scale: f64,
@@ -454,6 +457,7 @@ impl Renderer {
         let (rect_bind, mask_bind, color_bind) = Self::make_binds(&device, &bind_layout, &globals_buf, &glyphs, &nearest, &linear);
         let bound_versions = (glyphs.mask.version, glyphs.color.version);
 
+        let images = ImageRenderer::new(&device, &bind_layout, &globals_buf, format);
         let mut r = Renderer {
             surface,
             queue,
@@ -473,6 +477,7 @@ impl Renderer {
             color_bind,
             bound_versions,
             glyphs,
+            images,
             scale,
             font_pt,
             families: cfg.font.family.clone(),
@@ -852,7 +857,7 @@ impl Renderer {
     // -- frame ------------------------------------------------------------
 
     /// Update instances from the terminal's damage and draw one frame.
-    pub fn render(&mut self, term: &mut Terminal, view: &ViewState) -> FrameStatus {
+    pub fn render(&mut self, term: &mut Terminal, view: &ViewState, graphics: &mut grimalkin_graphics::Protocol) -> FrameStatus {
         let damage = term.take_damage();
         self.update_rows(term, &damage, view);
         self.build_cursor(term, view);
@@ -888,6 +893,14 @@ impl Renderer {
             srgb_target: if self.srgb_target { 1.0 } else { 0.0 },
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&g));
+        let geo = GridGeometry {
+            pad: self.pad,
+            cell_w: self.glyphs.metrics.cell_w,
+            cell_h: self.glyphs.metrics.cell_h,
+            surface_w: self.surface_config.width,
+            surface_h: self.surface_config.height,
+        };
+        self.images.prepare(&self.device, &self.queue, graphics, term, geo);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
@@ -1048,14 +1061,18 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            // 0. kitty images far below everything
+            self.images.draw(&mut pass, Layer::BelowBackground);
             // 1. backgrounds
             self.draw_rects(&mut pass, &self.bg_buf);
-            // 2. PASS 2 hook: kitty images with z < 0 (graphics agent)
+            // 2. kitty images with z < 0
+            self.images.draw(&mut pass, Layer::BelowText);
             // 3. glyphs then decorations
             self.draw_glyphs(&mut pass, &self.mask_pipeline, &self.mask_bind, &self.mask_buf);
             self.draw_glyphs(&mut pass, &self.color_pipeline, &self.color_bind, &self.color_buf);
             self.draw_rects(&mut pass, &self.deco_buf);
-            // 4. PASS 4 hook: kitty images with z >= 0 (graphics agent)
+            // 4. kitty images with z >= 0
+            self.images.draw(&mut pass, Layer::AboveText);
             // 5. cursor
             self.draw_rects(&mut pass, &self.cur_rect_buf);
             self.draw_glyphs(&mut pass, &self.mask_pipeline, &self.mask_bind, &self.cur_mask_buf);

@@ -16,7 +16,6 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use grimalkin_graphics::Protocol;
 use grimalkin_pty::{Pty, PtyEvent, PtyWriter, SpawnConfig};
 use grimalkin_vt::{CursorShape, Screen, TermEvent, Terminal};
 use winit::application::ApplicationHandler;
@@ -27,7 +26,7 @@ use winit::keyboard::ModifiersState;
 use winit::window::{UserAttentionType, Window, WindowId};
 
 use crate::config::{Config, CursorShapeCfg};
-use crate::graphics_glue;
+use crate::graphics_glue::Graphics;
 use crate::input::{self, EncodeState, KeyAction, KeyInput, MouseBtn, MouseEvent, MouseKind, ZoomOp};
 use crate::renderer::{FrameStatus, Renderer, ViewState};
 use crate::selection::{CellPos, Selection};
@@ -154,7 +153,7 @@ impl App {
             pty,
             rx,
             writer,
-            protocol: Protocol::new(),
+            gfx: Graphics::new(),
             clipboard: None,
             selection: Selection::new(),
             mods: ModifiersState::empty(),
@@ -261,7 +260,7 @@ struct Running {
     pty: Pty,
     rx: Receiver<PtyEvent>,
     writer: PtyWriter,
-    protocol: Protocol,
+    gfx: Graphics,
     clipboard: Option<arboard::Clipboard>,
     selection: Selection,
     mods: ModifiersState,
@@ -297,7 +296,7 @@ impl Running {
         loop {
             match self.rx.try_recv() {
                 Ok(PtyEvent::Output(bytes)) => {
-                    self.term.advance(&bytes);
+                    self.gfx.feed(&mut self.term, &bytes);
                     got_output = true;
                     budget = budget.saturating_sub(bytes.len());
                     if budget == 0 {
@@ -328,7 +327,9 @@ impl Running {
     /// Respond to the terminal, handle its events, and schedule a redraw.
     fn after_advance(&mut self) {
         let mut need_redraw = false;
-        for ev in self.term.drain_events() {
+        let events = self.gfx.drain_events(&mut self.term);
+        need_redraw |= self.gfx.take_dirty();
+        for ev in events {
             match ev {
                 TermEvent::Title(t) => self.window.set_title(if t.is_empty() { "grimalkin" } else { &t }),
                 TermEvent::Bell => {
@@ -356,10 +357,8 @@ impl Running {
                     self.cursor_shape_event = Some(s);
                     need_redraw = true;
                 }
-                // STUB: kitty graphics. Implemented by graphics_glue::handle.
-                TermEvent::GraphicsCommand(payload) => {
-                    need_redraw |= graphics_glue::handle(&mut self.term, &mut self.protocol, &payload);
-                }
+                // Handled by `Graphics` (graphics_glue.rs) as the bytes are fed.
+                TermEvent::GraphicsCommand(_) => {}
             }
         }
         let resp = self.term.drain_responses();
@@ -464,7 +463,7 @@ impl Running {
             cursor_shape: shape,
             selection: &self.selection,
         };
-        let status = self.renderer.render(&mut self.term, &view);
+        let status = self.renderer.render(&mut self.term, &view, self.gfx.protocol_mut());
         log::debug!("frame status: {status:?}");
         match status {
             FrameStatus::Retry => self.window.request_redraw(),
