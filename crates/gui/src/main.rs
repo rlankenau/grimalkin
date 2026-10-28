@@ -6,17 +6,19 @@
 //! * `renderer`      wgpu renderer (grid instances, cursor); `glyphs` fonts/atlas;
 //!   `boxdraw` procedural box/block characters
 //! * `input`         keyboard/wheel encoding, mouse + kitty keyboard hooks
-//! * `selection`     text selection (skeleton)
+//! * `selection`     text selection; `links` hyperlink detection; `bell` audible bell
 //! * `graphics_glue` kitty graphics protocol glue (stub)
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod bell;
 mod boxdraw;
 mod config;
 mod glyphs;
 mod graphics_glue;
 mod input;
+mod links;
 mod renderer;
 mod selection;
 

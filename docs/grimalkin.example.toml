@@ -59,3 +59,17 @@ blink = false
 # macOS: use the Option key as Alt (sends ESC prefix) instead of composing
 # special characters.
 option_as_alt = true
+
+[bell]
+# Flash the window for visual_ms milliseconds when a program rings the bell.
+visual = true
+visual_ms = 150
+# Play the system alert sound as well.
+audible = false
+
+[clipboard]
+# Allow programs to set the clipboard with OSC 52.
+osc52_write = true
+# Allow programs to read the clipboard with OSC 52. Off by default because any
+# program running in the terminal (including over ssh) could read it.
+osc52_read = false

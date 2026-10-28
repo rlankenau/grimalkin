@@ -24,11 +24,12 @@ use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{UserAttentionType, Window, WindowId};
+use winit::window::{CursorIcon, UserAttentionType, Window, WindowId};
 
 use crate::config::{Config, CursorShapeCfg};
 use crate::graphics_glue;
 use crate::input::{self, EncodeState, KeyAction, KeyInput, MouseBtn, MouseEvent, MouseKind, ZoomOp};
+use crate::links;
 use crate::renderer::{FrameStatus, Renderer, ViewState};
 use crate::selection::{CellPos, Selection};
 use crate::LaunchOptions;
@@ -165,6 +166,9 @@ impl App {
             mouse_px: (0.0, 0.0),
             left_down: false,
             wheel_accum: 0.0,
+            bell_until: None,
+            mouse_inside: false,
+            pointer_cursor: false,
             cursor_shape_event: None,
             blink_epoch: Instant::now(),
             blink_deadline: None,
@@ -226,7 +230,8 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => r.redraw(),
             WindowEvent::Occluded(false) => r.window.request_redraw(),
             WindowEvent::Focused(f) => r.on_focus(f),
-            WindowEvent::ModifiersChanged(m) => r.mods = m.state(),
+            WindowEvent::ModifiersChanged(m) => r.on_modifiers(m.state()),
+            WindowEvent::CursorLeft { .. } => r.on_cursor_left(),
             WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
                 if !is_synthetic {
                     r.on_key(&event);
@@ -273,6 +278,12 @@ struct Running {
     mouse_px: (f64, f64),
     left_down: bool,
     wheel_accum: f64,
+    /// The visual bell flash ends at this time.
+    bell_until: Option<Instant>,
+    /// The pointer is inside the window (link hover needs to know).
+    mouse_inside: bool,
+    /// The pointer cursor is currently shown for a hovered link.
+    pointer_cursor: bool,
     /// Cursor shape last set by the program (DECSCUSR); `None` = config default.
     cursor_shape_event: Option<CursorShape>,
     blink_epoch: Instant,
@@ -335,16 +346,19 @@ impl Running {
                     if !self.focused {
                         self.window.request_user_attention(Some(UserAttentionType::Informational));
                     }
+                    need_redraw |= self.ring_bell();
                 }
                 TermEvent::ClipboardSet(text) => {
-                    if let Some(cb) = self.clipboard() {
-                        if let Err(e) = cb.set_text(text) {
-                            log::warn!("clipboard set failed: {e}");
-                        }
+                    if self.cfg.clipboard.osc52_write {
+                        self.set_clipboard(text);
                     }
                 }
                 TermEvent::ClipboardQuery => {
-                    let text = self.clipboard().and_then(|cb| cb.get_text().ok()).unwrap_or_default();
+                    let text = if self.cfg.clipboard.osc52_read {
+                        self.clipboard().and_then(|cb| cb.get_text().ok()).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     self.term.respond_clipboard(&text);
                 }
                 TermEvent::CwdChanged(_) | TermEvent::SetMouseMode => {}
@@ -362,6 +376,11 @@ impl Running {
                 }
             }
         }
+        // The program wrote over (or switched away from) the selected text.
+        if self.selection.is_active() && self.selection.validate(&self.term) {
+            self.renderer.invalidate();
+            need_redraw = true;
+        }
         let resp = self.term.drain_responses();
         if !resp.is_empty() {
             let _ = self.writer.write_all(&resp);
@@ -376,6 +395,26 @@ impl Running {
                 self.window.request_redraw();
             }
         }
+    }
+
+    fn set_clipboard(&mut self, text: String) {
+        if let Some(cb) = self.clipboard() {
+            if let Err(e) = cb.set_text(text) {
+                log::warn!("clipboard set failed: {e}");
+            }
+        }
+    }
+
+    /// Visual and audible bell per config. Returns true if a redraw is needed.
+    fn ring_bell(&mut self) -> bool {
+        if self.cfg.bell.audible {
+            crate::bell::beep();
+        }
+        if self.cfg.bell.visual && self.cfg.bell.visual_ms > 0 {
+            self.bell_until = Some(Instant::now() + Duration::from_millis(self.cfg.bell.visual_ms as u64));
+            return true;
+        }
+        false
     }
 
     fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
@@ -458,11 +497,20 @@ impl Running {
             CursorShapeCfg::Underline => CursorShape::Underline,
             CursorShapeCfg::Bar => CursorShape::Bar,
         });
+        let hover = if self.link_hover_enabled() && self.mouse_inside {
+            links::link_at(&self.term, self.cell_at(self.mouse_px))
+        } else {
+            None
+        };
+        self.set_pointer_cursor(hover.is_some());
+        let flash = if self.bell_until.is_some_and(|t| now < t) { 1.0 } else { 0.0 };
         let view = ViewState {
             focused: self.focused,
             cursor_on: self.blink_on(now),
             cursor_shape: shape,
             selection: &self.selection,
+            hover: hover.as_ref(),
+            flash,
         };
         let status = self.renderer.render(&mut self.term, &view);
         log::debug!("frame status: {status:?}");
@@ -498,6 +546,16 @@ impl Running {
                 }
             }
             if let Some(t) = self.sync_poll {
+                merge(t);
+            }
+        }
+
+        // Visual bell: redraw once when the flash is over.
+        if let Some(t) = self.bell_until {
+            if now >= t {
+                self.bell_until = None;
+                self.window.request_redraw();
+            } else {
                 merge(t);
             }
         }
@@ -569,11 +627,89 @@ impl Running {
 
     fn copy(&mut self) {
         if let Some(text) = self.selection.selected_text(&self.term) {
+            self.set_clipboard(text);
+        }
+    }
+
+    /// Copy-on-select: put the selection into the PRIMARY selection (X11 and
+    /// Wayland only; other platforms have no such thing).
+    #[cfg(target_os = "linux")]
+    fn copy_primary(&mut self) {
+        use arboard::{LinuxClipboardKind, SetExtLinux};
+        if let Some(text) = self.selection.selected_text(&self.term) {
             if let Some(cb) = self.clipboard() {
-                if let Err(e) = cb.set_text(text) {
-                    log::warn!("clipboard set failed: {e}");
+                if let Err(e) = cb.set().clipboard(LinuxClipboardKind::Primary).text(text) {
+                    log::debug!("primary selection set failed: {e}");
                 }
             }
+        }
+    }
+
+    /// Middle-click paste from the PRIMARY selection.
+    #[cfg(target_os = "linux")]
+    fn paste_primary(&mut self) {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+        let text = self
+            .clipboard()
+            .and_then(|cb| cb.get().clipboard(LinuxClipboardKind::Primary).text().ok());
+        if let Some(text) = text {
+            self.paste_text(&text);
+        }
+    }
+
+    // -- links -------------------------------------------------------------
+
+    /// Ctrl (Cmd on macOS) is the modifier that activates links.
+    fn link_mod(&self, mods: ModifiersState) -> bool {
+        if input::IS_MAC {
+            mods.super_key()
+        } else {
+            mods.control_key()
+        }
+    }
+
+    /// Links are active while the modifier is held, unless an application has
+    /// mouse reporting on (then Shift is needed too, as for selection).
+    fn link_hover_enabled(&self) -> bool {
+        self.link_mod(self.mods)
+            && (self.term.mouse_mode() == grimalkin_vt::MouseMode::None || self.mods.shift_key())
+    }
+
+    fn set_pointer_cursor(&mut self, on: bool) {
+        if on != self.pointer_cursor {
+            self.pointer_cursor = on;
+            self.window
+                .set_cursor(if on { CursorIcon::Pointer } else { CursorIcon::Default });
+        }
+    }
+
+    /// Open the link under the pointer, if links are active. Returns true if
+    /// one was found (the click is then consumed).
+    fn try_open_link(&mut self) -> bool {
+        if !self.link_hover_enabled() {
+            return false;
+        }
+        match links::link_at(&self.term, self.cell_at(self.mouse_px)) {
+            Some(l) => {
+                links::open(&l.uri);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn on_modifiers(&mut self, mods: ModifiersState) {
+        let (was, is) = (self.link_mod(self.mods), self.link_mod(mods));
+        self.mods = mods;
+        if was != is || self.pointer_cursor {
+            self.window.request_redraw();
+        }
+    }
+
+    fn on_cursor_left(&mut self) {
+        self.mouse_inside = false;
+        if self.pointer_cursor {
+            self.window.request_redraw();
         }
     }
 
@@ -655,18 +791,45 @@ impl Running {
 
     fn on_cursor_moved(&mut self, x: f64, y: f64) {
         self.mouse_px = (x, y);
+        self.mouse_inside = true;
+        // Link hover underline / pointer cursor follow the mouse.
+        if self.link_hover_enabled() || self.pointer_cursor {
+            self.window.request_redraw();
+        }
         let btn = if self.left_down { MouseBtn::Left } else { MouseBtn::None };
         let ev = self.mouse_event(MouseKind::Motion, btn);
         if self.report_mouse(&ev) {
             return;
         }
         if self.left_down {
+            self.autoscroll_selection(y);
             let pos = self.cell_at(self.mouse_px);
-            // Selection hook (no-op until the selection agent fills it in).
             if self.selection.on_drag(&self.term, pos) {
                 self.renderer.invalidate();
                 self.window.request_redraw();
             }
+        }
+    }
+
+    /// Dragging above/below the text area scrolls the view (one line per
+    /// mouse event) so a selection can reach into the scrollback.
+    fn autoscroll_selection(&mut self, y: f64) {
+        if !self.selection.is_active() || self.term.screen() == Screen::Alt {
+            return;
+        }
+        let (_, ch) = self.renderer.cell_size_px();
+        let top = self.renderer.padding_px() as f64;
+        let bottom = top + self.term.rows() as f64 * ch as f64;
+        let delta = if y < top {
+            1
+        } else if y >= bottom {
+            -1
+        } else {
+            return;
+        };
+        if self.term.scroll_display(delta) {
+            self.renderer.invalidate();
+            self.window.request_redraw();
         }
     }
 
@@ -685,13 +848,24 @@ impl Running {
         if self.report_mouse(&ev) {
             return;
         }
+        if pressed && button == MouseButton::Left && self.try_open_link() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if pressed && button == MouseButton::Middle {
+            self.paste_primary();
+            return;
+        }
         let pos = self.cell_at(self.mouse_px);
-        // Selection hooks (no-ops until the selection agent fills them in).
         let changed = if pressed {
             self.selection.on_press(&self.term, pos, button, self.mods, Instant::now())
         } else {
             self.selection.on_release(&self.term, pos, button)
         };
+        #[cfg(target_os = "linux")]
+        if !pressed && self.selection.take_completed() {
+            self.copy_primary();
+        }
         if changed {
             self.renderer.invalidate();
             self.window.request_redraw();
