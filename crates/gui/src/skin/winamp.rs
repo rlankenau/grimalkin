@@ -149,8 +149,14 @@ pub fn resolve(reference: &str, user_dir: Option<&Path>) -> Option<Result<Skin, 
     if explicit {
         return Some(load_path(p));
     }
-    if is_wsz(rest) && p.is_file() {
-        return Some(load_path(p));
+    if is_wsz(rest) && (p.is_file() || path_like) {
+        // A path that names a `.wsz` is that skin; say so if it is missing
+        // instead of falling through to the TOML loader's "skin.toml missing".
+        return Some(if p.is_file() {
+            load_path(p)
+        } else {
+            Err(format!("WinAMP skin file {rest:?} not found"))
+        });
     }
     if path_like
         && p.is_dir()
@@ -256,6 +262,34 @@ mod tests {
         assert_eq!(px(sheet, 9, 18), [4, 5, 6, 255], "shade pressed");
         assert_eq!(px(sheet, 18, 18), [7, 8, 9, 255], "expand pressed");
         assert_eq!(px(sheet, 50, 27 + 5), [250, 250, 0, 255], "title art");
+    }
+
+    /// No top-edge tile is cut at a corner, for any window width: the left
+    /// run starts at the left cap with the tile's first column and the right
+    /// run ends at the right cap with its last one.
+    #[test]
+    fn top_edge_tiles_end_flush_with_both_corners() {
+        let mut im = synthetic_pledit(186);
+        for x in 0..25u32 {
+            for y in 0..20u32 {
+                im.put_pixel(127 + x, y, image::Rgb([x as u8 * 8, 0, 0]));
+            }
+        }
+        let bmp = bmp_bytes(&im);
+        let wsz = zip_of(&[("pledit.bmp", &bmp)]);
+        let s = from_wsz(wsz, "synth", None).unwrap();
+        for scale in [1u32, 2, 3] {
+            let (spec, _, k) = s.frame_spec(false, scale);
+            // Wide enough that the right run is not empty (the centre is left of the right cap).
+            for w in (310u32..=420).step_by(7).chain([337, 1001]) {
+                let w = (w * scale) as i32;
+                let col = |x: i32| spec.texel_at(w, 400, k, x, 3).0;
+                let (lc, rc) = (125 * k, 150 * k);
+                assert_eq!(col(lc), 125, "left run starts on the tile start, w {w} @{scale}x");
+                assert_eq!(col(w - rc - 1), 149, "right run ends on the tile end, w {w} @{scale}x");
+                assert_eq!(col(w - rc), 150, "the right cap follows, w {w} @{scale}x");
+            }
+        }
     }
 
     #[test]
@@ -367,6 +401,9 @@ mod tests {
 
     #[test]
     fn resolve_finds_user_skins_paths_and_directories() {
+        // A missing .wsz path is reported as such, not as a missing skin.toml.
+        let e = resolve("/no/such/dir/missing.wsz", None).unwrap().err().unwrap();
+        assert!(e.contains("not found") && e.contains("missing.wsz"), "{e}");
         let d = std::env::temp_dir().join(format!("grimalkin-wa-resolve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("raw")).unwrap();

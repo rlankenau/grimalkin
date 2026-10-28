@@ -20,6 +20,13 @@ pub enum EdgeMode {
     #[default]
     Tile,
     Stretch,
+    /// Like `Tile`, but the top edge is laid out as two runs that meet at the
+    /// window centre: the left run starts at the left cap, the right run ends
+    /// flush with the right cap. A tile is therefore never cut at a cap, for
+    /// any window width; the one seam sits mid-edge, where a centred
+    /// titlebar image normally hides it (WinAMP's playlist frame).
+    #[serde(rename = "tile_split")]
+    TileSplit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]

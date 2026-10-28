@@ -154,9 +154,46 @@ fn map_axis(d: i32, len: i32, cap_a: u32, cap_b: u32, tex_len: u32, k: i32, stre
     }
 }
 
+/// Where the two top-edge runs of `EdgeMode::TileSplit` meet: the window
+/// centre, moved right (by less than `k`) so the right run is a whole number
+/// of texels and ends exactly on a texel boundary at the right cap.
+fn split_at(len: i32, pa: i32, pb: i32, k: i32) -> i32 {
+    let end = (len - pb).max(pa);
+    let cx = (len / 2).clamp(pa, end);
+    cx + (end - cx) % k.max(1)
+}
+
+/// `map_axis` for the horizontal axis of the top band under `TileSplit`.
+fn map_axis_split(d: i32, len: i32, cap_a: u32, cap_b: u32, tex_len: u32, k: i32) -> u32 {
+    let k = k.max(1);
+    let (pa, pb) = (cap_a as i32 * k, cap_b as i32 * k);
+    let tm = tex_len.saturating_sub(cap_a + cap_b);
+    let d = d.clamp(0, (len - 1).max(0));
+    if tm == 0 || len < pa + pb || d < pa || d >= len - pb {
+        return map_axis(d, len, cap_a, cap_b, tex_len, k, false);
+    }
+    let cx = split_at(len, pa, pb, k);
+    if d < cx {
+        cap_a + ((d - pa) / k) as u32 % tm
+    } else {
+        // Counted back from the right cap, so the last texel of a tile sits
+        // right next to the cap.
+        let e = ((len - pb - 1 - d) / k) as u32;
+        cap_a + tm - 1 - e % tm
+    }
+}
+
 impl SliceSpec {
     fn stretch(&self) -> bool {
         self.mode == EdgeMode::Stretch
+    }
+
+    /// Whether window row `y` is in the top band that `TileSplit` lays out
+    /// in two runs (only when both vertical caps fit).
+    fn split_row(&self, win_h: i32, k: i32, y: i32) -> bool {
+        let k = k.max(1);
+        let c = self.caps;
+        self.mode == EdgeMode::TileSplit && win_h >= (c.top + c.bottom) as i32 * k && y < c.top as i32 * k
     }
 
     /// Texel (absolute texture coordinates) shown at window pixel (x, y).
@@ -164,10 +201,12 @@ impl SliceSpec {
         let [rx, ry, rw, rh] = self.region;
         let c = self.caps;
         let st = self.stretch();
-        (
-            rx + map_axis(x, win_w, c.left, c.right, rw, k, st),
-            ry + map_axis(y, win_h, c.top, c.bottom, rh, k, st),
-        )
+        let tx = if self.split_row(win_h, k, y) {
+            map_axis_split(x, win_w, c.left, c.right, rw, k)
+        } else {
+            map_axis(x, win_w, c.left, c.right, rw, k, st)
+        };
+        (rx + tx, ry + map_axis(y, win_h, c.top, c.bottom, rh, k, st))
     }
 
     /// The 3x3 patches (centre included, flagged) covering a window.
@@ -197,6 +236,28 @@ impl SliceSpec {
         for (j, y) in ys.iter().enumerate() {
             for (i, x) in xs.iter().enumerate() {
                 if x.1 <= 0 || y.1 <= 0 || x.3 == 0 || y.3 == 0 {
+                    continue;
+                }
+                if self.mode == EdgeMode::TileSplit && j == 0 && i == 1 && self.split_row(win_h, k, 0) {
+                    // The left run tiles from the left cap; the right run is
+                    // a partial tile followed by whole ones, so it ends on a
+                    // tile boundary at the right cap (see `split_at`).
+                    let (pa, end, tm) = (x.0, x.0 + x.1, x.3 as i32);
+                    let cx = split_at(win_w, pa, win_w - end, k);
+                    let mut run = |dx: i32, w: i32, t0: i32, tw: i32| {
+                        if w > 0 && tw > 0 {
+                            out.push(Patch {
+                                dst: [dx, y.0, w, y.1],
+                                src: [rx + x.2 + t0 as u32, ry + y.2, tw as u32, y.3],
+                                stretch: [false, false],
+                                centre: false,
+                            });
+                        }
+                    };
+                    let r0 = ((end - cx) / k) % tm;
+                    run(pa, cx - pa, 0, tm);
+                    run(cx, r0 * k, tm - r0, r0);
+                    run(cx + r0 * k, end - cx - r0 * k, 0, tm);
                     continue;
                 }
                 out.push(Patch {
@@ -401,7 +462,9 @@ pub fn shape_rects(
     if win_w <= 0 || win_h <= 0 {
         return Vec::new();
     }
-    let cols: Vec<u32> = (0..win_w).map(|x| spec.texel_at(win_w, win_h, k, x, 0).0).collect();
+    // The column mapping depends on the row only for the split top band.
+    let cols_of = |y: i32| -> Vec<u32> { (0..win_w).map(|x| spec.texel_at(win_w, win_h, k, x, y).0).collect() };
+    let (cols_top, cols) = (cols_of(0), cols_of(win_h - 1));
     let mut rects: Vec<[i32; 4]> = Vec::new();
     // Rectangles still growing downwards, keyed by their (x0, x1) run.
     let mut open: Vec<[i32; 4]> = Vec::new();
@@ -410,7 +473,8 @@ pub fn shape_rects(
         let mut runs: Vec<(i32, i32)> = Vec::new();
         let mut start: Option<i32> = None;
         for x in 0..win_w {
-            let inside = viewport.contains_px(x, y) || alpha(cols[x as usize], ty) >= ALPHA_CUTOFF;
+            let col = if spec.split_row(win_h, k, y) { &cols_top } else { &cols };
+            let inside = viewport.contains_px(x, y) || alpha(col[x as usize], ty) >= ALPHA_CUTOFF;
             match (inside, start) {
                 (true, None) => start = Some(x),
                 (false, Some(s)) => {
@@ -486,6 +550,27 @@ mod tests {
     }
 
     #[test]
+    fn tile_split_ends_runs_on_the_caps() {
+        let s = spec(EdgeMode::TileSplit);
+        // Middle texels are 8..56 (period 48). 1x, 203 px wide: the left run
+        // starts at texel 8 right after the left cap...
+        let (w, h) = (203, 100);
+        assert_eq!(s.texel_at(w, h, 1, 8, 0).0, 8);
+        assert_eq!(s.texel_at(w, h, 1, 9, 0).0, 9);
+        // ...and the right run ends with the last middle texel next to the
+        // right cap, whatever the width.
+        assert_eq!(s.texel_at(w, h, 1, w - 8 - 1, 0).0, 55);
+        assert_eq!(s.texel_at(w, h, 1, w - 8, 0).0, 56);
+        assert_eq!(s.texel_at(w, h, 1, w - 9 - 47, 0).0, 8);
+        // Rows below the top band keep the plain tiling from the left cap.
+        assert_eq!(s.texel_at(w, h, 1, w - 8 - 1, 50).0, (w - 9 - 8) as u32 % 48 + 8);
+        // Same at 2x with an odd width.
+        let w2 = 411;
+        assert_eq!(s.texel_at(w2, 200, 2, w2 - 16 - 1, 0).0, 55);
+        assert_eq!(s.texel_at(w2, 200, 2, 16, 0).0, 8);
+    }
+
+    #[test]
     fn stretch_covers_the_middle_once() {
         let s = spec(EdgeMode::Stretch);
         assert_eq!(s.texel_at(200, 100, 1, 8, 5).0, 8);
@@ -511,8 +596,16 @@ mod tests {
             assert_eq!(br.src, [56, 56, 8, 8]);
         }
         // A window smaller than the caps still yields sane patches.
-        let tiny = spec(EdgeMode::Tile).patches(10, 10, 1);
-        assert!(tiny.iter().all(|p| p.dst[2] > 0 && p.dst[3] > 0));
+        for mode in [EdgeMode::Tile, EdgeMode::TileSplit] {
+            let tiny = spec(mode).patches(10, 10, 1);
+            assert!(tiny.iter().all(|p| p.dst[2] > 0 && p.dst[3] > 0));
+        }
+        // The split top band still covers the window exactly, once.
+        for (w, k) in [(300, 2), (131, 1), (97, 3), (64, 1), (65, 1)] {
+            let ps = spec(EdgeMode::TileSplit).patches(w, 200, k);
+            let area: i64 = ps.iter().map(|p| p.dst[2] as i64 * p.dst[3] as i64).sum();
+            assert_eq!(area, w as i64 * 200, "width {w} @{k}x");
+        }
     }
 
     /// The fragment shader's per-patch mapping (chrome.wgsl `axis`), done on
@@ -528,10 +621,13 @@ mod tests {
                 src_o + (ll / k.max(1)) % sl
             }
         }
-        for mode in [EdgeMode::Tile, EdgeMode::Stretch] {
-            for k in [1, 2, 3] {
+        for (mode, w, h, k) in [EdgeMode::Tile, EdgeMode::Stretch, EdgeMode::TileSplit]
+            .into_iter()
+            .flat_map(|m| [1, 2, 3].map(|k| (m, k)))
+            .flat_map(|(m, k)| [(131, 97), (200, 97), (97, 75), (73, 90)].map(move |(w, h)| (m, w, h, k)))
+        {
+            {
                 let s = spec(mode);
-                let (w, h) = (131, 97);
                 let patches = s.patches(w, h, k);
                 for y in 0..h {
                     for x in 0..w {

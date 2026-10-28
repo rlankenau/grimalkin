@@ -219,7 +219,10 @@ pub fn skin_def(name: &str, bg: Rgb) -> SkinDef {
                 top: TOP_H,
                 bottom: BOT_H,
             },
-            edge_mode: EdgeMode::Tile,
+            // The top edge is tiled in two runs that meet under the centred
+            // title art, so no tile is cut at a corner whatever the width
+            // (Winamp itself only has the 25 px steps of its window sizes).
+            edge_mode: EdgeMode::TileSplit,
             // The viewport overlaps the left and right columns: it covers
             // everything but Winamp's 12 px left and 20 px right borders.
             viewport_inset: Insets {
