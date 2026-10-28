@@ -19,11 +19,11 @@ use std::time::{Duration, Instant};
 use grimalkin_pty::{Pty, PtyEvent, PtyWriter, SpawnConfig};
 use grimalkin_vt::{CursorShape, Screen, TermEvent, Terminal};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{CursorIcon, UserAttentionType, Window, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, UserAttentionType, Window, WindowId};
 
 use crate::config::{Config, CursorShapeCfg};
 use crate::graphics_glue::Graphics;
@@ -33,6 +33,8 @@ use crate::reload::{self, ReloadCtx};
 use crate::theme;
 use crate::renderer::{FrameStatus, Renderer, ViewState};
 use crate::selection::{CellPos, Selection};
+use crate::skin::hit::{Hit, ResizeDir};
+use crate::skin::{self, Action, Skin, SkinRuntime};
 use crate::LaunchOptions;
 
 /// Events delivered to the loop through its `EventLoopProxy`.
@@ -82,9 +84,21 @@ impl App {
     }
 
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<Running, String> {
+        let skin = if skin::is_active(&self.cfg.skin) {
+            match Skin::load(&self.cfg.skin) {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    log::error!("cannot load skin {:?}: {e}", self.cfg.skin);
+                    self.cfg.skin = "none".to_string();
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // The theme's font/cursor settings are folded into the effective config.
         let resolved = theme::resolve(&self.cfg);
-        let palette = resolved.palette;
+        let palette = skin_palette(resolved.palette, &self.cfg, skin.as_deref());
         let cfg = &resolved.config;
         let mut attrs = Window::default_attributes()
             .with_title(cfg.window.title.as_str())
@@ -92,6 +106,16 @@ impl App {
             .with_visible(false);
         if cfg.window.opacity < 1.0 {
             attrs = attrs.with_transparent(true);
+        }
+        if skin.is_some() {
+            // The skin draws its own frame; the OS draws nothing. Windows
+            // clips to the shape with a region and keeps an opaque swapchain.
+            attrs = attrs.with_decorations(false).with_transparent(skin::needs_alpha_surface());
+            #[cfg(target_os = "macos")]
+            {
+                use winit::platform::macos::WindowAttributesExtMacOS;
+                attrs = attrs.with_has_shadow(false);
+            }
         }
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| format!("cannot create window: {e}"))?);
         #[cfg(target_os = "macos")]
@@ -106,6 +130,7 @@ impl App {
 
         let mut renderer = Renderer::new(window.clone(), cfg)?;
         renderer.set_palette(&palette);
+        renderer.set_skin(skin.clone());
         // Size the window for the configured grid now that the cell size is known.
         let (w, h) = renderer.surface_size_for(cfg.window.cols as usize, cfg.window.rows as usize);
         if let Some(size) = window.request_inner_size(PhysicalSize::new(w, h)) {
@@ -115,6 +140,12 @@ impl App {
             renderer.resize(s.width, s.height);
         }
         let (cols, rows) = renderer.grid_size();
+        let skin_rt = skin.map(|sk| {
+            let s = window.inner_size();
+            let rt = SkinRuntime::new(sk, (s.width, s.height), renderer.skin_scale());
+            rt.apply_shape(&window);
+            rt
+        });
 
         let mut term = Terminal::new(cols, rows, cfg.scrollback_lines);
         apply_palette(&mut term, &mut renderer, &palette);
@@ -151,7 +182,13 @@ impl App {
         let writer = pty.writer();
 
         let font_pt = cfg.font.size;
-        Ok(Running {
+        let mut running = Running {
+            title: cfg.window.title.clone(),
+            skin: skin_rt,
+            chrome_cursor: false,
+            manual_resize: None,
+            pre_shade: None,
+            unshade_pending: false,
             window,
             renderer,
             term,
@@ -193,7 +230,9 @@ impl App {
             proxy: self.proxy.clone(),
             wake_pending: self.wake_pending.clone(),
             exit_requested: false,
-        })
+        };
+        running.update_skin_min_size();
+        Ok(running)
     }
 }
 
@@ -238,7 +277,9 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 r.renderer.resize(size.width, size.height);
+                r.finish_unshade(size);
                 r.apply_grid_resize();
+                r.skin_geometry_changed();
                 r.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -248,6 +289,8 @@ impl ApplicationHandler<UserEvent> for App {
                     r.renderer.resize(s.width, s.height);
                 }
                 r.apply_grid_resize();
+                r.update_skin_min_size();
+                r.skin_geometry_changed();
                 r.window.request_redraw();
             }
             WindowEvent::RedrawRequested => r.redraw(),
@@ -283,6 +326,18 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// Everything that exists once the window is up.
 struct Running {
+    /// Skin pointer state; `None` for a normal OS-decorated window.
+    skin: Option<SkinRuntime>,
+    /// Window title as shown in the skin's title text.
+    title: String,
+    /// The pointer icon is currently set by the chrome (resize edges, ...).
+    chrome_cursor: bool,
+    /// Manual edge resize for platforms without `drag_resize_window`.
+    manual_resize: Option<ManualResize>,
+    /// Window size before the windowshade collapsed it.
+    pre_shade: Option<PhysicalSize<u32>>,
+    /// Un-shading: waiting for the restored size to arrive.
+    unshade_pending: bool,
     window: Arc<Window>,
     renderer: Renderer,
     term: Terminal,
@@ -324,6 +379,17 @@ struct Running {
     exit_requested: bool,
 }
 
+/// The skin's `viewport_background` stands in for the terminal background
+/// only when the user chose neither a theme nor a `[colors] background`;
+/// an explicit theme or colour always wins (docs/SKINS.md).
+fn skin_palette(mut p: theme::Palette, raw: &Config, skin: Option<&Skin>) -> theme::Palette {
+    let user_chose = raw.colors.background.is_some() || raw.theme != theme::DEFAULT_THEME;
+    if let (false, Some(bg)) = (user_chose, skin.and_then(|s| s.def.frame.viewport_background)) {
+        p.background = bg;
+    }
+    p
+}
+
 /// Push a resolved theme into the terminal (default colors + ANSI palette)
 /// and the renderer (selection, cursor text, link colors).
 fn apply_palette(term: &mut Terminal, renderer: &mut Renderer, p: &theme::Palette) {
@@ -332,6 +398,16 @@ fn apply_palette(term: &mut Terminal, renderer: &mut Renderer, p: &theme::Palett
         term.set_palette_color(i as u8, c.tuple());
     }
     renderer.set_palette(p);
+}
+
+/// An edge resize driven by pointer motion (macOS has no
+/// `drag_resize_window`).
+#[derive(Clone, Copy)]
+struct ManualResize {
+    dir: ResizeDir,
+    start_screen: (f64, f64),
+    start_pos: PhysicalPosition<i32>,
+    start_size: PhysicalSize<u32>,
 }
 
 impl Drop for Running {
@@ -391,7 +467,12 @@ impl Running {
             match ev {
                 TermEvent::Title(t) => {
                     if self.cfg.window.dynamic_title {
-                        self.window.set_title(if t.is_empty() { &self.cfg.window.title } else { &t });
+                        let title = if t.is_empty() { self.cfg.window.title.clone() } else { t };
+                        self.window.set_title(&title);
+                        if self.skin.is_some() && title != self.title {
+                            self.title = title;
+                            need_redraw = true;
+                        }
                     }
                 }
                 TermEvent::Bell => {
@@ -523,7 +604,9 @@ impl Running {
         }
         let resolved = theme::resolve(&raw);
         log::info!("config reloaded (theme: {})", resolved.name);
-        apply_palette(&mut self.term, &mut self.renderer, &resolved.palette);
+        let skin = self.skin.as_ref().map(|r| r.skin.clone());
+        let palette = skin_palette(resolved.palette, &raw, skin.as_deref());
+        apply_palette(&mut self.term, &mut self.renderer, &palette);
         let new = resolved.config;
         let old = std::mem::replace(&mut self.cfg, new);
         let new = &self.cfg;
@@ -607,6 +690,7 @@ impl Running {
             selection: &self.selection,
             hover: hover.as_ref(),
             flash,
+            chrome: self.skin.as_ref().map(|s| s.view(&self.title)),
         };
         let status = self.renderer.render(&mut self.term, &view, self.gfx.protocol_mut());
         log::debug!("frame status: {status:?}");
@@ -821,6 +905,9 @@ impl Running {
 
     fn on_cursor_left(&mut self) {
         self.mouse_inside = false;
+        if self.skin.as_mut().is_some_and(|s| s.pointer_left()) {
+            self.window.request_redraw();
+        }
         if self.pointer_cursor {
             self.window.request_redraw();
         }
@@ -864,14 +951,246 @@ impl Running {
         self.paste_text(&format!("{quoted} "));
     }
 
+    // -- skin --------------------------------------------------------------
+
+    /// Smallest window that keeps the skin's fixed frame parts intact.
+    fn skin_min_size(&self) -> Option<PhysicalSize<u32>> {
+        let sk = self.skin.as_ref()?;
+        let (w, h) = sk.skin.min_window(sk.scale(), self.renderer.cell_size_px());
+        Some(PhysicalSize::new(w, h))
+    }
+
+    fn update_skin_min_size(&mut self) {
+        if self.skin.as_ref().is_some_and(|s| !s.shaded()) {
+            self.window.set_min_inner_size(self.skin_min_size());
+        }
+    }
+
+    /// The window size or display scale changed: re-layout the chrome and
+    /// (Windows) re-clip the window to the shape.
+    fn skin_geometry_changed(&mut self) {
+        let scale = self.renderer.skin_scale();
+        let size = self.window.inner_size();
+        let maximized = self.window.is_maximized();
+        if let Some(sk) = self.skin.as_mut() {
+            sk.set_geometry((size.width, size.height), scale);
+            sk.set_resizable(!maximized);
+            sk.apply_shape(&self.window);
+        }
+    }
+
+    /// Returns true if the pointer motion belongs to the chrome.
+    fn skin_pointer_moved(&mut self, x: f64, y: f64) -> bool {
+        if self.manual_resize.is_some() {
+            self.manual_resize_to(x, y);
+            return true;
+        }
+        let Some(sk) = self.skin.as_mut() else { return false };
+        let redraw = sk.pointer_moved(x, y);
+        let hit = sk.hover();
+        let icon = sk.cursor_for(hit);
+        if redraw {
+            self.window.request_redraw();
+        }
+        match icon {
+            Some(icon) => {
+                self.window.set_cursor(icon);
+                self.chrome_cursor = true;
+            }
+            None => {
+                if self.chrome_cursor {
+                    self.chrome_cursor = false;
+                    self.window
+                        .set_cursor(if self.pointer_cursor { CursorIcon::Pointer } else { CursorIcon::Default });
+                }
+            }
+        }
+        // A selection drag that wandered over the frame keeps going.
+        hit != Hit::Viewport && !self.left_down
+    }
+
+    /// Returns true if the left-button event belongs to the chrome.
+    fn skin_mouse_button(&mut self, pressed: bool) -> bool {
+        let (x, y) = self.mouse_px;
+        let Some(sk) = self.skin.as_mut() else { return false };
+        let action = if pressed {
+            if sk.hit_at(x, y) == Hit::Viewport {
+                return false;
+            }
+            sk.press(x, y, Instant::now())
+        } else {
+            if self.manual_resize.take().is_some() {
+                return true;
+            }
+            if sk.pressed_button().is_none() {
+                return false;
+            }
+            sk.release(x, y)
+        };
+        self.window.request_redraw();
+        if let Some(a) = action {
+            self.run_skin_action(a);
+        }
+        true
+    }
+
+    fn run_skin_action(&mut self, action: Action) {
+        match action {
+            Action::Close => self.exit_requested = true,
+            Action::Minimize => self.window.set_minimized(true),
+            Action::ToggleMaximize => {
+                let max = self.window.is_maximized();
+                // A borderless NSWindow has no zoom button for `zoom:` to
+                // act on; winit sets the frame directly for non-resizable
+                // windows, so switch resizing off around the call.
+                #[cfg(target_os = "macos")]
+                self.window.set_resizable(false);
+                self.window.set_maximized(!max);
+                #[cfg(target_os = "macos")]
+                self.window.set_resizable(true);
+            }
+            Action::ToggleShade => self.toggle_shade(),
+            Action::DragMove => {
+                if let Err(e) = self.window.drag_window() {
+                    log::debug!("drag_window: {e}");
+                }
+            }
+            Action::DragResize(dir) => {
+                let d = match dir {
+                    ResizeDir::N => ResizeDirection::North,
+                    ResizeDir::S => ResizeDirection::South,
+                    ResizeDir::E => ResizeDirection::East,
+                    ResizeDir::W => ResizeDirection::West,
+                    ResizeDir::NE => ResizeDirection::NorthEast,
+                    ResizeDir::NW => ResizeDirection::NorthWest,
+                    ResizeDir::SE => ResizeDirection::SouthEast,
+                    ResizeDir::SW => ResizeDirection::SouthWest,
+                };
+                if self.window.drag_resize_window(d).is_err() {
+                    self.start_manual_resize(dir);
+                }
+            }
+        }
+    }
+
+    fn screen_pointer(&self, local: (f64, f64)) -> Option<(f64, f64)> {
+        let p = self.window.inner_position().ok()?;
+        Some((p.x as f64 + local.0, p.y as f64 + local.1))
+    }
+
+    fn start_manual_resize(&mut self, dir: ResizeDir) {
+        let Some(start_screen) = self.screen_pointer(self.mouse_px) else { return };
+        let Ok(start_pos) = self.window.inner_position() else { return };
+        self.manual_resize = Some(ManualResize {
+            dir,
+            start_screen,
+            start_pos,
+            start_size: self.window.inner_size(),
+        });
+    }
+
+    fn manual_resize_to(&mut self, x: f64, y: f64) {
+        let Some(m) = self.manual_resize else { return };
+        let Some((sx, sy)) = self.screen_pointer((x, y)) else { return };
+        let (dx, dy) = (sx - m.start_screen.0, sy - m.start_screen.1);
+        let min = self.skin_min_size().unwrap_or(PhysicalSize::new(64, 64));
+        let (west, east) = (
+            matches!(m.dir, ResizeDir::W | ResizeDir::NW | ResizeDir::SW),
+            matches!(m.dir, ResizeDir::E | ResizeDir::NE | ResizeDir::SE),
+        );
+        let (north, south) = (
+            matches!(m.dir, ResizeDir::N | ResizeDir::NW | ResizeDir::NE),
+            matches!(m.dir, ResizeDir::S | ResizeDir::SW | ResizeDir::SE),
+        );
+        let (sw, sh) = (m.start_size.width as f64, m.start_size.height as f64);
+        let mut w = sw;
+        let mut h = sh;
+        if east {
+            w = sw + dx;
+        } else if west {
+            w = sw - dx;
+        }
+        if south {
+            h = sh + dy;
+        } else if north {
+            h = sh - dy;
+        }
+        let w = w.max(min.width as f64).round() as u32;
+        let h = h.max(min.height as f64).round() as u32;
+        let mut pos = m.start_pos;
+        if west {
+            pos.x += m.start_size.width as i32 - w as i32;
+        }
+        if north {
+            pos.y += m.start_size.height as i32 - h as i32;
+        }
+        if pos != m.start_pos {
+            self.window.set_outer_position(pos);
+        }
+        if let Some(size) = self.window.request_inner_size(PhysicalSize::new(w, h)) {
+            self.renderer.resize(size.width, size.height);
+            self.apply_grid_resize();
+            self.skin_geometry_changed();
+            self.window.request_redraw();
+        }
+    }
+
+    /// Windowshade: collapse the window to the skin's shade bar, or restore
+    /// the size it had before. The terminal keeps running; its grid (and the
+    /// child's idea of the window size) stay as they were.
+    fn toggle_shade(&mut self) {
+        let Some(sk) = self.skin.as_ref() else { return };
+        let (shaded, bar) = (sk.shaded(), (sk.skin.shade_height() * sk.scale()).max(1));
+        if !shaded {
+            let cur = self.window.inner_size();
+            self.pre_shade = Some(cur);
+            self.unshade_pending = false;
+            if let Some(sk) = self.skin.as_mut() {
+                sk.set_shaded(true);
+            }
+            self.renderer.set_shaded(true);
+            let min_w = self.skin_min_size().map_or(1, |m| m.width);
+            self.window.set_min_inner_size(Some(PhysicalSize::new(min_w, bar)));
+            if let Some(size) = self.window.request_inner_size(PhysicalSize::new(cur.width, bar)) {
+                self.renderer.resize(size.width, size.height);
+            }
+        } else {
+            if let Some(sk) = self.skin.as_mut() {
+                sk.set_shaded(false);
+            }
+            let target = self.pre_shade.take().unwrap_or(self.window.inner_size());
+            self.window.set_min_inner_size(self.skin_min_size());
+            self.unshade_pending = true;
+            if let Some(size) = self.window.request_inner_size(target) {
+                self.renderer.resize(size.width, size.height);
+                self.finish_unshade(size);
+            }
+        }
+        self.apply_grid_resize();
+        self.skin_geometry_changed();
+        self.window.request_redraw();
+    }
+
+    /// The restored window size arrived: let the renderer re-derive the grid.
+    fn finish_unshade(&mut self, size: PhysicalSize<u32>) {
+        if !self.unshade_pending {
+            return;
+        }
+        let bar = self.skin.as_ref().map_or(0, |s| s.skin.shade_height() * s.scale());
+        if size.height > bar {
+            self.unshade_pending = false;
+            self.renderer.set_shaded(false);
+        }
+    }
+
     // -- mouse -------------------------------------------------------------
 
     fn cell_at(&self, px: (f64, f64)) -> CellPos {
         let (cw, ch) = self.renderer.cell_size_px();
-        let pad = self.renderer.padding_px() as f64;
+        let (ox, oy) = self.renderer.grid_origin_px();
         let (cols, rows) = self.term.size();
-        let col = (((px.0 - pad) / cw as f64).floor().max(0.0) as usize).min(cols.saturating_sub(1));
-        let row = (((px.1 - pad) / ch as f64).floor().max(0.0) as usize).min(rows.saturating_sub(1));
+        let col = (((px.0 - ox as f64) / cw as f64).floor().max(0.0) as usize).min(cols.saturating_sub(1));
+        let row = (((px.1 - oy as f64) / ch as f64).floor().max(0.0) as usize).min(rows.saturating_sub(1));
         CellPos { col, row }
     }
 
@@ -908,6 +1227,9 @@ impl Running {
     fn on_cursor_moved(&mut self, x: f64, y: f64) {
         self.mouse_px = (x, y);
         self.mouse_inside = true;
+        if self.skin_pointer_moved(x, y) {
+            return;
+        }
         // Link hover underline / pointer cursor follow the mouse.
         if self.link_hover_enabled() || self.pointer_cursor {
             self.window.request_redraw();
@@ -934,7 +1256,7 @@ impl Running {
             return;
         }
         let (_, ch) = self.renderer.cell_size_px();
-        let top = self.renderer.padding_px() as f64;
+        let top = self.renderer.grid_origin_px().1 as f64;
         let bottom = top + self.term.rows() as f64 * ch as f64;
         let delta = if y < top {
             1
@@ -957,6 +1279,9 @@ impl Running {
             _ => return,
         };
         let pressed = state == ElementState::Pressed;
+        if button == MouseButton::Left && self.skin_mouse_button(pressed) {
+            return;
+        }
         if button == MouseButton::Left {
             self.left_down = pressed;
         }

@@ -278,6 +278,10 @@ pub struct Config {
     pub clipboard: ClipboardConfig,
     pub pty: PtyConfig,
     pub scrollback_lines: usize,
+    /// Window skin (docs/SKINS.md): a name from `<config_dir>/grimalkin/skins/`
+    /// or the built-ins, a directory path, or `"none"` for the normal OS
+    /// window. Overridden by `--skin`.
+    pub skin: String,
     /// Program to run; empty means the user's default shell.
     pub shell: String,
     pub shell_args: Vec<String>,
@@ -296,6 +300,7 @@ impl Default for Config {
             clipboard: ClipboardConfig::default(),
             pty: PtyConfig::default(),
             scrollback_lines: 10_000,
+            skin: "none".to_string(),
             shell: String::new(),
             shell_args: Vec::new(),
         }
@@ -442,6 +447,12 @@ mod tests {
         assert!(!passthrough_with_env(true, Some("0")));
         assert!(passthrough_with_env(true, Some("garbage")));
         assert!(!passthrough_with_env(false, Some("")));
+    }
+
+    #[test]
+    fn skin_key() {
+        assert_eq!(Config::from_toml("").unwrap().skin, "none");
+        assert_eq!(Config::from_toml("skin = \"debug\"").unwrap().skin, "debug");
     }
 
     #[test]

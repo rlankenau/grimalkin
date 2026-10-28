@@ -29,6 +29,7 @@ use crate::config::Config;
 use crate::images::{GridGeometry, ImageRenderer, Layer};
 use crate::glyphs::{AtlasKind, GlyphCache, Gpu, STYLE_BOLD, STYLE_ITALIC};
 use crate::selection::Selection;
+use crate::skin::{self, chrome::{Chrome, ChromeView}, Skin};
 
 // ---------------------------------------------------------------------------
 // Instance types
@@ -148,6 +149,8 @@ pub struct ViewState<'a> {
     pub hover: Option<&'a crate::links::LinkSpan>,
     /// Visual bell strength, 0.0 (off) to 1.0.
     pub flash: f32,
+    /// Skin chrome state; `None` when no skin is active.
+    pub chrome: Option<ChromeView<'a>>,
 }
 
 #[derive(Debug)]
@@ -197,6 +200,15 @@ pub struct Renderer {
     pad: u32,
     cols: usize,
     rows: usize,
+    /// Skin: top-left of the viewport and the right/bottom insets, in
+    /// physical pixels (all zero without a skin).
+    origin: (u32, u32),
+    inset: (u32, u32),
+    chrome: Option<Chrome>,
+    /// Windowshade: only the chrome is drawn and the grid size is frozen.
+    shaded: bool,
+    chrome_mask: Vec<GlyphInst>,
+    chrome_mask_buf: InstanceBuf,
 
     // Theme.
     sel_bg: Rgb,
@@ -280,7 +292,7 @@ impl Renderer {
             .or_else(|| caps.formats.first().copied())
             .ok_or("surface has no supported formats")?;
         let srgb_target = format.is_srgb();
-        let transparent = cfg.window.opacity < 1.0;
+        let transparent = cfg.window.opacity < 1.0 || (skin::needs_alpha_surface() && skin::is_active(&cfg.skin));
         let (alpha_mode, premultiplied_clear) = if transparent {
             if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
                 (wgpu::CompositeAlphaMode::PreMultiplied, true)
@@ -498,6 +510,12 @@ impl Renderer {
             sel_fg: (0, 0, 0),
             cursor_text: None,
             url_color: None,
+            origin: (0, 0),
+            inset: (0, 0),
+            chrome: None,
+            shaded: false,
+            chrome_mask: Vec::new(),
+            chrome_mask_buf: InstanceBuf::new(&device, "chrome title"),
             opacity: cfg.window.opacity,
             row_cache: Vec::new(),
             force_full: true,
@@ -564,8 +582,17 @@ impl Renderer {
         (self.glyphs.metrics.cell_w, self.glyphs.metrics.cell_h)
     }
 
-    pub fn padding_px(&self) -> u32 {
-        self.pad
+    /// Top-left of the cell grid in the surface (skin origin + padding).
+    pub fn grid_origin_px(&self) -> (u32, u32) {
+        (self.origin.0 + self.pad, self.origin.1 + self.pad)
+    }
+
+    fn ox(&self) -> f32 {
+        (self.origin.0 + self.pad) as f32
+    }
+
+    fn oy(&self) -> f32 {
+        (self.origin.1 + self.pad) as f32
     }
 
     /// Grid dimensions that fit the current surface size.
@@ -576,18 +603,25 @@ impl Renderer {
     /// Grid dimensions that fit a surface of `w` x `h` physical pixels.
     pub fn grid_size_for(&self, w: u32, h: u32) -> (usize, usize) {
         let (cw, ch) = self.cell_size_px();
-        let avail_w = w.saturating_sub(2 * self.pad);
-        let avail_h = h.saturating_sub(2 * self.pad);
+        let avail_w = w.saturating_sub(self.origin.0 + self.inset.0 + 2 * self.pad);
+        let avail_h = h.saturating_sub(self.origin.1 + self.inset.1 + 2 * self.pad);
         (((avail_w / cw) as usize).max(1), ((avail_h / ch) as usize).max(1))
     }
 
     /// Surface size (physical pixels) needed for a `cols` x `rows` grid.
     pub fn surface_size_for(&self, cols: usize, rows: usize) -> (u32, u32) {
         let (cw, ch) = self.cell_size_px();
-        (cols as u32 * cw + 2 * self.pad, rows as u32 * ch + 2 * self.pad)
+        (
+            cols as u32 * cw + 2 * self.pad + self.origin.0 + self.inset.0,
+            rows as u32 * ch + 2 * self.pad + self.origin.1 + self.inset.1,
+        )
     }
 
     fn update_grid_dims(&mut self) {
+        if self.shaded {
+            // The window is just the title bar: keep the grid as it was.
+            return;
+        }
         let (c, r) = self.grid_size_for(self.surface_config.width, self.surface_config.height);
         self.cols = c;
         self.rows = r;
@@ -611,8 +645,63 @@ impl Renderer {
         self.scale = scale;
         self.pad = (padding_logical as f64 * scale).round() as u32;
         self.glyphs.set_px_size(self.font_pt * scale as f32);
+        self.apply_skin_insets();
+    }
+
+    /// Install (or remove) a skin. Call before sizing the window: the grid
+    /// then fits inside the skin's viewport.
+    pub fn set_skin(&mut self, skin: Option<Arc<Skin>>) {
+        let scale = skin::pixel_scale(self.scale);
+        self.chrome = skin.map(|s| {
+            Chrome::new(
+                &self.device,
+                &self.queue,
+                s,
+                scale,
+                &self.bind_layout,
+                &self.globals_buf,
+                &self.nearest,
+                self.surface_config.format,
+                self.device.limits().max_texture_dimension_2d,
+                &self.families,
+            )
+        });
+        self.apply_skin_insets();
+    }
+
+    /// Switch the windowshade (title bar only) on or off.
+    pub fn set_shaded(&mut self, shaded: bool) {
+        if self.shaded != shaded {
+            self.shaded = shaded;
+            self.update_grid_dims();
+            self.force_full = true;
+        }
+    }
+
+    /// Integer pixel scale the chrome is drawn at.
+    pub fn skin_scale(&self) -> u32 {
+        skin::pixel_scale(self.scale)
+    }
+
+    fn apply_skin_insets(&mut self) {
+        let (o, i) = match &self.chrome {
+            Some(c) => c.skin().viewport_insets(skin::pixel_scale(self.scale)),
+            None => ((0, 0), (0, 0)),
+        };
+        self.origin = o;
+        self.inset = i;
         self.update_grid_dims();
         self.force_full = true;
+    }
+
+    /// The viewport rectangle (x, y, w, h) within the surface.
+    fn viewport_rect(&self) -> (u32, u32, u32, u32) {
+        let (sw, sh) = (self.surface_config.width, self.surface_config.height);
+        let x = self.origin.0.min(sw.saturating_sub(1));
+        let y = self.origin.1.min(sh.saturating_sub(1));
+        let w = sw.saturating_sub(self.origin.0 + self.inset.0).clamp(1, sw - x);
+        let h = sh.saturating_sub(self.origin.1 + self.inset.1).clamp(1, sh - y);
+        (x, y, w, h)
     }
 
     /// Change the font size (points) and rebuild the atlas.
@@ -702,8 +791,8 @@ impl Renderer {
         out.clear();
         let m = self.glyphs.metrics;
         let (cw, chh) = (m.cell_w as f32, m.cell_h as f32);
-        let y = self.pad as f32 + r as f32 * chh;
-        let x0 = self.pad as f32;
+        let y = self.oy() + r as f32 * chh;
+        let x0 = self.ox();
         let colors = term.colors();
         let def_fg = colors.foreground;
         let def_bg = colors.background;
@@ -817,7 +906,9 @@ impl Renderer {
 
         if view.flash > 0.0 {
             let a = (view.flash.clamp(0.0, 1.0) * 70.0) as u8;
-            self.cur_rect.push(rect(0.0, 0.0, vw, vh, fg, a, KIND_SOLID));
+            let (ox, oy) = (self.origin.0 as f32, self.origin.1 as f32);
+            let (fw, fh) = (vw - ox - self.inset.0 as f32, vh - oy - self.inset.1 as f32);
+            self.cur_rect.push(rect(ox, oy, fw, fh, fg, a, KIND_SOLID));
         }
 
         if let Some(link) = view.hover {
@@ -834,8 +925,8 @@ impl Renderer {
                 } else {
                     colors.resolve(cell.fg, fg)
                 };
-                let x = self.pad as f32 + c0 as f32 * cw;
-                let y = self.pad as f32 + r as f32 * chh + m.underline_y as f32;
+                let x = self.ox() + c0 as f32 * cw;
+                let y = self.oy() + r as f32 * chh + m.underline_y as f32;
                 self.cur_rect
                     .push(rect(x, y, (c1 - c0 + 1) as f32 * cw, t, c, 255, KIND_SOLID));
             }
@@ -847,8 +938,8 @@ impl Renderer {
             let n = text.chars().count() as f32;
             let pad_x = (cw * 0.6).round();
             let w = n * cw + 2.0 * pad_x;
-            let x = (vw - self.pad as f32 - w).max(0.0);
-            let y = self.pad as f32;
+            let x = (vw - self.inset.0 as f32 - self.pad as f32 - w).max(0.0);
+            let y = self.oy();
             self.cur_rect
                 .push(rect(x, y, w, chh, mix(bg, fg, 0.22), 235, KIND_SOLID));
             let gpu = Gpu {
@@ -885,8 +976,8 @@ impl Renderer {
         let row = term.visible_row(cur.row);
         let cell = &row.cells[cur.col];
         let ncells = if cell.width == CellWidth::Wide { 2.0 } else { 1.0 };
-        let x = self.pad as f32 + cur.col as f32 * cw;
-        let y = self.pad as f32 + cur.row as f32 * chh;
+        let x = self.ox() + cur.col as f32 * cw;
+        let y = self.oy() + cur.row as f32 * chh;
         let w = cw * ncells;
         let thick = ((self.scale * 1.5).round() as f32).max(1.0);
         use grimalkin_vt::CursorShape as CS;
@@ -958,6 +1049,8 @@ impl Renderer {
             self.cur_color_buf.upload(dev, q, &self.cur_color);
         }
 
+        self.prepare_chrome(term, view);
+
         // Rebuild bind groups if an atlas texture was replaced.
         let versions = (self.glyphs.mask.version, self.glyphs.color.version);
         if versions != self.bound_versions {
@@ -984,6 +1077,7 @@ impl Renderer {
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&g));
         let geo = GridGeometry {
             pad: self.pad,
+            origin: self.origin,
             cell_w: self.glyphs.metrics.cell_w,
             cell_h: self.glyphs.metrics.cell_h,
             surface_w: self.surface_config.width,
@@ -1040,6 +1134,28 @@ impl Renderer {
         FrameStatus::Presented
     }
 
+    /// Build the skin chrome (frame, buttons, title) for this frame.
+    fn prepare_chrome(&mut self, term: &Terminal, view: &ViewState) {
+        self.chrome_mask.clear();
+        let (Some(chrome), Some(cv)) = (self.chrome.as_mut(), view.chrome.as_ref()) else {
+            self.chrome_mask_buf.upload(&self.device, &self.queue, &self.chrome_mask);
+            return;
+        };
+        let (r, g, b) = term.colors().background;
+        let vo = chrome.skin().def.frame.viewport_opacity;
+        let a = (255.0 * vo * self.opacity).round().clamp(0.0, 255.0) as u8;
+        let win = (self.surface_config.width, self.surface_config.height);
+        let scale = skin::pixel_scale(self.scale);
+        let title = chrome.prepare(&self.device, &self.queue, cv, win, scale, [r, g, b, a]);
+        if let Some(t) = title {
+            let mut unused = Vec::new();
+            for (x, y, q) in &t.quads {
+                push_glyphs(std::slice::from_ref(q), *x, *y, t.color, &mut self.chrome_mask, &mut unused);
+            }
+        }
+        self.chrome_mask_buf.upload(&self.device, &self.queue, &self.chrome_mask);
+    }
+
     /// Write the frame to `GRIMALKIN_DUMP_FRAME` as a PNG (debug aid).
     fn dump_frame(&self, frame: &wgpu::Texture) {
         let Some(path) = &self.dump_path else { return };
@@ -1090,14 +1206,26 @@ impl Renderer {
             self.surface_config.format,
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
         );
+        // A skinned frame is premultiplied with real transparency: dump it as
+        // straight alpha so the window shape is visible in the PNG.
+        let keep_alpha = self.chrome.is_some() && skin::needs_alpha_surface();
         let mut img = Vec::with_capacity((w * h * 4) as usize);
         for y in 0..h as usize {
             let row = &data[y * bpr as usize..y * bpr as usize + (w * 4) as usize];
             for px in row.as_chunks::<4>().0 {
-                if bgra {
-                    img.extend_from_slice(&[px[2], px[1], px[0], 255]);
+                let (r, g, b) = if bgra { (px[2], px[1], px[0]) } else { (px[0], px[1], px[2]) };
+                if keep_alpha {
+                    let a = px[3];
+                    let un = |c: u8| {
+                        if a == 0 || a == 255 {
+                            c
+                        } else {
+                            ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8
+                        }
+                    };
+                    img.extend_from_slice(&[un(r), un(g), un(b), a]);
                 } else {
-                    img.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                    img.extend_from_slice(&[r, g, b, 255]);
                 }
             }
         }
@@ -1118,6 +1246,11 @@ impl Renderer {
     }
 
     fn clear_color(&self, term: &Terminal) -> wgpu::Color {
+        if self.chrome.is_some() {
+            // The chrome supplies every opaque pixel; the rest is the outside
+            // of the window shape.
+            return wgpu::Color::TRANSPARENT;
+        }
         let (r, g, b) = term.colors().background;
         let a = self.opacity as f64;
         let conv = |v: u8| {
@@ -1159,24 +1292,47 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // 0. kitty images far below everything
-            self.images.draw(&mut pass, Layer::BelowBackground);
-            // 1. backgrounds
-            self.draw_rects(&mut pass, &self.bg_buf);
-            // 2. kitty images with z < 0
-            self.images.draw(&mut pass, Layer::BelowText);
-            // 3. glyphs then decorations
-            self.draw_glyphs(&mut pass, &self.mask_pipeline, &self.mask_bind, &self.mask_buf);
-            self.draw_glyphs(&mut pass, &self.color_pipeline, &self.color_bind, &self.color_buf);
-            self.draw_rects(&mut pass, &self.deco_buf);
-            // 4. kitty images with z >= 0
-            self.images.draw(&mut pass, Layer::AboveText);
-            // 5. cursor
-            self.draw_rects(&mut pass, &self.cur_rect_buf);
-            self.draw_glyphs(&mut pass, &self.mask_pipeline, &self.mask_bind, &self.cur_mask_buf);
-            self.draw_glyphs(&mut pass, &self.color_pipeline, &self.color_bind, &self.cur_color_buf);
+            if let Some(chrome) = &self.chrome {
+                chrome.draw(&mut pass);
+                self.draw_glyphs(&mut pass, &self.mask_pipeline, chrome.title_bind(), &self.chrome_mask_buf);
+            }
+            if !self.shaded {
+                self.draw_terminal(&mut pass);
+            }
         }
         self.queue.submit([enc.finish()]);
+    }
+
+    /// Restrict drawing to the skin viewport (no-op without a skin).
+    fn clip_viewport(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.chrome.is_some() {
+            let (x, y, w, h) = self.viewport_rect();
+            pass.set_scissor_rect(x, y, w, h);
+        }
+    }
+
+    /// The terminal layers, clipped to the viewport.
+    fn draw_terminal(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.clip_viewport(pass);
+        // 0. kitty images far below everything
+        self.images.draw(pass, Layer::BelowBackground);
+        self.clip_viewport(pass);
+        // 1. backgrounds
+        self.draw_rects(pass, &self.bg_buf);
+        // 2. kitty images with z < 0
+        self.images.draw(pass, Layer::BelowText);
+        self.clip_viewport(pass);
+        // 3. glyphs then decorations
+        self.draw_glyphs(pass, &self.mask_pipeline, &self.mask_bind, &self.mask_buf);
+        self.draw_glyphs(pass, &self.color_pipeline, &self.color_bind, &self.color_buf);
+        self.draw_rects(pass, &self.deco_buf);
+        // 4. kitty images with z >= 0
+        self.images.draw(pass, Layer::AboveText);
+        self.clip_viewport(pass);
+        // 5. cursor
+        self.draw_rects(pass, &self.cur_rect_buf);
+        self.draw_glyphs(pass, &self.mask_pipeline, &self.mask_bind, &self.cur_mask_buf);
+        self.draw_glyphs(pass, &self.color_pipeline, &self.color_bind, &self.cur_color_buf);
     }
 
     fn draw_rects(&self, pass: &mut wgpu::RenderPass<'_>, buf: &InstanceBuf) {

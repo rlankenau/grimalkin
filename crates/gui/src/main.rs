@@ -9,6 +9,7 @@
 //! * `selection`     text selection; `links` hyperlink detection; `bell` audible bell
 //! * `theme`         color themes (TOML + kitty .conf); `reload` config hot-reload
 //! * `graphics_glue` kitty graphics protocol glue (stub)
+//! * `skin`         undecorated, non-rectangular window skins (docs/SKINS.md)
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -25,6 +26,7 @@ mod links;
 mod reload;
 mod renderer;
 mod selection;
+mod skin;
 mod terminfo;
 mod theme;
 
@@ -44,6 +46,8 @@ pub struct LaunchOptions {
     pub working_directory: Option<PathBuf>,
     /// `--theme NAME`: overrides `theme` in the config file (also on reload).
     pub theme: Option<String>,
+    /// Window skin given with `--skin` (overrides the config file).
+    pub skin: Option<String>,
 }
 
 pub enum Parsed {
@@ -62,6 +66,7 @@ Options:
       --working-directory DIR   Start in DIR
       --theme NAME              Use this color theme (see --list-themes)
       --list-themes             List the available themes and exit
+      --skin NAME               Use the window skin NAME (none = normal window)
   -h, --help                    Show this help
   -V, --version                 Show the version
 ";
@@ -89,6 +94,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Parsed {
             "--config" => match inline.or_else(|| it.next()) {
                 Some(p) => opts.config_path = Some(PathBuf::from(p)),
                 None => return Parsed::Error("--config requires a path".into()),
+            },
+            "--skin" => match inline.or_else(|| it.next()) {
+                Some(s) => opts.skin = Some(s),
+                None => return Parsed::Error("--skin requires a name".into()),
             },
             "--working-directory" => match inline.or_else(|| it.next()) {
                 Some(p) => opts.working_directory = Some(PathBuf::from(p)),
@@ -122,6 +131,9 @@ fn main() {
     let mut config = Config::load(opts.config_path.as_deref());
     if let Some(t) = &opts.theme {
         config.theme = t.clone();
+    }
+    if let Some(s) = &opts.skin {
+        config.skin = s.clone();
     }
 
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
@@ -160,6 +172,19 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn parses_skin_flag() {
+        match parse_args(args(&["--skin", "debug", "-e", "sh"])) {
+            Parsed::Run(o) => assert_eq!(o.skin.as_deref(), Some("debug")),
+            _ => panic!(),
+        }
+        match parse_args(args(&["--skin=none"])) {
+            Parsed::Run(o) => assert_eq!(o.skin.as_deref(), Some("none")),
+            _ => panic!(),
+        }
+        assert!(matches!(parse_args(args(&["--skin"])), Parsed::Error(_)));
     }
 
     #[test]

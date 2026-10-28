@@ -55,6 +55,8 @@ const IMAGE_ATTRS: [wgpu::VertexAttribute; 4] =
 #[derive(Clone, Copy, Debug)]
 pub struct GridGeometry {
     pub pad: u32,
+    /// Skin viewport origin (zero without a skin).
+    pub origin: (u32, u32),
     pub cell_w: u32,
     pub cell_h: u32,
     pub surface_w: u32,
@@ -97,8 +99,8 @@ pub struct ImageRenderer {
 fn layout(p: &grimalkin_graphics::Placement, img_w: u32, img_h: u32, top: u64, geo: GridGeometry) -> ImageInst {
     let (iw, ih) = (img_w as f32, img_h as f32);
     let row = p.abs_row as i64 - top as i64;
-    let x = geo.pad as f32 + p.col as f32 * geo.cell_w as f32 + p.pixel_offset.0 as f32;
-    let y = geo.pad as f32 + row as f32 * geo.cell_h as f32 + p.pixel_offset.1 as f32;
+    let x = (geo.origin.0 + geo.pad) as f32 + p.col as f32 * geo.cell_w as f32 + p.pixel_offset.0 as f32;
+    let y = (geo.origin.1 + geo.pad) as f32 + row as f32 * geo.cell_h as f32 + p.pixel_offset.1 as f32;
     let r = p.src_rect;
     ImageInst {
         pos: [x, y],
@@ -281,8 +283,8 @@ impl ImageRenderer {
 
         let (rows, cols) = (term.rows() as u32, term.cols() as u32);
         self.surface = [geo.surface_w.max(1), geo.surface_h.max(1)];
-        let cx = geo.pad.min(self.surface[0] - 1);
-        let cy = geo.pad.min(self.surface[1] - 1);
+        let cx = (geo.origin.0 + geo.pad).min(self.surface[0] - 1);
+        let cy = (geo.origin.1 + geo.pad).min(self.surface[1] - 1);
         self.clip = [
             cx,
             cy,
@@ -564,6 +566,7 @@ mod tests {
 
     const GEO: GridGeometry = GridGeometry {
         pad: 4,
+        origin: (0, 0),
         cell_w: 10,
         cell_h: 20,
         surface_w: 800,
