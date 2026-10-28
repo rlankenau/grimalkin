@@ -1,0 +1,38 @@
+name = "Llama"
+author = "grimalkin"
+
+# 9-slice frame. Corners are fixed; the tileable edge segments repeat every 8 px,
+# so `tile` stretches without seams.  frame.png is 320x240 at 1x.
+[frame]
+image = "frame.png"
+slices = { left = 24, right = 24, top = 32, bottom = 32 }
+edge_mode = "tile"
+viewport_inset = { left = 24, right = 24, top = 32, bottom = 32 }
+viewport_background = "#000000"
+viewport_opacity = 1.0
+
+[titlebar]
+rect = { x = 0, y = 0, w = -1, h = 32 }
+double_click = "shade"
+# title text sits in the green LCD trough; its right end stops where the buttons begin
+text = { x = 30, y = 12, w = -84, font_px = 11, color = "#9bd6a1", align = "center" }
+
+# buttons.png: one column per button, normal / hover / pressed stacked vertically,
+# each cell exactly the rect size (14x14).
+[buttons]
+sheet = "buttons.png"
+close    = { rect = { x = -26, y = 11, w = 14, h = 14 }, sprite = [0, 0] }
+minimize = { rect = { x = -44, y = 11, w = 14, h = 14 }, sprite = [14, 0] }
+shade    = { rect = { x = -62, y = 11, w = 14, h = 14 }, sprite = [28, 0] }
+maximize = { rect = { x = -80, y = 11, w = 14, h = 14 }, sprite = [42, 0] }
+
+[resize]
+grip = { x = -20, y = -20, w = 20, h = 20 }
+border = 5
+
+# shade.png is the top 32 rows of the frame, closed off along the bottom, 320 px wide
+# (left/right 24 px are caps, the middle repeats every 8 px).  The titlebar and button rects
+# above apply to it unchanged.
+[shade]
+image = "shade.png"
+height = 32
