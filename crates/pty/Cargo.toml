@@ -4,10 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Thin PTY (ConPTY / forkpty) wrapper for the grimalkin terminal emulator"
+description = "Thin PTY (native ConPTY / forkpty) wrapper for the grimalkin terminal emulator"
 
 [dependencies]
-portable-pty = "0.9"
+log = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+portable-pty = "0.9"
+
+# Windows talks to ConPTY directly (src/win/conpty.rs) so grimalkin controls
+# the pseudoconsole flags and can sideload a newer conpty.dll.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

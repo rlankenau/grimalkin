@@ -261,6 +261,35 @@ impl Default for ClipboardConfig {
     }
 }
 
+/// Environment variable that overrides `[pty] passthrough` (`1`/`true`/`yes`/
+/// `on` force it on, `0`/`false`/`no`/`off` force it off).
+pub const CONPTY_PASSTHROUGH_ENV: &str = "GRIMALKIN_CONPTY_PASSTHROUGH";
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PtyConfig {
+    /// Windows only: create the ConPTY pseudoconsole in passthrough mode
+    /// (`PSEUDOCONSOLE_PASSTHROUGH_MODE`) so a new enough ConPTY forwards APC
+    /// (kitty graphics) and other sequences untouched. Needs a sideloaded
+    /// `conpty.dll` + `OpenConsole.exe` or Windows 11. Ignored elsewhere.
+    pub passthrough: bool,
+}
+
+impl PtyConfig {
+    /// The effective setting: `GRIMALKIN_CONPTY_PASSTHROUGH` wins over the file.
+    pub fn passthrough_enabled(&self) -> bool {
+        passthrough_with_env(self.passthrough, std::env::var(CONPTY_PASSTHROUGH_ENV).ok().as_deref())
+    }
+}
+
+fn passthrough_with_env(configured: bool, env: Option<&str>) -> bool {
+    match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => configured,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -271,6 +300,7 @@ pub struct Config {
     pub input: InputConfig,
     pub bell: BellConfig,
     pub clipboard: ClipboardConfig,
+    pub pty: PtyConfig,
     pub scrollback_lines: usize,
     /// Program to run; empty means the user's default shell.
     pub shell: String,
@@ -287,6 +317,7 @@ impl Default for Config {
             input: InputConfig::default(),
             bell: BellConfig::default(),
             clipboard: ClipboardConfig::default(),
+            pty: PtyConfig::default(),
             scrollback_lines: 10_000,
             shell: String::new(),
             shell_args: Vec::new(),
@@ -401,6 +432,19 @@ mod tests {
         assert_eq!(c.cursor.shape, CursorShapeCfg::Bar);
         assert!(c.cursor.blink);
         assert_eq!(c.scrollback_lines, 5);
+    }
+
+    #[test]
+    fn pty_passthrough_config_and_env_override() {
+        assert!(!Config::from_toml("").unwrap().pty.passthrough);
+        assert!(Config::from_toml("[pty]\npassthrough = true").unwrap().pty.passthrough);
+        assert!(!passthrough_with_env(false, None));
+        assert!(passthrough_with_env(true, None));
+        assert!(passthrough_with_env(false, Some("1")));
+        assert!(passthrough_with_env(false, Some("true")));
+        assert!(!passthrough_with_env(true, Some("0")));
+        assert!(passthrough_with_env(true, Some("garbage")));
+        assert!(!passthrough_with_env(false, Some("")));
     }
 
     #[test]

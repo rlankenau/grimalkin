@@ -71,6 +71,15 @@ visual_ms = 150
 # Play the system alert sound as well.
 audible = false
 
+[pty]
+# Windows only (ignored elsewhere). Create the ConPTY pseudoconsole in
+# passthrough mode so a sideloaded modern ConPTY (conpty.dll + OpenConsole.exe
+# next to grimalkin.exe) or Windows 11 forwards kitty graphics (APC) and other
+# sequences untouched. Stock Windows 10 ConPTY strips APC; see the README
+# section "Windows: kitty graphics need a newer ConPTY". The environment
+# variable GRIMALKIN_CONPTY_PASSTHROUGH=1 (or 0) overrides this setting.
+passthrough = false
+
 [clipboard]
 # Allow programs to set the clipboard with OSC 52.
 osc52_write = true

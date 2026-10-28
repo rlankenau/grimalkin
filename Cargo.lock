@@ -867,7 +867,9 @@ name = "grimalkin-pty"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "log",
  "portable-pty",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

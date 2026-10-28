@@ -15,7 +15,7 @@ grimalkin/
   crates/
     vt/                 # grimalkin-vt: terminal state machine (no I/O, no GUI)
     graphics/           # grimalkin-graphics: kitty graphics protocol + image store
-    pty/                # grimalkin-pty: thin wrapper over portable-pty (ConPTY/forkpty)
+    pty/                # grimalkin-pty: native ConPTY (Windows) / portable-pty forkpty (Unix)
     gui/                # grimalkin (binary): winit + wgpu renderer, input, config
   ARCHITECTURE.md
 ```
@@ -143,6 +143,13 @@ main-screen placements intact; `protocol.clear_screen(Screen::Alt)` on alt exit.
   `pwsh.exe` if on PATH else `powershell.exe` else `cmd.exe`; set env
   `TERM=xterm-kitty`, `COLORTERM=truecolor`, `TERM_PROGRAM=grimalkin`.
   On Unix default shell is `$SHELL` or `/bin/sh`.
+* Backends: Unix uses `portable_pty` (`src/unix.rs`). Windows uses a native
+  ConPTY implementation on `windows-sys` (`src/win/conpty.rs`) so we control the
+  pseudoconsole flags (`SpawnConfig::passthrough` -> `PSEUDOCONSOLE_PASSTHROUGH_MODE`)
+  and can sideload `conpty.dll` + `OpenConsole.exe` from the exe directory
+  (stock Windows 10 ConPTY strips APC, i.e. kitty graphics). Pure command-line /
+  environment-block helpers live in `src/win/cmdline.rs` and are unit-tested
+  on every platform. lib.rs keeps the shared reader/writer/wait-thread logic.
 * Reader thread sends `Vec<u8>` chunks over an `std::sync::mpsc` channel (or
   a callback) and the caller gets `Box<dyn Write + Send>` for input.
 * `resize(cols, rows, pixel_w, pixel_h)`, `kill()`, child-exit detection.

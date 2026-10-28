@@ -1,5 +1,6 @@
-//! grimalkin-pty: a thin wrapper over [`portable_pty`] (ConPTY on Windows,
-//! `forkpty` on Unix) that gives the GUI everything it needs and nothing else:
+//! grimalkin-pty: a thin PTY layer (a native ConPTY backend on Windows, a
+//! [`portable_pty`] `forkpty` backend on Unix) that gives the GUI everything it
+//! needs and nothing else:
 //!
 //! * [`Pty::spawn`] / [`Pty::spawn_with`] start a shell (or any command) on a
 //!   fresh pseudo-terminal of a given size.
@@ -45,6 +46,16 @@
 //!
 //! ConPTY needs the initial `cols`/`rows` at creation time, so they are
 //! mandatory arguments to spawn.
+//!
+//! # Windows backend
+//!
+//! Windows uses a native ConPTY implementation (`win/conpty.rs`) rather than
+//! portable-pty so that grimalkin controls the pseudoconsole flags. It loads
+//! `conpty.dll` from the executable's directory when present (with
+//! `OpenConsole.exe` next to it) and otherwise the in-box `kernel32.dll`
+//! ConPTY. Stock Windows 10 ConPTY strips APC sequences (kitty graphics) and
+//! the kitty keyboard query; a sideloaded modern ConPTY, optionally with
+//! [`SpawnConfig::passthrough`], lets them through.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -55,7 +66,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+#[cfg(unix)]
+mod unix;
+#[cfg(any(windows, test))]
+mod win;
 
 /// Maximum size of one [`PtyEvent::Output`] chunk.
 pub const MAX_CHUNK: usize = 64 * 1024;
@@ -105,6 +119,12 @@ pub struct SpawnConfig {
     pub pixel_height: u16,
     /// Unix only: run as a login shell (argv[0] prefixed with `-`).
     pub login_shell: bool,
+    /// Windows only: create the pseudoconsole with
+    /// `PSEUDOCONSOLE_PASSTHROUGH_MODE`, so a new enough ConPTY forwards the
+    /// child's output sequences (APC, DCS, ...) unmodified instead of
+    /// re-rendering them. Ignored elsewhere. Falls back to a normal
+    /// pseudoconsole if the ConPTY in use rejects the flag. Default `false`.
+    pub passthrough: bool,
     /// Channel receiving [`PtyEvent`]s.
     pub tx: Sender<PtyEvent>,
     /// Called after every event is sent.
@@ -184,11 +204,48 @@ impl std::fmt::Debug for PtyWriter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Platform backend interface
+// ---------------------------------------------------------------------------
+
+/// The pty master side: resizing, and (on drop) tearing the pty down.
+trait Master: Send {
+    fn resize(&self, cols: u16, rows: u16, pixel_w: u16, pixel_h: u16) -> io::Result<()>;
+}
+
+/// Blocks until the child exits.
+trait ChildWait: Send {
+    /// Wait for exit; the exit code if it could be determined.
+    fn wait(&mut self) -> Option<u32>;
+}
+
+/// Terminates the child from any thread.
+trait Killer: Send + Sync {
+    fn kill(&mut self) -> io::Result<()>;
+}
+
+/// Everything a backend hands back from a successful spawn.
+struct Spawned {
+    master: Box<dyn Master>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn ChildWait>,
+    killer: Box<dyn Killer>,
+    pid: Option<u32>,
+}
+
+#[cfg(unix)]
+use unix::open as backend_open;
+#[cfg(windows)]
+use win::open as backend_open;
+
 /// A running child attached to a pseudo-terminal.
 pub struct Pty {
-    master: Box<dyn MasterPty + Send>,
+    // Field order matters: on drop the pseudoconsole (`master`) must be
+    // closed before anything else (see `win/conpty.rs`).
+    master: Box<dyn Master>,
     writer: PtyWriter,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    killer: Box<dyn Killer>,
     status: Arc<Mutex<Option<Option<u32>>>>,
     pid: Option<u32>,
     #[cfg(unix)]
@@ -246,6 +303,7 @@ impl Pty {
             pixel_width: 0,
             pixel_height: 0,
             login_shell: args.is_empty() && (cmd.is_empty() || is_known_shell(cmd)),
+            passthrough: false,
             tx,
             on_wake: None,
         })
@@ -253,31 +311,15 @@ impl Pty {
 
     /// Spawn using a full [`SpawnConfig`].
     pub fn spawn_with(cfg: SpawnConfig) -> io::Result<Pty> {
-        let size = PtySize {
-            rows: cfg.rows.max(1),
-            cols: cfg.cols.max(1),
-            pixel_width: cfg.pixel_width,
-            pixel_height: cfg.pixel_height,
-        };
-        // libc::openpty is not thread-safe on macOS (it uses ptsname(3)); two
-        // concurrent calls intermittently fail with ENXIO. Serialize them.
-        static OPENPTY_LOCK: Mutex<()> = Mutex::new(());
-        let _open_guard = OPENPTY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let pair = native_pty_system().openpty(size).map_err(io::Error::other)?;
-
-        let builder = build_command(&cfg);
-        let mut child = pair
-            .slave
-            .spawn_command(builder)
-            .map_err(io::Error::other)?;
-        // Must drop the slave so the reader sees EOF once the child is gone.
-        drop(pair.slave);
-        drop(_open_guard);
-
-        let pid = child.process_id();
-        let killer = child.clone_killer();
-        let reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
-        let writer = PtyWriter::new(pair.master.take_writer().map_err(io::Error::other)?)?;
+        let Spawned {
+            master,
+            reader,
+            writer,
+            mut child,
+            killer,
+            pid,
+        } = backend_open(&cfg)?;
+        let writer = PtyWriter::new(writer)?;
 
         let dead = writer.failed.clone();
         let wake: Option<Arc<dyn Fn() + Send + Sync>> = cfg.on_wake.map(Arc::from);
@@ -310,7 +352,7 @@ impl Pty {
             thread::Builder::new()
                 .name("grimalkin-pty-wait".into())
                 .spawn(move || {
-                    let code = child.wait().ok().map(|s| s.exit_code());
+                    let code = child.wait();
                     *status.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
                     wait_for_drain(&reader_state);
                     {
@@ -329,7 +371,7 @@ impl Pty {
         }
 
         Ok(Pty {
-            master: pair.master,
+            master,
             writer,
             killer,
             status,
@@ -357,13 +399,7 @@ impl Pty {
     /// Resize the pty. Pixel sizes may be 0 if unknown.
     pub fn resize(&self, cols: u16, rows: u16, pixel_w: u16, pixel_h: u16) -> io::Result<()> {
         self.master
-            .resize(PtySize {
-                rows: rows.max(1),
-                cols: cols.max(1),
-                pixel_width: pixel_w,
-                pixel_height: pixel_h,
-            })
-            .map_err(io::Error::other)
+            .resize(cols.max(1), rows.max(1), pixel_w, pixel_h)
     }
 
     /// Terminate the child (SIGHUP then, after 2 s, SIGKILL on Unix;
@@ -606,34 +642,23 @@ fn resolve_in_path(cmd: &str, cwd: Option<&Path>) -> PathBuf {
     p.to_path_buf()
 }
 
-fn build_command(cfg: &SpawnConfig) -> CommandBuilder {
+#[cfg(unix)]
+fn build_command(cfg: &SpawnConfig) -> portable_pty::CommandBuilder {
+    use portable_pty::CommandBuilder;
     let mut builder;
-    #[cfg(unix)]
-    {
-        if cfg.cmd.is_empty() || (cfg.login_shell && cfg.args.is_empty()) {
-            // portable-pty's default-prog path execs `$SHELL` (from this
-            // builder's env) with argv[0] = "-<basename>", i.e. a login shell.
-            let shell = if cfg.cmd.is_empty() {
-                default_shell()
-            } else {
-                // portable-pty only honors an absolute, executable $SHELL.
-                resolve_in_path(&cfg.cmd, cfg.cwd.as_deref())
-            };
-            builder = CommandBuilder::new_default_prog();
-            builder.env("SHELL", shell);
-        } else {
-            builder = CommandBuilder::new(&cfg.cmd);
-            builder.args(&cfg.args);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let prog = if cfg.cmd.is_empty() {
+    if cfg.cmd.is_empty() || (cfg.login_shell && cfg.args.is_empty()) {
+        // portable-pty's default-prog path execs `$SHELL` (from this
+        // builder's env) with argv[0] = "-<basename>", i.e. a login shell.
+        let shell = if cfg.cmd.is_empty() {
             default_shell()
         } else {
-            PathBuf::from(&cfg.cmd)
+            // portable-pty only honors an absolute, executable $SHELL.
+            resolve_in_path(&cfg.cmd, cfg.cwd.as_deref())
         };
-        builder = CommandBuilder::new(prog);
+        builder = CommandBuilder::new_default_prog();
+        builder.env("SHELL", shell);
+    } else {
+        builder = CommandBuilder::new(&cfg.cmd);
         builder.args(&cfg.args);
     }
     for (k, v) in default_env() {
@@ -732,6 +757,7 @@ mod tests {
         assert_eq!(get("TERM").as_deref(), Some("xterm-kitty"));
     }
 
+    #[cfg(unix)]
     fn cfg(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> SpawnConfig {
         let (tx, _rx) = std::sync::mpsc::channel();
         SpawnConfig {
@@ -744,11 +770,13 @@ mod tests {
             pixel_width: 0,
             pixel_height: 0,
             login_shell: false,
+            passthrough: false,
             tx,
             on_wake: None,
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn caller_env_overrides_defaults() {
         let b = build_command(&cfg("prog", &[], &[("TERM_PROGRAM", "other"), ("FOO", "bar")]));

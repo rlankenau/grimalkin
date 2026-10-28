@@ -132,12 +132,43 @@ keyboard protocols. On Unix, if no kitty terminfo database can be found
 back to `TERM=xterm-256color` so vim, tmux, less and friends keep working. See
 `crates/gui/src/terminfo.rs`.
 
+## Windows: kitty graphics need a newer ConPTY
+
+Stock Windows 10 ConPTY (conhost 10.0.19041) strips APC sequences
+(`ESC _ ... ESC \`), so the kitty graphics protocol never reaches Grimalkin, and
+it swallows the kitty keyboard query (`CSI ? u`). Grimalkin talks to ConPTY
+directly (`crates/pty/src/win/`) and can use Microsoft's current one:
+
+1. Download the `Microsoft.Windows.Console.ConPTY` NuGet package (a `.nupkg` is
+   a zip file) and take `runtimes/win-x64/native/conpty.dll` and
+   `build/native/runtimes/x64/OpenConsole.exe` (paths vary a little by
+   package version; use the x64 pair).
+2. Put both files in the same directory as `grimalkin.exe`.
+
+At startup Grimalkin loads `conpty.dll` from the executable's directory if it
+exists and falls back to the in-box `kernel32.dll` ConPTY otherwise. Run with
+`RUST_LOG=info` to see which one was used.
+
+For the best chance of APC and other sequences arriving untouched, also turn on
+passthrough mode (`PSEUDOCONSOLE_PASSTHROUGH_MODE`), which stops ConPTY from
+re-rendering the child's output:
+
+```toml
+[pty]
+passthrough = true
+```
+
+or set `GRIMALKIN_CONPTY_PASSTHROUGH=1` (`0` forces it off), which overrides
+the file. Passthrough needs the sideloaded ConPTY or Windows 11; if the ConPTY
+in use rejects the flag, Grimalkin logs a warning and starts without it.
+Passthrough is off by default.
+
 ## Crate layout
 
 - `crates/vt` (`grimalkin-vt`): terminal state machine, no I/O or GUI
 - `crates/graphics` (`grimalkin-graphics`): kitty graphics protocol, image
   store, `gcat` example
-- `crates/pty` (`grimalkin-pty`): thin wrapper over portable-pty (ConPTY/forkpty)
+- `crates/pty` (`grimalkin-pty`): PTY layer: native ConPTY on Windows, portable-pty (forkpty) on Unix
 - `crates/gui` (`grimalkin`): the binary: winit + wgpu renderer, input, config
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for details. Tests: `cargo test --workspace`.

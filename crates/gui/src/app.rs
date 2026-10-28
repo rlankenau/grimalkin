@@ -127,6 +127,7 @@ impl App {
         };
         let pty = Pty::spawn_with(SpawnConfig {
             login_shell: args.is_empty() && self.launch.command.is_none(),
+            passthrough: cfg.pty.passthrough_enabled(),
             cmd,
             args,
             cwd: self.launch.working_directory.clone(),
