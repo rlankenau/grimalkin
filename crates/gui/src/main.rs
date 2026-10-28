@@ -195,7 +195,62 @@ mod console {
     }
 }
 
+/// Where a panic report is appended: `<data_dir>/grimalkin/panic.log`.
+fn panic_log_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("grimalkin").join("panic.log"))
+}
+
+/// The text of one panic report (message, location, backtrace).
+fn format_panic_report(unix_secs: u64, thread: &str, message: &str, location: &str, backtrace: &str) -> String {
+    format!(
+        "--- grimalkin {} panic at unix time {unix_secs} ---\nthread '{thread}' panicked at {location}:\n{message}\nbacktrace:\n{backtrace}\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Append `report` to the panic log at `path`, creating its directory.
+fn append_panic_log(path: &std::path::Path, report: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(report.as_bytes())
+}
+
+/// Report panics and exit with status 101. Without this, a panic inside a
+/// winit callback (an `extern "C"` frame called from AppKit / Win32) cannot
+/// unwind, so the runtime aborts the process and the OS shows a crash dialog
+/// that carries no panic message. Installed from `main` only, so `cargo test`
+/// keeps the default hook.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let message = match info.payload().downcast_ref::<&str>() {
+            Some(s) => (*s).to_string(),
+            None => match info.payload().downcast_ref::<String>() {
+                Some(s) => s.clone(),
+                None => "Box<dyn Any>".to_string(),
+            },
+        };
+        let location = info.location().map_or_else(|| "unknown location".to_string(), |l| l.to_string());
+        let thread = std::thread::current().name().unwrap_or("<unnamed>").to_string();
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let report = format_panic_report(secs, &thread, &message, &location, &backtrace);
+        eprintln!("{report}");
+        match panic_log_path() {
+            Some(path) => match append_panic_log(&path, &report) {
+                Ok(()) => eprintln!("grimalkin: panic report written to {}", path.display()),
+                Err(e) => eprintln!("grimalkin: cannot write {}: {e}", path.display()),
+            },
+            None => eprintln!("grimalkin: no data directory; panic report not saved"),
+        }
+        std::process::exit(101);
+    }));
+}
+
 fn main() {
+    install_panic_hook();
     console::attach();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,grimalkin=info")).init();
 
@@ -247,6 +302,21 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn panic_report_is_appended_to_the_log() {
+        let dir = std::env::temp_dir().join(format!("grimalkin-panic-test-{}", std::process::id()));
+        let path = dir.join("nested").join("panic.log");
+        let r1 = format_panic_report(1, "main", "attempt to add with overflow", "skin/hit.rs:64:18", "bt1");
+        let r2 = format_panic_report(2, "main", "second", "x.rs:1:1", "bt2");
+        append_panic_log(&path, &r1).unwrap();
+        append_panic_log(&path, &r2).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("attempt to add with overflow") && text.contains("skin/hit.rs:64:18") && text.contains("bt1"));
+        assert!(text.contains("second") && text.find("bt1") < text.find("bt2"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(panic_log_path().is_none_or(|p| p.ends_with("grimalkin/panic.log")));
     }
 
     #[test]

@@ -594,15 +594,15 @@ impl Renderer {
 
     /// Top-left of the cell grid in the surface (skin origin + padding).
     pub fn grid_origin_px(&self) -> (u32, u32) {
-        (self.origin.0 + self.pad, self.origin.1 + self.pad)
+        (self.origin.0.saturating_add(self.pad), self.origin.1.saturating_add(self.pad))
     }
 
     fn ox(&self) -> f32 {
-        (self.origin.0 + self.pad) as f32
+        self.origin.0.saturating_add(self.pad) as f32
     }
 
     fn oy(&self) -> f32 {
-        (self.origin.1 + self.pad) as f32
+        self.origin.1.saturating_add(self.pad) as f32
     }
 
     /// Grid dimensions that fit the current surface size.
@@ -613,17 +613,32 @@ impl Renderer {
     /// Grid dimensions that fit a surface of `w` x `h` physical pixels.
     pub fn grid_size_for(&self, w: u32, h: u32) -> (usize, usize) {
         let (cw, ch) = self.cell_size_px();
-        let avail_w = w.saturating_sub(self.origin.0 + self.inset.0 + 2 * self.pad);
-        let avail_h = h.saturating_sub(self.origin.1 + self.inset.1 + 2 * self.pad);
-        (((avail_w / cw) as usize).max(1), ((avail_h / ch) as usize).max(1))
+        let (fx, fy) = self.fixed_px();
+        let avail_w = w.saturating_sub(fx);
+        let avail_h = h.saturating_sub(fy);
+        (((avail_w / cw.max(1)) as usize).max(1), ((avail_h / ch.max(1)) as usize).max(1))
     }
 
     /// Surface size (physical pixels) needed for a `cols` x `rows` grid.
     pub fn surface_size_for(&self, cols: usize, rows: usize) -> (u32, u32) {
         let (cw, ch) = self.cell_size_px();
+        let (fx, fy) = self.fixed_px();
+        let cols = u32::try_from(cols).unwrap_or(u32::MAX);
+        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
         (
-            cols as u32 * cw + 2 * self.pad + self.origin.0 + self.inset.0,
-            rows as u32 * ch + 2 * self.pad + self.origin.1 + self.inset.1,
+            cols.saturating_mul(cw).saturating_add(fx).min(skin::MAX_WINDOW_PX),
+            rows.saturating_mul(ch).saturating_add(fy).min(skin::MAX_WINDOW_PX),
+        )
+    }
+
+    /// Pixels around the grid that are not cells: skin origin + inset +
+    /// padding on both sides, per axis. Saturating, so hostile skin or
+    /// config values can never wrap.
+    fn fixed_px(&self) -> (u32, u32) {
+        let pad2 = self.pad.saturating_mul(2);
+        (
+            self.origin.0.saturating_add(self.inset.0).saturating_add(pad2),
+            self.origin.1.saturating_add(self.inset.1).saturating_add(pad2),
         )
     }
 
@@ -718,8 +733,8 @@ impl Renderer {
         let (sw, sh) = (self.surface_config.width, self.surface_config.height);
         let x = self.origin.0.min(sw.saturating_sub(1));
         let y = self.origin.1.min(sh.saturating_sub(1));
-        let w = sw.saturating_sub(self.origin.0 + self.inset.0).clamp(1, sw - x);
-        let h = sh.saturating_sub(self.origin.1 + self.inset.1).clamp(1, sh - y);
+        let w = sw.saturating_sub(self.origin.0.saturating_add(self.inset.0)).clamp(1, (sw - x).max(1));
+        let h = sh.saturating_sub(self.origin.1.saturating_add(self.inset.1)).clamp(1, (sh - y).max(1));
         (x, y, w, h)
     }
 

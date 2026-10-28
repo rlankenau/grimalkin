@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use winit::window::CursorIcon;
 
 use self::hit::{ButtonKind, Hit, Layout, ResizeDir, SliceSpec, ALPHA_CUTOFF};
-use self::parse::{DoubleClick, Insets, SkinDef};
+use self::parse::{DoubleClick, Insets, SkinDef, MAX_SHADE_HEIGHT};
 
 include!(concat!(env!("OUT_DIR"), "/builtin_skins.rs"));
 
@@ -59,6 +59,23 @@ pub fn work_area(window: &winit::window::Window) -> winstate::Rect {
 }
 
 /// Two clicks on the titlebar within this time are a double-click.
+/// Largest window dimension (physical pixels) the app ever asks the window
+/// system for. Anything derived from a skin is clamped to this.
+pub const MAX_WINDOW_PX: u32 = 16384;
+
+/// Largest window coordinate (either sign) handed to the window system.
+pub const MAX_WINDOW_POS: i32 = 65536;
+
+/// A window size that is safe to hand to winit: each side in `1..=MAX_WINDOW_PX`.
+pub fn clamp_size(w: u32, h: u32) -> winit::dpi::PhysicalSize<u32> {
+    winit::dpi::PhysicalSize::new(w.clamp(1, MAX_WINDOW_PX), h.clamp(1, MAX_WINDOW_PX))
+}
+
+/// A window position that is safe to hand to winit.
+pub fn clamp_pos(x: i32, y: i32) -> winit::dpi::PhysicalPosition<i32> {
+    winit::dpi::PhysicalPosition::new(x.clamp(-MAX_WINDOW_POS, MAX_WINDOW_POS), y.clamp(-MAX_WINDOW_POS, MAX_WINDOW_POS))
+}
+
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Does this `skin` config value ask for a skin at all?
@@ -296,12 +313,20 @@ impl Skin {
     /// Height in skin pixels of the shaded (windowshade) window.
     pub fn shade_height(&self) -> u32 {
         let d = &self.def;
-        d.shade
+        let h = d
+            .shade
             .as_ref()
             .map(|s| s.height)
             .filter(|h| *h > 0)
             .or_else(|| d.titlebar.as_ref().map(|t| t.rect.h.max(0) as u32).filter(|h| *h > 0))
-            .unwrap_or(d.frame.slices.top.max(8))
+            .unwrap_or(d.frame.slices.top.max(8));
+        h.min(MAX_SHADE_HEIGHT)
+    }
+
+    /// Shade bar height in physical pixels at `scale`, at least 1 and never
+    /// more than [`MAX_WINDOW_PX`].
+    pub fn shade_bar_px(&self, scale: u32) -> u32 {
+        self.shade_height().saturating_mul(scale.max(1)).clamp(1, MAX_WINDOW_PX)
     }
 
     /// Is a window `height` physical pixels tall the windowshade bar? The
@@ -310,7 +335,7 @@ impl Skin {
     /// the window: a normal window is always taller than the bar (its minimum
     /// height is larger), and a window as thin as the bar can only show the bar.
     pub fn is_shade_height(&self, height: u32, scale: u32) -> bool {
-        height <= (self.shade_height() * scale.max(1)).max(1)
+        height <= self.shade_bar_px(scale)
     }
 
     /// How to stretch the frame (or the shade bar) over a window at `scale`:
@@ -332,7 +357,12 @@ impl Skin {
         }
         if scale == 2 {
             if let Some(f2) = &self.frame2 {
-                let caps = Insets { left: c.left * 2, right: c.right * 2, top: c.top * 2, bottom: c.bottom * 2 };
+                let caps = Insets {
+                    left: c.left.saturating_mul(2),
+                    right: c.right.saturating_mul(2),
+                    top: c.top.saturating_mul(2),
+                    bottom: c.bottom.saturating_mul(2),
+                };
                 return (SliceSpec { region: [0, 0, f2.w, f2.h], caps, mode }, TexId::Frame2, 1);
             }
         }
@@ -347,7 +377,8 @@ impl Skin {
     pub fn viewport_insets(&self, scale: u32) -> ((u32, u32), (u32, u32)) {
         let v = self.def.frame.viewport_inset;
         let s = scale.max(1);
-        ((v.left * s, v.top * s), (v.right * s, v.bottom * s))
+        let m = |a: u32| a.saturating_mul(s).min(MAX_WINDOW_PX);
+        ((m(v.left), m(v.top)), (m(v.right), m(v.bottom)))
     }
 
     /// Smallest window (physical pixels) that keeps the fixed frame parts
@@ -356,9 +387,10 @@ impl Skin {
         let ((l, t), (r, b)) = self.viewport_insets(scale);
         let c = self.def.frame.slices;
         let s = scale.max(1);
-        let w = (l + r + cell.0 * 4).max((c.left + c.right) * s + 1);
-        let h = (t + b + cell.1 * 2).max((c.top + c.bottom) * s + 1);
-        (w, h)
+        let cap = |a: u32, b: u32| a.saturating_add(b).saturating_mul(s).saturating_add(1);
+        let w = l.saturating_add(r).saturating_add(cell.0.saturating_mul(4)).max(cap(c.left, c.right));
+        let h = t.saturating_add(b).saturating_add(cell.1.saturating_mul(2)).max(cap(c.top, c.bottom));
+        (w.min(MAX_WINDOW_PX), h.min(MAX_WINDOW_PX))
     }
 
     /// Is window pixel (x, y) part of the window shape?
@@ -590,6 +622,143 @@ impl SkinRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write `skin.toml` plus a 64x64 frame.png into a fresh temp dir and load it.
+    fn load_toml(tag: &str, toml: &str) -> Result<Skin, String> {
+        let dir = std::env::temp_dir().join(format!("grimalkin-hostile-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([10, 20, 30, 255])).save(dir.join("frame.png")).unwrap();
+        std::fs::write(dir.join("skin.toml"), toml).unwrap();
+        let r = Skin::load_from(dir.to_str().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    #[test]
+    fn well_formed_skin_loads_from_a_directory() {
+        let toml = "[frame]\nslices = { left = 8, right = 8, top = 8, bottom = 8 }\n\
+                    viewport_inset = { left = 8, right = 8, top = 8, bottom = 8 }\n\
+                    [titlebar]\nrect = { x = 0, y = 0, w = -1, h = 12 }\n\
+                    [shade]\nheight = 12\n";
+        let s = load_toml("ok", toml).expect("valid skin");
+        assert_eq!(s.shade_height(), 12);
+    }
+
+    // The five hostile skin.toml variants from docs/qa/crash-triage-2026-10-28.md.
+    // Each used to panic (debug) or reach AppKit with a wrapped size (release);
+    // each must now be a clean load error that names the offending field.
+
+    #[test]
+    fn hostile_a_slices_u32_max_is_rejected() {
+        let e = load_toml("a", "[frame]\nslices = { left = 4294967295 }\n").err().expect("must be rejected");
+        assert!(e.contains("frame.slices"), "{e}");
+        let e = load_toml("a2", "[frame]\nslices = { left = 4294967295, right = 4294967295, top = 4294967295, bottom = 4294967295 }\n")
+            .err()
+            .expect("must be rejected");
+        assert!(e.contains("frame.slices"), "{e}");
+    }
+
+    #[test]
+    fn hostile_b_viewport_inset_extremes_are_rejected() {
+        for v in ["4294967295", "2147483647"] {
+            for field in ["left", "right", "top", "bottom"] {
+                let toml = format!("[frame]\nviewport_inset = {{ {field} = {v} }}\n");
+                let e = load_toml("b", &toml).err().expect("must be rejected");
+                assert!(e.contains("frame.viewport_inset"), "{field}={v}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_c_button_and_titlebar_rect_extremes_are_rejected() {
+        let toml = "[buttons]\nclose = { rect = { x = 2147483647, y = 2147483647, w = 2147483647, h = 2147483647 }, sprite = [0, 0] }\n";
+        let e = load_toml("c1", toml).err().expect("must be rejected");
+        assert!(e.contains("buttons.close.rect"), "{e}");
+        let toml = "[titlebar]\nrect = { x = 2000000000, y = 0, w = 2000000000, h = 10 }\n";
+        let e = load_toml("c2", toml).err().expect("must be rejected");
+        assert!(e.contains("titlebar.rect"), "{e}");
+        let toml = "[buttons]\nclose = { rect = { x = -2147483648, y = 0, w = 10, h = 10 }, sprite = [0, 0] }\n";
+        assert!(load_toml("c3", toml).is_err());
+    }
+
+    #[test]
+    fn hostile_d_titlebar_text_extremes_are_rejected() {
+        let toml = "[titlebar]\nrect = { x = 0, y = 0, w = -1, h = 10 }\n\
+                    text = { x = 2147483647, y = 2147483647, w = -2147483648 }\n";
+        let e = load_toml("d", toml).err().expect("must be rejected");
+        assert!(e.contains("titlebar.text"), "{e}");
+        let toml = "[titlebar]\ntext = { w = -2147483648 }\n";
+        let e = load_toml("d2", toml).err().expect("must be rejected");
+        assert!(e.contains("titlebar.text.w"), "{e}");
+    }
+
+    #[test]
+    fn hostile_e_shade_height_extremes_are_rejected() {
+        for v in ["4294967295", "2147483647", "100000", "4097", "65"] {
+            let toml = format!("[shade]\nheight = {v}\n");
+            let r = load_toml("e", &toml);
+            // 65 is larger than the 64 pixel frame; the rest exceed the hard cap.
+            let e = r.err().unwrap_or_else(|| panic!("shade.height {v} must be rejected"));
+            assert!(e.contains("shade.height"), "{v}: {e}");
+        }
+        for v in ["-1", "-2147483648"] {
+            assert!(load_toml("e2", &format!("[shade]\nheight = {v}\n")).is_err(), "{v}");
+        }
+    }
+
+    #[test]
+    fn nonsensical_but_in_range_values_are_rejected_too() {
+        // Slices that leave no centre; sprite coordinates beyond any texture.
+        assert!(load_toml("n1", "[frame]\nslices = { left = 32, right = 32 }\n").is_err());
+        let toml = "[buttons]\nclose = { rect = { x = 0, y = 0, w = 4, h = 4 }, sprite = [4294967295, 0] }\n";
+        assert!(load_toml("n2", toml).is_err());
+        assert!(load_toml("n3", "[frame]\nviewport_inset = { left = 40, right = 40 }\n").is_err());
+    }
+
+    #[test]
+    fn hostile_definitions_that_skip_validation_still_cannot_overflow() {
+        // Defence in depth: the layout / bar arithmetic must not panic even
+        // for a definition that never went through `validate`.
+        let nasty = "[frame]\nslices = { left = 4294967295, right = 4294967295, top = 4294967295, bottom = 4294967295 }\n\
+            viewport_inset = { left = 4294967295, right = 4294967295, top = 2147483647, bottom = 2147483647 }\n\
+            [titlebar]\nrect = { x = 2147483647, y = 2147483647, w = 2147483647, h = 2147483647 }\n\
+            text = { x = 2147483647, y = 2147483647, w = -2147483648, font_px = 1e30 }\n\
+            [buttons]\nclose = { rect = { x = -2147483648, y = 2147483647, w = -2147483648, h = 2147483647 }, sprite = [4294967295, 4294967295] }\n\
+            [resize]\ngrip = { x = 2147483647, y = -2147483648, w = 2147483647, h = -2147483648 }\nborder = 4294967295\n\
+            [shade]\nheight = 4294967295\n";
+        let def = SkinDef::from_toml(nasty).unwrap();
+        for shaded in [false, true] {
+            for scale in [1u32, 2, 16] {
+                let l = Layout::new(&def, 800, 600, scale, shaded, true);
+                let _ = l.hit(10.0, 10.0, |_, _| true);
+            }
+        }
+        let _ = Layout::new(&def, u32::MAX, u32::MAX, u32::MAX, false, true);
+        let mut skin = debug();
+        skin.def = def;
+        for scale in [1u32, 2, 16, u32::MAX] {
+            assert!(skin.shade_bar_px(scale) <= MAX_WINDOW_PX);
+            assert!(skin.shade_bar_px(scale) >= 1);
+            let (w, h) = skin.min_window(scale, (u32::MAX, u32::MAX));
+            assert!(w <= MAX_WINDOW_PX && h <= MAX_WINDOW_PX);
+            let _ = skin.viewport_insets(scale);
+            let _ = skin.is_shade_height(u32::MAX, scale);
+            let _ = skin.frame_spec(false, scale);
+            let _ = skin.frame_spec(true, scale);
+        }
+    }
+
+    #[test]
+    fn window_size_and_position_clamps() {
+        let s = clamp_size(0, u32::MAX);
+        assert_eq!((s.width, s.height), (1, MAX_WINDOW_PX));
+        let s = clamp_size(800, 600);
+        assert_eq!((s.width, s.height), (800, 600));
+        let p = clamp_pos(i32::MIN, i32::MAX);
+        assert_eq!((p.x, p.y), (-MAX_WINDOW_POS, MAX_WINDOW_POS));
+        let p = clamp_pos(-30, 40);
+        assert_eq!((p.x, p.y), (-30, 40));
+    }
 
     fn debug() -> Skin {
         Skin::load_from("debug", None).expect("built-in debug skin")

@@ -55,14 +55,16 @@ impl ResizeDrag {
         } else if north {
             h = sh - dy;
         }
-        let w = w.round().max(self.min.0.max(1) as f64) as u32;
-        let h = h.round().max(self.min.1.max(1) as f64) as u32;
+        let cap = super::MAX_WINDOW_PX;
+        // A NaN pointer position saturates to 0 and then to the minimum.
+        let w = (w.round().max(self.min.0.max(1) as f64) as u32).min(cap).max(1);
+        let h = (h.round().max(self.min.1.max(1) as f64) as u32).min(cap).max(1);
         let mut pos = self.origin;
         if west {
-            pos.0 += self.size.0 as i32 - w as i32;
+            pos.0 = pos.0.saturating_add(self.size.0.min(cap) as i32 - w as i32);
         }
         if north {
-            pos.1 += self.size.1 as i32 - h as i32;
+            pos.1 = pos.1.saturating_add(self.size.1.min(cap) as i32 - h as i32);
         }
         (pos, (w, h))
     }
@@ -71,6 +73,18 @@ impl ResizeDrag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extreme_pointer_positions_stay_within_the_window_cap() {
+        for dir in [ResizeDir::NW, ResizeDir::SE, ResizeDir::W, ResizeDir::N] {
+            for p in [(1e300, 1e300), (-1e300, -1e300), (f64::NAN, f64::NAN), (f64::INFINITY, f64::NEG_INFINITY)] {
+                let (pos, (w, h)) = drag(dir).target(p);
+                assert!((1..=crate::skin::MAX_WINDOW_PX).contains(&w), "{dir:?} {p:?} w={w}");
+                assert!((1..=crate::skin::MAX_WINDOW_PX).contains(&h), "{dir:?} {p:?} h={h}");
+                let _ = pos;
+            }
+        }
+    }
 
     fn drag(dir: ResizeDir) -> ResizeDrag {
         ResizeDrag::begin(dir, (500.0, 400.0), (100, 50), (800, 600), (300, 200))

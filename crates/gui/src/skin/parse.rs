@@ -192,23 +192,143 @@ impl SkinDef {
             1.0
         };
         if let Some(t) = d.titlebar.as_mut().and_then(|t| t.text.as_mut()) {
-            t.font_px = if t.font_px.is_finite() { t.font_px.clamp(4.0, 96.0) } else { 11.0 };
+            t.font_px = if t.font_px.is_finite() { t.font_px.clamp(MIN_FONT_PX, MAX_FONT_PX) } else { 11.0 };
         }
-        d.resize.border = d.resize.border.min(64);
+        d.resize.border = d.resize.border.min(MAX_BORDER);
         Ok(d)
     }
 
-    /// Check the definition against the frame image size.
+    /// Check every numeric field against the frame image size. This is the one
+    /// place hostile or nonsensical values are stopped: anything that is
+    /// rejected here never reaches layout, the renderer or the window system,
+    /// so the arithmetic downstream only ever sees bounded values.
     pub fn validate(&self, img_w: u32, img_h: u32) -> Result<(), String> {
-        let s = self.frame.slices;
-        if s.left + s.right > img_w || s.top + s.bottom > img_h {
-            return Err(format!(
-                "frame slices ({}+{} x {}+{}) exceed the {img_w}x{img_h} frame image",
-                s.left, s.right, s.top, s.bottom
-            ));
+        if img_w == 0 || img_h == 0 || img_w > MAX_SKIN_DIM || img_h > MAX_SKIN_DIM {
+            return Err(format!("frame image is {img_w}x{img_h}; it must be 1..={MAX_SKIN_DIM} pixels per side"));
+        }
+        let (w, h) = (img_w as i64, img_h as i64);
+        check_insets("frame.slices", &self.frame.slices, w, h)?;
+        check_insets("frame.viewport_inset", &self.frame.viewport_inset, w, h)?;
+
+        let op = self.frame.viewport_opacity;
+        if !op.is_finite() || !(0.0..=1.0).contains(&op) {
+            return Err(format!("frame.viewport_opacity {op} is outside 0..=1"));
+        }
+
+        if let Some(t) = &self.titlebar {
+            check_rect("titlebar.rect", &t.rect, w, h)?;
+            if let Some(tx) = &t.text {
+                check_extent("titlebar.text.x", tx.x as i64, w)?;
+                check_extent("titlebar.text.y", tx.y as i64, h)?;
+                check_len("titlebar.text.w", tx.w as i64, w)?;
+                if !tx.font_px.is_finite() || !(MIN_FONT_PX..=MAX_FONT_PX).contains(&tx.font_px) {
+                    return Err(format!(
+                        "titlebar.text.font_px {} is outside {MIN_FONT_PX}..={MAX_FONT_PX}",
+                        tx.font_px
+                    ));
+                }
+            }
+            if let Some(im) = &t.image {
+                check_sprite("titlebar.image.sprite", im.sprite)?;
+                check_sprite("titlebar.image.size", im.size)?;
+            }
+        }
+
+        let b = &self.buttons;
+        for (name, def) in [
+            ("buttons.close", &b.close),
+            ("buttons.minimize", &b.minimize),
+            ("buttons.shade", &b.shade),
+            ("buttons.maximize", &b.maximize),
+        ] {
+            let Some(d) = def else { continue };
+            check_rect(&format!("{name}.rect"), &d.rect, w, h)?;
+            // Hover and pressed sprites are stacked below the normal one, so
+            // the sprite row plus three heights must stay representable.
+            check_sprite(&format!("{name}.sprite"), d.sprite)?;
+            if let Some(sp) = d.shaded_sprite {
+                check_sprite(&format!("{name}.shaded_sprite"), sp)?;
+            }
+        }
+
+        if let Some(g) = &self.resize.grip {
+            check_rect("resize.grip", g, w, h)?;
+        }
+        if self.resize.border > MAX_BORDER {
+            return Err(format!("resize.border {} exceeds {MAX_BORDER}", self.resize.border));
+        }
+
+        if let Some(sh) = &self.shade {
+            // 0 means "derive from the titlebar" (see `Skin::shade_height`).
+            if sh.height > MAX_SHADE_HEIGHT {
+                return Err(format!("shade.height {} exceeds {MAX_SHADE_HEIGHT}", sh.height));
+            }
+            if sh.height as i64 > h {
+                return Err(format!("shade.height {} exceeds the {img_h} pixel frame image height", sh.height));
+            }
         }
         Ok(())
     }
+}
+
+/// Largest frame image side (and sprite coordinate / size) a skin may use.
+pub const MAX_SKIN_DIM: u32 = 16384;
+/// Largest windowshade bar height, in skin pixels.
+pub const MAX_SHADE_HEIGHT: u32 = 4096;
+/// Largest resize zone width, in skin pixels.
+pub const MAX_BORDER: u32 = 64;
+pub const MIN_FONT_PX: f32 = 4.0;
+pub const MAX_FONT_PX: f32 = 96.0;
+
+fn check_insets(what: &str, v: &Insets, w: i64, h: i64) -> Result<(), String> {
+    // i64 so that no u32 sum can wrap.
+    let (l, r, t, b) = (v.left as i64, v.right as i64, v.top as i64, v.bottom as i64);
+    if l + r >= w || t + b >= h {
+        return Err(format!(
+            "{what} ({}+{} x {}+{}) must be smaller than the {w}x{h} frame image",
+            v.left, v.right, v.top, v.bottom
+        ));
+    }
+    Ok(())
+}
+
+/// A frame-space position: negative counts from the far edge; either way its
+/// magnitude is bounded by the frame size.
+fn check_extent(what: &str, v: i64, limit: i64) -> Result<(), String> {
+    if v.abs() > limit {
+        return Err(format!("{what} {v} is outside the +/-{limit} frame range"));
+    }
+    Ok(())
+}
+
+/// A frame-space length: -1 (to the edge), `< -1` (a margin) or a size.
+fn check_len(what: &str, v: i64, limit: i64) -> Result<(), String> {
+    if v.abs() > limit {
+        return Err(format!("{what} {v} is outside the +/-{limit} frame range"));
+    }
+    Ok(())
+}
+
+fn check_rect(what: &str, r: &RectDef, w: i64, h: i64) -> Result<(), String> {
+    check_extent(&format!("{what}.x"), r.x as i64, w)?;
+    check_extent(&format!("{what}.y"), r.y as i64, h)?;
+    check_len(&format!("{what}.w"), r.w as i64, w)?;
+    check_len(&format!("{what}.h"), r.h as i64, h)?;
+    // A rect measured from the left/top edge must also end inside the frame.
+    if r.x >= 0 && r.w >= 0 && r.x as i64 + r.w as i64 > w {
+        return Err(format!("{what} (x {} + w {}) extends past the {w} pixel frame width", r.x, r.w));
+    }
+    if r.y >= 0 && r.h >= 0 && r.y as i64 + r.h as i64 > h {
+        return Err(format!("{what} (y {} + h {}) extends past the {h} pixel frame height", r.y, r.h));
+    }
+    Ok(())
+}
+
+fn check_sprite(what: &str, v: [u32; 2]) -> Result<(), String> {
+    if v[0] > MAX_SKIN_DIM || v[1] > MAX_SKIN_DIM {
+        return Err(format!("{what} {v:?} exceeds {MAX_SKIN_DIM}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -264,8 +384,41 @@ mod tests {
         let d = SkinDef::from_toml("[frame]\nslices = { left = 4, right = 4, top = 4, bottom = 4 }").unwrap();
         assert!(d.titlebar.is_none());
         assert_eq!(d.resize.border, 6);
-        assert!(d.validate(8, 8).is_ok());
-        assert!(d.validate(7, 8).is_err());
+        // Slices must leave at least one texel for the centre.
+        assert!(d.validate(9, 9).is_ok());
+        assert!(d.validate(8, 9).is_err());
+        assert!(d.validate(9, 8).is_err());
         assert!(SkinDef::from_toml("[frame]\nedge_mode = \"wobble\"").is_err());
+    }
+
+    #[test]
+    fn validate_uses_wide_arithmetic_and_bounds_every_field() {
+        let ok = |t: &str| SkinDef::from_toml(t).unwrap().validate(64, 64);
+        // A: u32 sums cannot wrap.
+        assert!(ok("[frame]\nslices = { left = 4294967295, right = 4294967295 }").is_err());
+        // Frame image size itself is bounded.
+        assert!(SkinDef::default().validate(0, 10).is_err());
+        assert!(SkinDef::default().validate(MAX_SKIN_DIM + 1, 10).is_err());
+        // Negative (from-the-far-edge) positions are fine within the frame, not beyond it.
+        assert!(ok("[buttons]\nclose = { rect = { x = -22, y = -20, w = 14, h = 14 }, sprite = [0, 0] }").is_ok());
+        assert!(ok("[buttons]\nclose = { rect = { x = -65, y = 0, w = 14, h = 14 }, sprite = [0, 0] }").is_err());
+        assert!(ok("[buttons]\nclose = { rect = { x = 60, y = 0, w = 14, h = 14 }, sprite = [0, 0] }").is_err());
+        // w = -1 and margins stay valid.
+        assert!(ok("[titlebar]\nrect = { x = 0, y = 0, w = -1, h = 12 }").is_ok());
+        assert!(ok("[titlebar]\nrect = { x = 0, y = 0, w = -10, h = 12 }").is_ok());
+        assert!(ok("[titlebar]\nrect = { x = 0, y = 0, w = -65, h = 12 }").is_err());
+        assert!(ok("[resize]\ngrip = { x = 2147483647, y = 0, w = 1, h = 1 }").is_err());
+        // Shade: 0 = derive from the titlebar; the cap and the frame height both apply.
+        assert!(ok("[shade]\nheight = 0").is_ok());
+        assert!(ok("[shade]\nheight = 12").is_ok());
+        assert!(ok("[shade]\nheight = 65").is_err());
+        assert!(SkinDef::from_toml("[shade]\nheight = 5000").unwrap().validate(64, 16384).is_err());
+        // Definitions built without from_toml are checked too.
+        let mut d = SkinDef::default();
+        d.resize.border = 65;
+        assert!(d.validate(64, 64).is_err());
+        let mut d = SkinDef::from_toml("[titlebar]\ntext = { font_px = 11 }").unwrap();
+        d.titlebar.as_mut().unwrap().text.as_mut().unwrap().font_px = f32::NAN;
+        assert!(d.validate(64, 64).is_err());
     }
 }

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use grimalkin_pty::{Pty, PtyEvent, PtyWriter, SpawnConfig};
 use grimalkin_vt::{CursorShape, Screen, TermEvent, Terminal};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::ModifiersState;
@@ -341,7 +341,7 @@ impl App {
         renderer.set_skin(skin.clone());
         // Size the window for the configured grid now that the cell size is known.
         let (w, h) = renderer.surface_size_for(cfg.window.cols as usize, cfg.window.rows as usize);
-        if let Some(size) = window.request_inner_size(PhysicalSize::new(w, h)) {
+        if let Some(size) = window.request_inner_size(skin::clamp_size(w, h)) {
             renderer.resize(size.width, size.height);
         } else {
             let s = window.inner_size();
@@ -1376,7 +1376,7 @@ impl Running {
             "shade" => self.run_skin_action(Action::ToggleShade),
             "size" => {
                 if let Some((w, h)) = arg.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))) {
-                    if let Some(size) = self.window.request_inner_size(PhysicalSize::new(w, h)) {
+                    if let Some(size) = self.window.request_inner_size(skin::clamp_size(w, h)) {
                         self.renderer.resize(size.width, size.height);
                         self.apply_grid_resize();
                         self.skin_geometry_changed();
@@ -1408,7 +1408,7 @@ impl Running {
     fn skin_min_size(&self) -> Option<PhysicalSize<u32>> {
         let sk = self.skin.as_ref()?;
         let (w, h) = sk.skin.min_window(sk.scale(), self.renderer.cell_size_px());
-        Some(PhysicalSize::new(w, h))
+        Some(skin::clamp_size(w, h))
     }
 
     fn update_skin_min_size(&mut self) {
@@ -1561,7 +1561,7 @@ impl Running {
         let Some(anchor) = self.screen_pointer(self.mouse_px) else { return };
         let Ok(origin) = self.window.outer_position() else { return };
         let size = self.window.inner_size();
-        let min = self.skin_min_size().unwrap_or(PhysicalSize::new(64, 64));
+        let min = self.skin_min_size().unwrap_or(skin::clamp_size(64, 64));
         log::debug!("manual resize {dir:?} start: size {}x{} origin {},{}", size.width, size.height, origin.x, origin.y);
         let drag = ResizeDrag::begin(dir, anchor, (origin.x, origin.y), (size.width, size.height), (min.width, min.height));
         self.manual_resize = Some(drag);
@@ -1574,7 +1574,7 @@ impl Running {
         let Some(m) = self.manual_resize else { return };
         let Some(pointer) = self.screen_pointer((x, y)) else { return };
         let (pos, (w, h)) = m.target(pointer);
-        let size = PhysicalSize::new(w, h);
+        let size = skin::clamp_size(w, h);
         if self.window.inner_size() != size {
             // Resize first, then put the frame where the drag says it belongs:
             // AppKit keeps the bottom-left corner fixed on a resize, which
@@ -1588,7 +1588,7 @@ impl Running {
             }
         }
         if self.window.outer_position().is_ok_and(|p| (p.x, p.y) != pos) {
-            self.window.set_outer_position(PhysicalPosition::new(pos.0, pos.1));
+            self.window.set_outer_position(skin::clamp_pos(pos.0, pos.1));
         }
     }
 
@@ -1601,7 +1601,7 @@ impl Running {
 
     /// Height of the shade bar in physical pixels.
     fn shade_bar(&self) -> u32 {
-        self.skin.as_ref().map_or(1, |sk| (sk.skin.shade_height() * sk.scale()).max(1))
+        self.skin.as_ref().map_or(1, |sk| sk.skin.shade_bar_px(sk.scale()))
     }
 
     /// Maximize / restore, done by hand: fill the monitor's work area, or go
@@ -1633,7 +1633,7 @@ impl Running {
         let t = plan.target;
         let min = if plan.state.is_shaded() {
             let min_w = self.skin_min_size().map_or(1, |m| m.width);
-            Some(PhysicalSize::new(min_w, self.shade_bar()))
+            Some(skin::clamp_size(min_w, self.shade_bar()))
         } else {
             self.skin_min_size()
         };
@@ -1642,11 +1642,11 @@ impl Running {
         if plan.state.is_shaded() {
             self.window.set_min_inner_size(min);
         }
-        if let Some(size) = self.window.request_inner_size(PhysicalSize::new(t.w, t.h)) {
+        if let Some(size) = self.window.request_inner_size(skin::clamp_size(t.w, t.h)) {
             self.renderer.resize(size.width, size.height);
         }
         // AppKit keeps the bottom-left corner on a resize: place the frame last.
-        self.window.set_outer_position(PhysicalPosition::new(t.x, t.y));
+        self.window.set_outer_position(skin::clamp_pos(t.x, t.y));
         if !plan.state.is_shaded() {
             self.window.set_min_inner_size(min);
         }

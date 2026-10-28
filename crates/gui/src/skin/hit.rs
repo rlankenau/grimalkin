@@ -48,41 +48,60 @@ pub struct PxRect {
     pub h: i32,
 }
 
+/// Clamp an `i64` into `i32` (the pixel coordinate type).
+pub fn sat_i32(v: i64) -> i32 {
+    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
 impl PxRect {
+    /// Exclusive right edge; saturates instead of wrapping.
+    fn right(&self) -> i64 {
+        self.x as i64 + self.w as i64
+    }
+
+    /// Exclusive bottom edge; saturates instead of wrapping.
+    fn bottom(&self) -> i64 {
+        self.y as i64 + self.h as i64
+    }
+
     pub fn contains(&self, x: f64, y: f64) -> bool {
-        x >= self.x as f64 && y >= self.y as f64 && x < (self.x + self.w) as f64 && y < (self.y + self.h) as f64
+        x >= self.x as f64 && y >= self.y as f64 && x < self.right() as f64 && y < self.bottom() as f64
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]
     fn contains_px(&self, x: i32, y: i32) -> bool {
-        x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
+        let (x, y) = (x as i64, y as i64);
+        x >= self.x as i64 && y >= self.y as i64 && x < self.right() && y < self.bottom()
     }
 
     fn intersect(&self, o: &PxRect) -> PxRect {
-        let x0 = self.x.max(o.x);
-        let y0 = self.y.max(o.y);
-        let x1 = (self.x + self.w).min(o.x + o.w);
-        let y1 = (self.y + self.h).min(o.y + o.h);
+        let x0 = self.x.max(o.x) as i64;
+        let y0 = self.y.max(o.y) as i64;
+        let x1 = self.right().min(o.right());
+        let y1 = self.bottom().min(o.bottom());
         PxRect {
-            x: x0,
-            y: y0,
-            w: (x1 - x0).max(0),
-            h: (y1 - y0).max(0),
+            x: sat_i32(x0),
+            y: sat_i32(y0),
+            w: sat_i32((x1 - x0).max(0)),
+            h: sat_i32((y1 - y0).max(0)),
         }
     }
 }
 
 /// Resolve a frame-space rectangle (see [`RectDef`]) against a window of
-/// `win_w` x `win_h` physical pixels at integer scale `s`.
+/// `win_w` x `win_h` physical pixels at integer scale `s`. All arithmetic is
+/// done in `i64` and the result saturates into `i32`, so no input can wrap.
 pub fn resolve_rect(r: &RectDef, win_w: i32, win_h: i32, s: i32) -> PxRect {
+    let s = s as i64;
     let axis = |pos: i32, len: i32, win: i32| {
+        let (pos, len, win) = (pos as i64, len as i64, win as i64);
         let p = if pos < 0 { win + pos * s } else { pos * s };
         let l = match len {
             -1 => win - p,
             l if l < -1 => win + l * s - p,
             l => l * s,
         };
-        (p, l.max(0))
+        (sat_i32(p), sat_i32(l.max(0)))
     };
     let (x, w) = axis(r.x, r.w, win_w);
     let (y, h) = axis(r.y, r.h, win_h);
@@ -298,7 +317,7 @@ pub struct Layout {
 /// Rectangles written for the full-height titlebar do not fit a thin shade
 /// bar: shrink/centre them vertically so they stay on it.
 fn fit_in_bar(r: PxRect, bar_h: i32) -> PxRect {
-    if r.y + r.h <= bar_h {
+    if r.bottom() <= bar_h as i64 {
         return r;
     }
     let h = r.h.min(bar_h);
@@ -312,16 +331,18 @@ fn fit_in_bar(r: PxRect, bar_h: i32) -> PxRect {
 
 impl Layout {
     pub fn new(def: &SkinDef, win_w: u32, win_h: u32, scale: u32, shaded: bool, resizable: bool) -> Layout {
-        let (w, h, s) = (win_w as i32, win_h as i32, scale.max(1) as i32);
+        // Window sizes are clamped well below i32::MAX by the app; saturate anyway.
+        let (w, h, s) = (win_w.min(i32::MAX as u32) as i32, win_h.min(i32::MAX as u32) as i32, scale.clamp(1, 64) as i32);
         let vi = def.frame.viewport_inset;
+        let (s64, w64, h64) = (s as i64, w as i64, h as i64);
         let viewport = if shaded {
             PxRect::default()
         } else {
             PxRect {
-                x: vi.left as i32 * s,
-                y: vi.top as i32 * s,
-                w: (w - (vi.left + vi.right) as i32 * s).max(0),
-                h: (h - (vi.top + vi.bottom) as i32 * s).max(0),
+                x: sat_i32(vi.left as i64 * s64),
+                y: sat_i32(vi.top as i64 * s64),
+                w: sat_i32((w64 - (vi.left as i64 + vi.right as i64) * s64).max(0)),
+                h: sat_i32((h64 - (vi.top as i64 + vi.bottom as i64) * s64).max(0)),
             }
         };
         let win_rect = PxRect { x: 0, y: 0, w, h };
@@ -340,7 +361,7 @@ impl Layout {
             .and_then(|t| t.text.as_ref())
             .map(|t| {
                 // The line box is a little taller than the font size.
-                let line = (t.font_px * 1.25).ceil() as i32;
+                let line = (t.font_px.clamp(0.0, 4096.0) * 1.25).ceil() as i32;
                 adj(resolve_rect(&RectDef { x: t.x, y: t.y, w: t.w, h: line }, w, h, s))
             })
             .filter(|r| r.w > 0 && r.h > 0);
@@ -374,7 +395,7 @@ impl Layout {
             title_text,
             buttons,
             grip,
-            border: if can_resize { def.resize.border as i32 * s } else { 0 },
+            border: if can_resize { sat_i32(def.resize.border as i64 * s64) } else { 0 },
         }
     }
 
@@ -509,6 +530,51 @@ pub fn shape_rects(
 mod tests {
     use super::*;
     use crate::skin::parse::SkinDef;
+
+    #[test]
+    fn sat_i32_clamps() {
+        assert_eq!(sat_i32(i64::MAX), i32::MAX);
+        assert_eq!(sat_i32(i64::MIN), i32::MIN);
+        assert_eq!(sat_i32(-5), -5);
+    }
+
+    #[test]
+    fn pxrect_intersect_and_contains_saturate() {
+        let big = PxRect { x: i32::MAX, y: i32::MAX, w: i32::MAX, h: i32::MAX };
+        let win = PxRect { x: 0, y: 0, w: 800, h: 600 };
+        let r = big.intersect(&win);
+        assert_eq!((r.w, r.h), (0, 0));
+        let wide = PxRect { x: i32::MIN, y: i32::MIN, w: i32::MAX, h: i32::MAX };
+        let r = wide.intersect(&PxRect { x: i32::MAX - 1, y: 0, w: i32::MAX, h: 10 });
+        assert_eq!(r.w, 0);
+        assert!(!big.contains(5.0, 5.0));
+        assert!(big.contains(i32::MAX as f64, i32::MAX as f64));
+        assert!(!big.contains_px(0, 0));
+        assert!(big.contains_px(i32::MAX, i32::MAX));
+        let neg = PxRect { x: -10, y: -10, w: 20, h: 20 };
+        assert_eq!(neg.intersect(&win), PxRect { x: 0, y: 0, w: 10, h: 10 });
+    }
+
+    #[test]
+    fn resolve_rect_never_wraps() {
+        let ext = [i32::MIN, i32::MIN + 1, -2, -1, 0, 1, i32::MAX - 1, i32::MAX];
+        for &x in &ext {
+            for &w in &ext {
+                for s in [1, 2, 16] {
+                    let r = resolve_rect(&RectDef { x, y: x, w, h: w }, 800, 600, s);
+                    assert!(r.w >= 0 && r.h >= 0, "{x} {w} {s}: {r:?}");
+                }
+            }
+        }
+        // The documented forms still resolve as before.
+        let r = resolve_rect(&RectDef { x: -22, y: 8, w: 14, h: 14 }, 300, 200, 2);
+        assert_eq!(r, PxRect { x: 256, y: 16, w: 28, h: 28 });
+        let r = resolve_rect(&RectDef { x: 10, y: 0, w: -1, h: -4 }, 300, 200, 1);
+        assert_eq!(r, PxRect { x: 10, y: 0, w: 290, h: 196 });
+        // i32::MIN width: a huge margin, so nothing is left.
+        let r = resolve_rect(&RectDef { x: i32::MAX, y: 0, w: i32::MIN, h: 5 }, 800, 600, 1);
+        assert_eq!(r.w, 0);
+    }
 
     fn spec(mode: EdgeMode) -> SliceSpec {
         SliceSpec {
