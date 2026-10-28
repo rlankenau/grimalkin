@@ -200,7 +200,14 @@ Details the format above leaves open, for skin authors:
   mode on Metal). Pixels outside the shape are alpha 0 because the frame is
   the only thing drawn there; terminal content is confined to the viewport.
 * **macOS**: winit has no `drag_resize_window`, so edge/grip resizing is done
-  by hand from pointer motion there.
+  by hand from pointer motion there (`skin/drag.rs`). The direction, pointer,
+  window origin, size and minimum size are latched on press and kept until
+  release; each step is computed from the system's global pointer position
+  (window-local coordinates are unreliable while the window resizes), so the
+  opposite edge stays put and all eight directions work, including left/top
+  (which also move the window origin). A button state that reads "up" or a
+  focus loss ends the drag, and the pointer icon is re-derived from the hit
+  test afterwards. Title-bar moves use winit's `drag_window`, which is native.
 
 ## Testing hooks
 
@@ -210,7 +217,9 @@ Environment variables for frame dumps and automation (`crates/gui/src/debug_scri
 * `GRIMALKIN_DEBUG_SCRIPT="1500:hover:close;800:shade;1000:size:900x500"`
   runs `delay-ms:command` steps through the real input handlers: `move:X,Y`,
   `hover:BUTTON`, `press:BUTTON`, `down`, `up`, `click`, `dblclick`, `shade`,
-  `size:WxH`, `exit`. Combine with `GRIMALKIN_DUMP_FRAME` to inspect each state.
+  `size:WxH`, `exit`. After each step the log (`RUST_LOG=grimalkin=info`) has a
+  `debug script: inner size WxH` line, e.g. a grip drag is
+  `move:1006,587;down;move:1046,617;move:1086,647;up`. Combine with `GRIMALKIN_DUMP_FRAME` to inspect each state.
 * Hot reload: between two skins the window is re-skinned live (a skin read from
   a user directory is re-read on every change under `skins/`); going between
   "no skin" and a skin applies on the next launch.

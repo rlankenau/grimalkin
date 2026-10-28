@@ -33,6 +33,7 @@ use crate::reload::{self, ReloadCtx};
 use crate::theme;
 use crate::renderer::{FrameStatus, Renderer, ViewState};
 use crate::selection::{CellPos, Selection};
+use crate::skin::drag::ResizeDrag;
 use crate::skin::hit::{Hit, ResizeDir};
 use crate::skin::{self, Action, Skin, SkinRuntime};
 use crate::LaunchOptions;
@@ -193,6 +194,7 @@ impl App {
             skin: skin_rt,
             chrome_cursor: false,
             manual_resize: None,
+            scripted_pointer: false,
             pre_shade: None,
             unshade_pending: false,
             window,
@@ -349,7 +351,10 @@ struct Running {
     /// The pointer icon is currently set by the chrome (resize edges, ...).
     chrome_cursor: bool,
     /// Manual edge resize for platforms without `drag_resize_window`.
-    manual_resize: Option<ManualResize>,
+    manual_resize: Option<ResizeDrag>,
+    /// A debug script is driving the pointer: use its window coordinates
+    /// instead of the real (global) pointer for manual resizes.
+    scripted_pointer: bool,
     /// Window size before the windowshade collapsed it.
     pre_shade: Option<PhysicalSize<u32>>,
     /// Un-shading: waiting for the restored size to arrive.
@@ -414,16 +419,6 @@ fn apply_palette(term: &mut Terminal, renderer: &mut Renderer, p: &theme::Palett
         term.set_palette_color(i as u8, c.tuple());
     }
     renderer.set_palette(p);
-}
-
-/// An edge resize driven by pointer motion (macOS has no
-/// `drag_resize_window`).
-#[derive(Clone, Copy)]
-struct ManualResize {
-    dir: ResizeDir,
-    start_screen: (f64, f64),
-    start_pos: PhysicalPosition<i32>,
-    start_size: PhysicalSize<u32>,
 }
 
 impl Drop for Running {
@@ -844,6 +839,9 @@ impl Running {
 
     fn on_focus(&mut self, focused: bool) {
         self.focused = focused;
+        if !focused {
+            self.end_manual_resize();
+        }
         if self.term.focus_reporting() {
             self.send(if focused { b"\x1b[I" } else { b"\x1b[O" });
         }
@@ -1016,6 +1014,12 @@ impl Running {
     /// through the same handlers real input uses.
     fn debug_command(&mut self, cmd: &str) {
         log::info!("debug script: {cmd}");
+        self.debug_command_inner(cmd);
+        let s = self.window.inner_size();
+        log::info!("debug script: inner size {}x{}", s.width, s.height);
+    }
+
+    fn debug_command_inner(&mut self, cmd: &str) {
         let (name, arg) = cmd.split_once(':').unwrap_or((cmd, ""));
         let button_centre = |me: &Self, name: &str| {
             let kind = match name {
@@ -1029,11 +1033,13 @@ impl Running {
         };
         match name {
             "move" => {
+                self.scripted_pointer = true;
                 if let Some((x, y)) = arg.split_once(',').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))) {
                     self.on_cursor_moved(x, y);
                 }
             }
             "hover" | "press" => {
+                self.scripted_pointer = true;
                 if let Some((x, y)) = button_centre(self, arg) {
                     self.on_cursor_moved(x, y);
                     if name == "press" {
@@ -1096,16 +1102,28 @@ impl Running {
     /// Returns true if the pointer motion belongs to the chrome.
     fn skin_pointer_moved(&mut self, x: f64, y: f64) -> bool {
         if self.manual_resize.is_some() {
-            self.manual_resize_to(x, y);
-            return true;
+            // The button is the authority: if the system says it is up (a
+            // mouse-up we never saw), the drag is over.
+            if !self.scripted_pointer && crate::pointer::left_button_down() == Some(false) {
+                self.end_manual_resize();
+            } else {
+                self.manual_resize_to(x, y);
+                return true;
+            }
         }
         let Some(sk) = self.skin.as_mut() else { return false };
-        let redraw = sk.pointer_moved(x, y);
+        let (redraw, icon) = sk.hover_cursor(x, y);
         let hit = sk.hover();
-        let icon = sk.cursor_for(hit);
         if redraw {
             self.window.request_redraw();
         }
+        self.apply_chrome_cursor(icon);
+        // A selection drag that wandered over the frame keeps going.
+        hit != Hit::Viewport && !self.left_down
+    }
+
+    /// Show the chrome's icon, or give the pointer back to the viewport.
+    fn apply_chrome_cursor(&mut self, icon: Option<CursorIcon>) {
         match icon {
             Some(icon) => {
                 self.window.set_cursor(icon);
@@ -1119,13 +1137,27 @@ impl Running {
                 }
             }
         }
-        // A selection drag that wandered over the frame keeps going.
-        hit != Hit::Viewport && !self.left_down
+    }
+
+    /// The manual resize is over (button released, focus lost, ...): drop the
+    /// latched state and put the pointer icon back to what is under it.
+    fn end_manual_resize(&mut self) {
+        if self.manual_resize.take().is_none() {
+            return;
+        }
+        let (x, y) = self.mouse_px;
+        let icon = self.skin.as_mut().and_then(|sk| sk.hover_cursor(x, y).1);
+        self.apply_chrome_cursor(icon);
+        self.window.request_redraw();
     }
 
     /// Returns true if the left-button event belongs to the chrome.
     fn skin_mouse_button(&mut self, pressed: bool) -> bool {
         let (x, y) = self.mouse_px;
+        if !pressed && self.manual_resize.is_some() {
+            self.end_manual_resize();
+            return true;
+        }
         let Some(sk) = self.skin.as_mut() else { return false };
         let action = if pressed {
             if sk.hit_at(x, y) == Hit::Viewport {
@@ -1133,9 +1165,6 @@ impl Running {
             }
             sk.press(x, y, Instant::now())
         } else {
-            if self.manual_resize.take().is_some() {
-                return true;
-            }
             if sk.pressed_button().is_none() {
                 return false;
             }
@@ -1187,65 +1216,56 @@ impl Running {
         }
     }
 
+    /// The pointer on the screen, physical pixels. The system's global
+    /// position when there is one: window-local coordinates are re-derived
+    /// against a frame that is changing during the drag and cannot be trusted
+    /// for it. Falls back to the window position plus the local position.
     fn screen_pointer(&self, local: (f64, f64)) -> Option<(f64, f64)> {
+        if !self.scripted_pointer {
+            if let Some((gx, gy)) = crate::pointer::global_position() {
+                let k = self.window.scale_factor();
+                return Some((gx * k, gy * k));
+            }
+        }
         let p = self.window.inner_position().ok()?;
         Some((p.x as f64 + local.0, p.y as f64 + local.1))
     }
 
+    /// Latch a pointer-driven resize (platforms without `drag_resize_window`).
+    /// The direction, pointer anchor, window origin and size are captured
+    /// here and kept until the button is released.
     fn start_manual_resize(&mut self, dir: ResizeDir) {
-        let Some(start_screen) = self.screen_pointer(self.mouse_px) else { return };
-        let Ok(start_pos) = self.window.inner_position() else { return };
-        self.manual_resize = Some(ManualResize {
-            dir,
-            start_screen,
-            start_pos,
-            start_size: self.window.inner_size(),
-        });
+        let Some(anchor) = self.screen_pointer(self.mouse_px) else { return };
+        let Ok(origin) = self.window.outer_position() else { return };
+        let size = self.window.inner_size();
+        let min = self.skin_min_size().unwrap_or(PhysicalSize::new(64, 64));
+        log::debug!("manual resize {dir:?} start: size {}x{} origin {},{}", size.width, size.height, origin.x, origin.y);
+        let drag = ResizeDrag::begin(dir, anchor, (origin.x, origin.y), (size.width, size.height), (min.width, min.height));
+        self.manual_resize = Some(drag);
+        // Keep the resize icon for the whole drag, wherever the pointer goes.
+        let icon = self.skin.as_ref().and_then(|sk| sk.cursor_for(Hit::ResizeEdge(drag.dir())));
+        self.apply_chrome_cursor(icon);
     }
 
     fn manual_resize_to(&mut self, x: f64, y: f64) {
         let Some(m) = self.manual_resize else { return };
-        let Some((sx, sy)) = self.screen_pointer((x, y)) else { return };
-        let (dx, dy) = (sx - m.start_screen.0, sy - m.start_screen.1);
-        let min = self.skin_min_size().unwrap_or(PhysicalSize::new(64, 64));
-        let (west, east) = (
-            matches!(m.dir, ResizeDir::W | ResizeDir::NW | ResizeDir::SW),
-            matches!(m.dir, ResizeDir::E | ResizeDir::NE | ResizeDir::SE),
-        );
-        let (north, south) = (
-            matches!(m.dir, ResizeDir::N | ResizeDir::NW | ResizeDir::NE),
-            matches!(m.dir, ResizeDir::S | ResizeDir::SW | ResizeDir::SE),
-        );
-        let (sw, sh) = (m.start_size.width as f64, m.start_size.height as f64);
-        let mut w = sw;
-        let mut h = sh;
-        if east {
-            w = sw + dx;
-        } else if west {
-            w = sw - dx;
+        let Some(pointer) = self.screen_pointer((x, y)) else { return };
+        let (pos, (w, h)) = m.target(pointer);
+        let size = PhysicalSize::new(w, h);
+        if self.window.inner_size() != size {
+            // Resize first, then put the frame where the drag says it belongs:
+            // AppKit keeps the bottom-left corner fixed on a resize, which
+            // would otherwise make the top edge (and so the pointer position
+            // relative to the window) slide with every step.
+            if let Some(s) = self.window.request_inner_size(size) {
+                self.renderer.resize(s.width, s.height);
+                self.apply_grid_resize();
+                self.skin_geometry_changed();
+                self.window.request_redraw();
+            }
         }
-        if south {
-            h = sh + dy;
-        } else if north {
-            h = sh - dy;
-        }
-        let w = w.max(min.width as f64).round() as u32;
-        let h = h.max(min.height as f64).round() as u32;
-        let mut pos = m.start_pos;
-        if west {
-            pos.x += m.start_size.width as i32 - w as i32;
-        }
-        if north {
-            pos.y += m.start_size.height as i32 - h as i32;
-        }
-        if pos != m.start_pos {
-            self.window.set_outer_position(pos);
-        }
-        if let Some(size) = self.window.request_inner_size(PhysicalSize::new(w, h)) {
-            self.renderer.resize(size.width, size.height);
-            self.apply_grid_resize();
-            self.skin_geometry_changed();
-            self.window.request_redraw();
+        if self.window.outer_position().is_ok_and(|p| (p.x, p.y) != pos) {
+            self.window.set_outer_position(PhysicalPosition::new(pos.0, pos.1));
         }
     }
 

@@ -12,6 +12,7 @@
 //! titlebar double-click, and which window action a click means.
 
 pub mod chrome;
+pub mod drag;
 pub mod hit;
 pub mod parse;
 pub mod win;
@@ -406,6 +407,14 @@ impl SkinRuntime {
         changed
     }
 
+    /// Update the hover state for a pointer at (x, y) and return the icon the
+    /// pointer should show (`None`: the viewport decides). Call whenever no
+    /// chrome drag is in progress, so the icon always follows the hit test.
+    pub fn hover_cursor(&mut self, x: f64, y: f64) -> (bool, Option<CursorIcon>) {
+        let redraw = self.pointer_moved(x, y);
+        (redraw, self.cursor_for(self.hover))
+    }
+
     pub fn pointer_left(&mut self) -> bool {
         let was = matches!(self.hover, Hit::Button(_));
         self.hover = Hit::Outside;
@@ -601,6 +610,22 @@ mod tests {
         assert!(rt.pointer_moved(cx, cy));
         assert!(!rt.pointer_moved(cx + 1.0, cy));
         assert!(rt.pointer_moved(100.0, 100.0));
+    }
+
+    #[test]
+    fn cursor_follows_the_hit_test_after_an_edge_drag() {
+        let mut rt = SkinRuntime::new(Arc::new(debug()), (300, 200), 1);
+        let t0 = Instant::now();
+        // Hover, press and drag the west edge: the resize icon shows.
+        assert_eq!(rt.hover_cursor(1.0, 100.0).1, Some(CursorIcon::WResize));
+        assert_eq!(rt.press(1.0, 100.0, t0), Some(Action::DragResize(ResizeDir::W)));
+        // The drag ends on the title bar: release, and the very next hover
+        // there must show the plain icon, not the stale resize one.
+        assert_eq!(rt.release(100.0, 8.0), None);
+        assert_eq!(rt.hover_cursor(100.0, 8.0).1, Some(CursorIcon::Default));
+        // And back over an edge, then the corner grip/zone, then the viewport.
+        assert_eq!(rt.hover_cursor(1.0, 100.0).1, Some(CursorIcon::WResize));
+        assert_eq!(rt.hover_cursor(150.0, 100.0).1, None);
     }
 
     #[test]

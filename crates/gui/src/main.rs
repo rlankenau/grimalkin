@@ -25,6 +25,7 @@ mod graphics_glue;
 mod images;
 mod input;
 mod links;
+mod pointer;
 mod reload;
 mod renderer;
 mod selection;
