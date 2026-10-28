@@ -29,6 +29,8 @@ use crate::config::{Config, CursorShapeCfg};
 use crate::graphics_glue::Graphics;
 use crate::input::{self, EncodeState, KeyAction, KeyInput, MouseBtn, MouseEvent, MouseKind, ZoomOp};
 use crate::links;
+use crate::reload::{self, ReloadCtx};
+use crate::theme;
 use crate::renderer::{FrameStatus, Renderer, ViewState};
 use crate::selection::{CellPos, Selection};
 use crate::LaunchOptions;
@@ -41,6 +43,8 @@ pub enum UserEvent {
     /// Something outside the loop (another thread, a timer) wants a redraw.
     #[allow(dead_code)] // sent by future background work (image decoding, ...)
     Redraw,
+    /// The config file or a user theme changed on disk (debounced).
+    ConfigChanged,
 }
 
 /// Max bytes of pty output processed per wake so input and redraws stay
@@ -78,7 +82,10 @@ impl App {
     }
 
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<Running, String> {
-        let cfg = &self.cfg;
+        // The theme's font/cursor settings are folded into the effective config.
+        let resolved = theme::resolve(&self.cfg);
+        let palette = resolved.palette;
+        let cfg = &resolved.config;
         let mut attrs = Window::default_attributes()
             .with_title(cfg.window.title.as_str())
             .with_inner_size(LogicalSize::new(900.0, 600.0))
@@ -98,6 +105,7 @@ impl App {
         }
 
         let mut renderer = Renderer::new(window.clone(), cfg)?;
+        renderer.set_palette(&palette);
         // Size the window for the configured grid now that the cell size is known.
         let (w, h) = renderer.surface_size_for(cfg.window.cols as usize, cfg.window.rows as usize);
         if let Some(size) = window.request_inner_size(PhysicalSize::new(w, h)) {
@@ -109,12 +117,7 @@ impl App {
         let (cols, rows) = renderer.grid_size();
 
         let mut term = Terminal::new(cols, rows, cfg.scrollback_lines);
-        let fg = cfg.colors.foreground.tuple();
-        let bg = cfg.colors.background.tuple();
-        term.set_default_colors(fg, bg, Some(cfg.colors.cursor.tuple()));
-        for (i, c) in cfg.colors.palette16().iter().enumerate() {
-            term.set_palette_color(i as u8, c.tuple());
-        }
+        apply_palette(&mut term, &mut renderer, &palette);
         let (cw, ch) = renderer.cell_size_px();
         term.set_cell_pixel_size(cw, ch);
 
@@ -177,6 +180,16 @@ impl App {
             redraw_retry: None,
             retries: 0,
             cfg: cfg.clone(),
+            reload: ReloadCtx {
+                path: self.launch.config_path.clone(),
+                theme_override: self.launch.theme.clone(),
+                _watcher: {
+                    let proxy = self.proxy.clone();
+                    reload::watch(self.launch.config_path.as_deref(), move || {
+                        let _ = proxy.send_event(UserEvent::ConfigChanged);
+                    })
+                },
+            },
             proxy: self.proxy.clone(),
             wake_pending: self.wake_pending.clone(),
             exit_requested: false,
@@ -207,6 +220,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::PtyWake => r.on_pty_wake(),
             UserEvent::Redraw => r.window.request_redraw(),
+            UserEvent::ConfigChanged => r.reload_config(),
         }
         if r.exit_requested {
             event_loop.exit();
@@ -304,9 +318,20 @@ struct Running {
     /// Consecutive `FrameStatus::Retry` results.
     retries: u8,
     cfg: Config,
+    reload: ReloadCtx,
     proxy: EventLoopProxy<UserEvent>,
     wake_pending: Arc<AtomicBool>,
     exit_requested: bool,
+}
+
+/// Push a resolved theme into the terminal (default colors + ANSI palette)
+/// and the renderer (selection, cursor text, link colors).
+fn apply_palette(term: &mut Terminal, renderer: &mut Renderer, p: &theme::Palette) {
+    term.set_default_colors(p.foreground.tuple(), p.background.tuple(), p.cursor.map(|c| c.tuple()));
+    for (i, c) in p.ansi.iter().enumerate() {
+        term.set_palette_color(i as u8, c.tuple());
+    }
+    renderer.set_palette(p);
 }
 
 impl Drop for Running {
@@ -480,6 +505,51 @@ impl Running {
                 clamp16(rows as u64 * ch as u64),
             );
         }
+    }
+
+    /// The config file or a theme changed: re-read it and apply the theme,
+    /// colors, font and cursor settings without restarting. A file that does
+    /// not parse is reported and the running settings stay.
+    fn reload_config(&mut self) {
+        let mut raw = match Config::try_load(self.reload.path.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("config reload failed, keeping current settings: {e}");
+                return;
+            }
+        };
+        if let Some(t) = &self.reload.theme_override {
+            raw.theme = t.clone();
+        }
+        let resolved = theme::resolve(&raw);
+        log::info!("config reloaded (theme: {})", resolved.name);
+        apply_palette(&mut self.term, &mut self.renderer, &resolved.palette);
+        let new = resolved.config;
+        let old = std::mem::replace(&mut self.cfg, new);
+        let new = &self.cfg;
+
+        let font_changed = new.font.family != old.font.family
+            || new.font.line_height != old.font.line_height
+            || new.font.size != old.font.size;
+        let padding_changed = new.window.padding != old.window.padding;
+        if font_changed {
+            // A zoomed window keeps its zoom unless the configured size changed.
+            let pt = if new.font.size != old.font.size { new.font.size } else { self.font_pt };
+            self.font_pt = pt;
+            self.renderer.set_font(&new.font.family, pt, new.font.line_height);
+        }
+        if padding_changed {
+            self.renderer.set_scale_factor(self.window.scale_factor(), new.window.padding);
+        }
+        if font_changed || padding_changed {
+            let s = self.window.inner_size();
+            if s.width > 0 && s.height > 0 {
+                self.renderer.resize(s.width, s.height);
+            }
+            self.apply_grid_resize();
+        }
+        self.renderer.invalidate();
+        self.window.request_redraw();
     }
 
     fn zoom(&mut self, op: ZoomOp) {

@@ -38,20 +38,46 @@ title = "grimalkin"
 # Follow window titles set by programs (OSC 0/2).
 dynamic_title = true
 
+# Color theme: a built-in name (run `grimalkin --list-themes`: default,
+# catppuccin-mocha, dracula, gruvbox-dark, solarized-light, nord, tokyo-night)
+# or a file of your own. Themes are looked up in
+#   <config dir>/grimalkin/themes/NAME.toml   (grimalkin format, see below)
+#   <config dir>/grimalkin/themes/NAME.conf   (kitty format: drop in any theme
+#                                              from kitty-themes)
+# and then among the built-ins. `grimalkin --theme NAME` overrides this.
+# The config file is watched: saving it (or a theme file) re-applies the theme,
+# colors and font without restarting.
+theme = "default"
+
+# Per-key overrides applied on top of the theme. Everything is optional; the
+# values shown are those of the "default" theme.
 [colors]
 foreground = "#dddddd"
 background = "#000000"
 cursor = "#cccccc"
-selection_bg = "#fffacd"
-selection_fg = "#000000"
-# The 16 ANSI colors: black, red, green, yellow, blue, magenta, cyan, white,
-# then the bright variants. A shorter list overrides only the first entries.
-ansi = [
-  "#000000", "#cc0403", "#19cb00", "#cecb00",
-  "#0d73cc", "#cb1ed1", "#0dcdcd", "#dddddd",
-  "#767676", "#f2201f", "#23fd00", "#fffd00",
-  "#1a8fff", "#fd28ff", "#14ffff", "#ffffff",
-]
+cursor_text = "#000000"            # text under a block cursor (default: background)
+selection_background = "#fffacd"   # alias: selection_bg
+selection_foreground = "#000000"   # alias: selection_fg
+url = "#0d73cc"                    # underline color of a hovered link (default: text color)
+# The 16 ANSI colors, by name (or color0 .. color15):
+# black, red, green, yellow, blue, magenta, cyan, white, bright_black, ...
+red = "#cc0403"
+# or as a list: a shorter list overrides only the first entries.
+# ansi = ["#000000", "#cc0403", "#19cb00", "#cecb00", "#0d73cc", "#cb1ed1",
+#         "#0dcdcd", "#dddddd", "#767676", "#f2201f", "#23fd00", "#fffd00",
+#         "#1a8fff", "#fd28ff", "#14ffff", "#ffffff"]
+
+# A theme file (themes/NAME.toml) has the same [colors] table plus a name and
+# optional [font] (family, size, line_height) and [cursor] (shape, blink)
+# tables. When a theme sets those, they replace the ones in this file:
+#
+#   name = "Catppuccin Mocha"
+#   [colors]
+#   foreground = "#cdd6f4"
+#   background = "#1e1e2e"
+#   ...
+#   [font]
+#   family = ["JetBrains Mono"]
 
 [cursor]
 # "block", "underline" or "bar". Programs can change this at runtime (DECSCUSR).

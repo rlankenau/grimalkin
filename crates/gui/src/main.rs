@@ -7,6 +7,7 @@
 //!   `boxdraw` procedural box/block characters
 //! * `input`         keyboard/wheel encoding, mouse + kitty keyboard hooks
 //! * `selection`     text selection; `links` hyperlink detection; `bell` audible bell
+//! * `theme`         color themes (TOML + kitty .conf); `reload` config hot-reload
 //! * `graphics_glue` kitty graphics protocol glue (stub)
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -21,9 +22,11 @@ mod graphics_glue;
 mod images;
 mod input;
 mod links;
+mod reload;
 mod renderer;
 mod selection;
 mod terminfo;
+mod theme;
 
 use std::path::PathBuf;
 
@@ -39,6 +42,8 @@ pub struct LaunchOptions {
     pub command: Option<Vec<String>>,
     pub config_path: Option<PathBuf>,
     pub working_directory: Option<PathBuf>,
+    /// `--theme NAME`: overrides `theme` in the config file (also on reload).
+    pub theme: Option<String>,
 }
 
 pub enum Parsed {
@@ -55,6 +60,8 @@ Options:
   -e, --command CMD [ARGS...]   Run CMD instead of the shell (consumes the rest of the arguments)
       --config PATH             Use this config file
       --working-directory DIR   Start in DIR
+      --theme NAME              Use this color theme (see --list-themes)
+      --list-themes             List the available themes and exit
   -h, --help                    Show this help
   -V, --version                 Show the version
 ";
@@ -87,6 +94,11 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Parsed {
                 Some(p) => opts.working_directory = Some(PathBuf::from(p)),
                 None => return Parsed::Error("--working-directory requires a path".into()),
             },
+            "--theme" => match inline.or_else(|| it.next()) {
+                Some(n) => opts.theme = Some(n),
+                None => return Parsed::Error("--theme requires a name".into()),
+            },
+            "--list-themes" => return Parsed::Info(theme::list_text(theme::user_dir().as_deref())),
             other => return Parsed::Error(format!("unknown argument {other:?}")),
         }
     }
@@ -107,7 +119,10 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let config = Config::load(opts.config_path.as_deref());
+    let mut config = Config::load(opts.config_path.as_deref());
+    if let Some(t) = &opts.theme {
+        config.theme = t.clone();
+    }
 
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(l) => l,
@@ -156,5 +171,22 @@ mod tests {
         assert!(matches!(parse_args(args(&["--bogus"])), Parsed::Error(_)));
         assert!(matches!(parse_args(args(&["-e"])), Parsed::Error(_)));
         assert!(matches!(parse_args(args(&["--help"])), Parsed::Info(_)));
+    }
+
+    #[test]
+    fn parses_theme_flags() {
+        match parse_args(args(&["--theme", "nord"])) {
+            Parsed::Run(o) => assert_eq!(o.theme.as_deref(), Some("nord")),
+            _ => panic!(),
+        }
+        match parse_args(args(&["--theme=dracula", "-e", "ls"])) {
+            Parsed::Run(o) => assert_eq!(o.theme.as_deref(), Some("dracula")),
+            _ => panic!(),
+        }
+        assert!(matches!(parse_args(args(&["--theme"])), Parsed::Error(_)));
+        match parse_args(args(&["--list-themes"])) {
+            Parsed::Info(s) => assert!(s.lines().any(|l| l == "nord")),
+            _ => panic!(),
+        }
     }
 }
