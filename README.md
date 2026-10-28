@@ -52,11 +52,33 @@ cargo run --release -p grimalkin -- [OPTIONS] [-e COMMAND [ARGS...]]
 
 The release binary is `target/release/grimalkin`.
 
-On Windows the release build is a GUI-subsystem executable, but it attaches to
-the parent console on start, so `--help`, `--list-themes`, `--list-skins`,
-`--install-skin` and error messages print in PowerShell/cmd (followed by a
-blank line, since the shell has already drawn its next prompt). Launched from
-Explorer there is no parent console and no console window appears.
+### Windows: two files
+
+The Windows release is two files that belong in the same folder:
+
+- `grimalkin.exe` is the GUI-subsystem terminal. Double-click it (or a
+  shortcut to it) to open a window; no console window appears.
+- `grimalkin.com` is a tiny console-subsystem launcher (built from
+  `crates/launcher` as `grimalkin-launcher.exe` and renamed). cmd and
+  PowerShell resolve a bare `grimalkin` to the `.com` before the `.exe`, so
+  from a shell `grimalkin ...` runs the launcher, which starts `grimalkin.exe`
+  from its own folder with the identical command line, waits for it and exits
+  with its exit code. Output (`--help`, `--list-themes`, `--list-skins`,
+  `--install-skin`, errors) therefore prints before the next prompt, and
+  `$LASTEXITCODE` / `%ERRORLEVEL%` are set. The old workarounds
+  (`grimalkin --list-skins | Out-Host`, `start /wait grimalkin ...`) are no
+  longer needed with the `.com` present. Ctrl+C is left to the child.
+
+Without `grimalkin.com`, `grimalkin.exe` still attaches to the parent console
+to print, but the shell does not wait for it (the prompt redraws over the
+output and exit codes are not set).
+
+The optional `conpty.dll` and `OpenConsole.exe` (newer ConPTY) go in this same
+folder, next to both files, as before.
+
+When building yourself: `cargo build --release -p grimalkin -p grimalkin-launcher`,
+then copy `target/release/grimalkin-launcher.exe` to `grimalkin.com` beside
+`grimalkin.exe`.
 
 ## Configuration
 

@@ -1,0 +1,14 @@
+[package]
+name = "grimalkin-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Console-subsystem launcher (shipped as grimalkin.com) that runs grimalkin.exe and waits for it"
+
+[[bin]]
+name = "grimalkin-launcher"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Environment"] }

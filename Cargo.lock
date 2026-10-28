@@ -889,6 +889,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "grimalkin-launcher"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "grimalkin-pty"
 version = "0.1.0"
 dependencies = [
