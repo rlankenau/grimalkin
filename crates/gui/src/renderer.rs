@@ -144,6 +144,10 @@ pub struct ViewState<'a> {
     pub cursor_on: bool,
     pub cursor_shape: grimalkin_vt::CursorShape,
     pub selection: &'a Selection,
+    /// Link under the pointer while the link modifier is held (underlined).
+    pub hover: Option<&'a crate::links::LinkSpan>,
+    /// Visual bell strength, 0.0 (off) to 1.0.
+    pub flash: f32,
 }
 
 #[derive(Debug)]
@@ -777,6 +781,64 @@ impl Renderer {
         self.row_cache[r] = out;
     }
 
+    /// Per-frame overlays drawn on top of the cached rows: the visual bell
+    /// flash, the hovered link underline and the "scrolled back" indicator.
+    /// Appends to the cursor instance lists (rebuilt every frame).
+    fn build_overlay(&mut self, term: &Terminal, view: &ViewState) {
+        let m = self.glyphs.metrics;
+        let (cw, chh) = (m.cell_w as f32, m.cell_h as f32);
+        let colors = term.colors();
+        let (fg, bg) = (colors.foreground, colors.background);
+        let (vw, vh) = (self.surface_config.width as f32, self.surface_config.height as f32);
+
+        if view.flash > 0.0 {
+            let a = (view.flash.clamp(0.0, 1.0) * 70.0) as u8;
+            self.cur_rect.push(rect(0.0, 0.0, vw, vh, fg, a, KIND_SOLID));
+        }
+
+        if let Some(link) = view.hover {
+            let t = (m.underline_thickness as f32).max(1.0);
+            for &(r, c0, c1) in &link.segments {
+                if r >= term.rows() || c0 >= term.cols() {
+                    continue;
+                }
+                let cell = &term.visible_row(r).cells[c0];
+                let c = if cell.flags.contains(Flags::INVERSE) {
+                    colors.resolve(cell.bg, bg)
+                } else {
+                    colors.resolve(cell.fg, fg)
+                };
+                let x = self.pad as f32 + c0 as f32 * cw;
+                let y = self.pad as f32 + r as f32 * chh + m.underline_y as f32;
+                self.cur_rect
+                    .push(rect(x, y, (c1 - c0 + 1) as f32 * cw, t, c, 255, KIND_SOLID));
+            }
+        }
+
+        let off = term.display_offset();
+        if off > 0 {
+            let text = format!("scrolled back {off} lines");
+            let n = text.chars().count() as f32;
+            let pad_x = (cw * 0.6).round();
+            let w = n * cw + 2.0 * pad_x;
+            let x = (vw - self.pad as f32 - w).max(0.0);
+            let y = self.pad as f32;
+            self.cur_rect
+                .push(rect(x, y, w, chh, mix(bg, fg, 0.22), 235, KIND_SOLID));
+            let gpu = Gpu {
+                device: &self.device,
+                queue: &self.queue,
+            };
+            for (i, ch) in text.chars().enumerate() {
+                if ch == ' ' {
+                    continue;
+                }
+                let quads = self.glyphs.lookup(&gpu, ch, &[], 0, false);
+                push_glyphs(quads, x + pad_x + i as f32 * cw, y, fg, &mut self.cur_mask, &mut self.cur_color);
+            }
+        }
+    }
+
     fn build_cursor(&mut self, term: &Terminal, view: &ViewState) {
         self.cur_rect.clear();
         self.cur_mask.clear();
@@ -861,6 +923,7 @@ impl Renderer {
         let damage = term.take_damage();
         self.update_rows(term, &damage, view);
         self.build_cursor(term, view);
+        self.build_overlay(term, view);
         {
             let dev = &self.device;
             let q = &self.queue;

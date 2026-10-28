@@ -216,12 +216,54 @@ impl Default for InputConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
+pub struct BellConfig {
+    /// Flash the window briefly when a program rings the bell.
+    pub visual: bool,
+    /// Duration of the flash in milliseconds.
+    pub visual_ms: u32,
+    /// Play the system alert sound.
+    pub audible: bool,
+}
+
+impl Default for BellConfig {
+    fn default() -> Self {
+        BellConfig {
+            visual: true,
+            visual_ms: 150,
+            audible: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    /// Let programs set the clipboard with OSC 52.
+    pub osc52_write: bool,
+    /// Let programs read the clipboard with OSC 52 (off by default: any
+    /// program in the terminal, including remote ones, could read it).
+    pub osc52_read: bool,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        ClipboardConfig {
+            osc52_write: true,
+            osc52_read: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub font: FontConfig,
     pub window: WindowConfig,
     pub colors: ColorsConfig,
     pub cursor: CursorConfig,
     pub input: InputConfig,
+    pub bell: BellConfig,
+    pub clipboard: ClipboardConfig,
     pub scrollback_lines: usize,
     /// Program to run; empty means the user's default shell.
     pub shell: String,
@@ -236,6 +278,8 @@ impl Default for Config {
             colors: ColorsConfig::default(),
             cursor: CursorConfig::default(),
             input: InputConfig::default(),
+            bell: BellConfig::default(),
+            clipboard: ClipboardConfig::default(),
             scrollback_lines: 10_000,
             shell: String::new(),
             shell_args: Vec::new(),

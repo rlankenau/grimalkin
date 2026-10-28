@@ -869,9 +869,10 @@ fn text_bytes(text: Option<&str>, alt: bool) -> Option<Vec<u8>> {
     Some(v)
 }
 
-/// Bytes to send for a paste. Newlines become CR (what Enter sends); in
-/// bracketed mode the text is wrapped and any embedded ESC is removed so the
-/// pasted text cannot end the bracket early.
+/// Bytes to send for a paste. Newlines become CR (what Enter sends). Control
+/// characters other than tab and newline (ESC, Ctrl+C, the C1 range, ...) are
+/// dropped so pasted text cannot inject key presses or end the bracketed
+/// paste early; in bracketed mode the text is wrapped in the paste markers.
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let mut s = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -884,7 +885,8 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
                 s.push('\r');
             }
             '\n' => s.push('\r'),
-            '\x1b' if bracketed => {}
+            '\t' => s.push('\t'),
+            c if c.is_control() => {}
             _ => s.push(c),
         }
     }
@@ -1036,6 +1038,9 @@ mod tests {
     fn paste() {
         assert_eq!(paste_bytes("a\nb\r\nc", false), b"a\rb\rc");
         assert_eq!(paste_bytes("hi\x1b[201~x", true), b"\x1b[200~hi[201~x\x1b[201~");
+        // Control characters never reach the program, bracketed or not.
+        assert_eq!(paste_bytes("a\x1b[31m\x03\x7fb\u{9b}c\td", false), b"a[31mbc\td");
+        assert_eq!(paste_bytes("a\r\rb", false), b"a\r\rb");
     }
 
     #[test]
