@@ -65,6 +65,35 @@ fn family_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error>
     })
 }
 
+/// Read an integer setting, clamping instead of failing when it is negative
+/// or too large for the field (`cols = 100000`, `scrollback_lines = -1`).
+/// Out-of-range values are fixed up further by [`Config::sanitize`]; a value
+/// that is not a number at all is still an error.
+fn lenient_uint<'de, D: Deserializer<'de>>(d: D, max: u64, what: &str) -> Result<u64, D::Error> {
+    let v = f64::deserialize(d)?;
+    if v.is_nan() {
+        log::warn!("config: {what} is not a number; ignoring");
+        return Ok(0);
+    }
+    let clamped = v.max(0.0).min(max as f64) as u64;
+    if clamped as f64 != v.trunc() {
+        log::warn!("config: {what} = {v} is out of range; using {clamped}");
+    }
+    Ok(clamped)
+}
+
+fn lenient_u16<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+    lenient_uint(d, u16::MAX as u64, "window size").map(|v| v as u16)
+}
+
+fn lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    lenient_uint(d, u32::MAX as u64, "duration").map(|v| v as u32)
+}
+
+fn lenient_usize<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    lenient_uint(d, u32::MAX as u64, "scrollback_lines").map(|v| v as usize)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CursorShapeCfg {
@@ -111,7 +140,9 @@ fn default_families() -> Vec<String> {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct WindowConfig {
+    #[serde(deserialize_with = "lenient_u16")]
     pub cols: u16,
+    #[serde(deserialize_with = "lenient_u16")]
     pub rows: u16,
     /// Padding around the cell grid, in logical pixels.
     pub padding: f32,
@@ -200,6 +231,7 @@ pub struct BellConfig {
     /// Flash the window briefly when a program rings the bell.
     pub visual: bool,
     /// Duration of the flash in milliseconds.
+    #[serde(deserialize_with = "lenient_u32")]
     pub visual_ms: u32,
     /// Play the system alert sound.
     pub audible: bool,
@@ -318,6 +350,7 @@ pub struct Config {
     pub bell: BellConfig,
     pub clipboard: ClipboardConfig,
     pub pty: PtyConfig,
+    #[serde(deserialize_with = "lenient_usize")]
     pub scrollback_lines: usize,
     /// Window skin (docs/SKINS.md): a name from `<config_dir>/grimalkin/skins/`
     /// or the built-ins, a directory path, or `"none"` for the normal OS
@@ -421,24 +454,45 @@ impl Config {
         Ok(c)
     }
 
-    /// Clamp values to something the renderer can work with.
+    /// Clamp values to something the renderer can work with, warning about
+    /// each one that had to change (the rest of the file stays in force).
     pub fn sanitize(&mut self) {
-        self.font.size = if self.font.size.is_finite() { self.font.size.clamp(4.0, 200.0) } else { 13.0 };
-        self.font.line_height = if self.font.line_height.is_finite() {
-            self.font.line_height.clamp(0.5, 3.0)
-        } else {
-            1.0
-        };
-        self.window.opacity = if self.window.opacity.is_finite() { self.window.opacity.clamp(0.0, 1.0) } else { 1.0 };
-        self.window.padding = if self.window.padding.is_finite() { self.window.padding.clamp(0.0, 200.0) } else { 4.0 };
-        self.window.cols = self.window.cols.clamp(2, 1000);
-        self.window.rows = self.window.rows.clamp(1, 1000);
-        self.scrollback_lines = self.scrollback_lines.min(1_000_000);
+        fn fix(name: &str, v: &mut f32, lo: f32, hi: f32, fallback: f32) {
+            let new = if v.is_finite() { v.clamp(lo, hi) } else { fallback };
+            if new != *v && !(v.is_nan() && new.is_nan()) {
+                log::warn!("config: {name} = {v} is outside {lo}..={hi}; using {new}");
+            }
+            *v = new;
+        }
+        fix("font.size", &mut self.font.size, 4.0, 200.0, 13.0);
+        fix("font.line_height", &mut self.font.line_height, 0.5, 3.0, 1.0);
+        fix("window.opacity", &mut self.window.opacity, 0.0, 1.0, 1.0);
+        fix("window.padding", &mut self.window.padding, 0.0, 200.0, 4.0);
+        let (cols, rows) = (self.window.cols, self.window.rows);
+        self.window.cols = cols.clamp(2, 1000);
+        self.window.rows = rows.clamp(1, 1000);
+        if (cols, rows) != (self.window.cols, self.window.rows) {
+            log::warn!(
+                "config: window size {cols}x{rows} is outside 2x1..=1000x1000; using {}x{}",
+                self.window.cols,
+                self.window.rows
+            );
+        }
+        if self.scrollback_lines > MAX_SCROLLBACK_LINES {
+            log::warn!(
+                "config: scrollback_lines = {} is too large; using {MAX_SCROLLBACK_LINES}",
+                self.scrollback_lines
+            );
+            self.scrollback_lines = MAX_SCROLLBACK_LINES;
+        }
         if self.font.family.is_empty() {
             self.font.family = default_families();
         }
     }
 }
+
+/// Upper bound for `scrollback_lines`.
+pub const MAX_SCROLLBACK_LINES: usize = 1_000_000;
 
 #[cfg(test)]
 mod tests {
@@ -538,8 +592,41 @@ mod tests {
     }
 
     #[test]
-    fn bad_color_is_error() {
-        assert!(Config::from_toml("[colors]\nforeground = \"nope\"").is_err());
+    fn bad_color_only_loses_that_key() {
+        let c = Config::from_toml(
+            "scrollback_lines = 77\n[colors]\nforeground = \"nope\"\nbackground = \"#102030\"\nansi = [\"#000001\", \"zzz\", \"#000003\"]\ncursor = [\"#000000\"]\nurl = 5\n[cursor]\nshape = \"bar\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.colors.foreground, None);
+        assert_eq!(c.colors.background, Some(Rgb(0x10, 0x20, 0x30)));
+        assert_eq!(c.colors.ansi[0], Some(Rgb(0, 0, 1)));
+        assert_eq!(c.colors.ansi[1], None);
+        assert_eq!(c.colors.ansi[2], Some(Rgb(0, 0, 3)));
+        assert_eq!(c.colors.cursor, None);
+        assert_eq!(c.colors.url, None);
+        // Everything else in the file is kept.
+        assert_eq!(c.scrollback_lines, 77);
+        assert_eq!(c.cursor.shape, CursorShapeCfg::Bar);
+    }
+
+    #[test]
+    fn toml_syntax_error_is_still_whole_file_error() {
+        assert!(Config::from_toml("[colors\nforeground = ").is_err());
+        assert!(Config::from_toml("scrollback_lines = \"lots\"").is_err());
+    }
+
+    #[test]
+    fn absurd_integers_are_clamped_not_rejected() {
+        let c = Config::from_toml(
+            "scrollback_lines = -4\n[window]\ncols = 100000\nrows = -2\n[bell]\nvisual_ms = 99999999999\n[font]\nsize = 1e9\n",
+        )
+        .unwrap();
+        assert_eq!(c.scrollback_lines, 0);
+        assert_eq!((c.window.cols, c.window.rows), (1000, 1));
+        assert_eq!(c.bell.visual_ms, u32::MAX);
+        assert_eq!(c.font.size, 200.0);
+        let c = Config::from_toml("scrollback_lines = 9223372036854775807").unwrap();
+        assert_eq!(c.scrollback_lines, 1_000_000);
     }
 
     #[test]

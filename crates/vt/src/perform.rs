@@ -552,6 +552,8 @@ impl Perform for Terminal {
                 self.clip_selection = if sel.is_empty() { "c".into() } else { sel };
                 if params[2] == b"?" {
                     self.events.push(TermEvent::ClipboardQuery);
+                } else if params[2].len() > MAX_CLIPBOARD_B64 {
+                    // Refuse oversized writes without decoding them.
                 } else if let Some(bytes) = util::base64_decode(params[2]) {
                     self.events.push(TermEvent::ClipboardSet(
                         String::from_utf8_lossy(&bytes).into_owned(),

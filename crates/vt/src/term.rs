@@ -224,7 +224,18 @@ pub(crate) struct KbState {
 pub(crate) const KB_STACK_LIMIT: usize = 16;
 /// Synchronized output (mode 2026) is force-ended after this long.
 pub(crate) const SYNC_TIMEOUT: Duration = Duration::from_secs(1);
-const MAX_APC: usize = 64 * 1024 * 1024;
+/// Hard cap on the accumulated body of any OSC/DCS/APC/SOS/PM string. Longer
+/// strings are discarded whole. (Graphics chunks are <= 4 KiB by protocol and
+/// the largest legitimate OSC is a clipboard write, capped below this.)
+/// Largest OSC 52 clipboard write (decoded bytes) accepted.
+pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+/// Base64 length corresponding to [`MAX_CLIPBOARD_BYTES`].
+pub(crate) const MAX_CLIPBOARD_B64: usize = MAX_CLIPBOARD_BYTES.div_ceil(3) * 4;
+/// Maximum combining marks stored per cell; extras are dropped (kitty: 8).
+pub const MAX_COMBINING: usize = 8;
+pub const MAX_STRING_BODY: usize = 2 * 1024 * 1024;
+/// After a string longer than this, buffers are reallocated to free memory.
+const STRING_SHRINK_THRESHOLD: usize = 64 * 1024;
 pub(crate) const MAX_HYPERLINKS: usize = 1 << 17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +244,16 @@ enum ApcState {
     Esc,
     Apc,
     ApcEsc,
+    /// Inside an OSC/DCS/SOS/PM string (vte parses it; we only bound it).
+    Str,
+    StrEsc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrKind {
+    Osc,
+    Apc,
+    Other,
 }
 
 /// The terminal emulator state machine.
@@ -240,7 +261,9 @@ pub struct Terminal {
     parser: Option<vte::Parser>,
     apc: ApcState,
     apc_buf: Vec<u8>,
-    apc_overflow: bool,
+    str_kind: StrKind,
+    str_len: usize,
+    str_overflow: bool,
 
     pub(crate) main: Grid,
     pub(crate) alt: Grid,
@@ -300,7 +323,9 @@ impl Terminal {
             parser: Some(vte::Parser::new()),
             apc: ApcState::Ground,
             apc_buf: Vec::new(),
-            apc_overflow: false,
+            str_kind: StrKind::Other,
+            str_len: 0,
+            str_overflow: false,
             main: Grid::new(cols, rows, sb),
             alt: Grid::new(cols, rows, 0),
             active: Screen::Main,
@@ -346,6 +371,13 @@ impl Terminal {
     // ------------------------------------------------------------------
 
     /// Feed bytes received from the pty.
+    ///
+    /// A thin pre-scanner sits in front of `vte`: it tracks string sequences
+    /// (OSC, DCS, SOS, PM and APC), bounds how many body bytes any of them may
+    /// accumulate ([`MAX_STRING_BODY`]) and, for APC, collects the payload
+    /// itself (vte has no APC callback). A string that exceeds the bound is
+    /// discarded: vte's parser (and its internal buffers) is replaced and the
+    /// remaining bytes are swallowed up to the terminator, never printed.
     pub fn advance(&mut self, bytes: &[u8]) {
         self.check_sync_timeout(SYNC_TIMEOUT);
         let mut parser = self.parser.take().unwrap_or_default();
@@ -369,7 +401,16 @@ impl Terminal {
                         seg = i;
                         self.apc = ApcState::Apc;
                         self.apc_buf.clear();
-                        self.apc_overflow = false;
+                        self.str_kind = StrKind::Apc;
+                        self.str_len = 0;
+                        self.str_overflow = false;
+                    }
+                    b']' | b'P' | b'X' | b'^' => {
+                        self.str_kind = if b == b']' { StrKind::Osc } else { StrKind::Other };
+                        self.str_len = 0;
+                        self.str_overflow = false;
+                        self.apc = ApcState::Str;
+                        i += 1;
                     }
                     0x1b => i += 1,
                     _ => {
@@ -383,13 +424,14 @@ impl Terminal {
                         0x18 | 0x1a => {
                             // CAN / SUB abort the string.
                             parser.advance(self, &[b]);
+                            self.end_string_buffers();
                             self.apc = ApcState::Ground;
                         }
                         _ => {
-                            if self.apc_buf.len() < MAX_APC {
+                            if self.apc_buf.len() < MAX_STRING_BODY {
                                 self.apc_buf.push(b);
                             } else {
-                                self.apc_overflow = true;
+                                self.str_overflow = true;
                             }
                         }
                     }
@@ -399,11 +441,11 @@ impl Terminal {
                 ApcState::ApcEsc => {
                     if b == b'\\' {
                         let buf = std::mem::take(&mut self.apc_buf);
-                        if !self.apc_overflow && buf.first() == Some(&b'G') {
+                        if !self.str_overflow && buf.first() == Some(&b'G') {
                             self.events
                                 .push(TermEvent::GraphicsCommand(buf[1..].to_vec()));
                         }
-                        self.apc_overflow = false;
+                        self.end_string_buffers();
                         // Let vte leave its APC state.
                         parser.advance(self, &[0x1b, b'\\']);
                         self.apc = ApcState::Ground;
@@ -411,10 +453,78 @@ impl Terminal {
                         seg = i;
                     } else {
                         // ESC aborted the APC and starts a new sequence.
-                        self.apc_buf.clear();
+                        self.end_string_buffers();
                         parser.advance(self, &[0x1b]);
                         self.apc = ApcState::Esc;
                         seg = i; // reprocess `b` in Esc state
+                    }
+                }
+                ApcState::Str => {
+                    // Inside an OSC/DCS/SOS/PM string. Bytes reach vte
+                    // untouched (via `seg`) until the bound is exceeded.
+                    let terminates = match b {
+                        0x1b => {
+                            self.apc = ApcState::StrEsc;
+                            false
+                        }
+                        0x18 | 0x1a => true,
+                        0x07 => self.str_kind == StrKind::Osc,
+                        _ => false,
+                    };
+                    if terminates {
+                        if self.str_overflow {
+                            seg = i + 1; // parser already reset; swallow
+                        } else {
+                            parser.advance(self, &bytes[seg..=i]);
+                            seg = i + 1;
+                            self.finish_string(&mut parser);
+                        }
+                        self.apc = ApcState::Ground;
+                        self.str_overflow = false;
+                        self.str_len = 0;
+                    } else if self.apc == ApcState::Str {
+                        self.str_len = self.str_len.saturating_add(1);
+                        if self.str_overflow {
+                            seg = i + 1;
+                        } else if self.str_len > MAX_STRING_BODY {
+                            // Too long: drop everything vte has accumulated
+                            // and swallow the rest of the string.
+                            self.str_overflow = true;
+                            parser = vte::Parser::default();
+                            seg = i + 1;
+                        }
+                    } else if self.str_overflow {
+                        seg = i + 1; // the ESC of a possible ST
+                    }
+                    i += 1;
+                }
+                ApcState::StrEsc => {
+                    if b == b'\\' {
+                        if self.str_overflow {
+                            seg = i + 1;
+                        } else {
+                            parser.advance(self, &bytes[seg..=i]);
+                            seg = i + 1;
+                            self.finish_string(&mut parser);
+                        }
+                        self.apc = ApcState::Ground;
+                        self.str_overflow = false;
+                        self.str_len = 0;
+                        i += 1;
+                    } else if b == 0x1b {
+                        if self.str_overflow {
+                            seg = i + 1;
+                        }
+                        i += 1;
+                    } else {
+                        // The ESC aborted the string and starts a sequence.
+                        if self.str_overflow {
+                            self.str_overflow = false;
+                            parser.advance(self, &[0x1b]);
+                            seg = i;
+                        }
+                        self.apc = ApcState::Esc;
+                        // reprocess `b` in Esc state
                     }
                 }
             }
@@ -424,6 +534,39 @@ impl Terminal {
         }
         self.parser = Some(parser);
         self.update_cursor_damage();
+    }
+
+    /// A bounded string just ended normally; give memory back if it was big.
+    fn finish_string(&mut self, parser: &mut vte::Parser) {
+        if self.str_len > STRING_SHRINK_THRESHOLD {
+            *parser = vte::Parser::default();
+        }
+        self.str_len = 0;
+    }
+
+    /// An APC string ended (any way); release oversized buffers.
+    fn end_string_buffers(&mut self) {
+        self.apc_buf.clear();
+        if self.apc_buf.capacity() > STRING_SHRINK_THRESHOLD {
+            self.apc_buf = Vec::new();
+        }
+        self.str_overflow = false;
+    }
+
+    /// Body bytes held for the string sequence currently being parsed
+    /// (never more than [`MAX_STRING_BODY`]). Test/diagnostic hook.
+    #[cfg(test)]
+    pub(crate) fn string_bytes_buffered(&self) -> usize {
+        match self.apc {
+            ApcState::Apc | ApcState::ApcEsc => self.apc_buf.len(),
+            _ if self.str_overflow => 0,
+            _ => self.str_len.min(MAX_STRING_BODY),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn string_buffer_capacity(&self) -> usize {
+        self.apc_buf.capacity()
     }
 
     /// Drain bytes the terminal wants written back to the pty.
@@ -1077,6 +1220,10 @@ impl Terminal {
         s.push(c);
         if s.graphemes(true).count() != 1 {
             return false;
+        }
+        if cell.combining.len() >= MAX_COMBINING {
+            // Joins the cluster but the cell is full: drop the extra mark.
+            return true;
         }
         let was_wide = cell.is_wide();
         let cluster_w = s.width();

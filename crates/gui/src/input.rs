@@ -888,10 +888,18 @@ fn text_bytes(text: Option<&str>, alt: bool) -> Option<Vec<u8>> {
     Some(v)
 }
 
-/// Bytes to send for a paste. Newlines become CR (what Enter sends). Control
-/// characters other than tab and newline (ESC, Ctrl+C, the C1 range, ...) are
-/// dropped so pasted text cannot inject key presses or end the bracketed
-/// paste early; in bracketed mode the text is wrapped in the paste markers.
+/// Bytes to send for a paste. Newlines (`\r\n`, `\n`, `\r`) become CR, what
+/// Enter sends.
+///
+/// Unbracketed (the program has not enabled mode 2004): the text goes straight
+/// to the program as if typed, so everything that could act as a command is
+/// dropped: all C0 controls except tab and CR, ESC, DEL, the C1 range
+/// (0x80-0x9f) and the Unicode line/paragraph separators U+2028/2029.
+///
+/// Bracketed: like kitty, the text is passed through (the program asked for
+/// the markers and treats the content as data) except that the end marker is
+/// removed, repeatedly, so pasted text cannot close the paste early and
+/// smuggle in keystrokes. NUL is dropped as well.
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let mut s = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -905,18 +913,27 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
             }
             '\n' => s.push('\r'),
             '\t' => s.push('\t'),
+            '\0' => {}
+            _ if bracketed => s.push(c),
+            '\u{2028}' | '\u{2029}' => {}
             c if c.is_control() => {}
             _ => s.push(c),
         }
     }
-    if bracketed {
-        let mut v = b"\x1b[200~".to_vec();
-        v.extend_from_slice(s.as_bytes());
-        v.extend_from_slice(b"\x1b[201~");
-        v
-    } else {
-        s.into_bytes()
+    if !bracketed {
+        return s.into_bytes();
     }
+    // Removing one occurrence can splice a new one together
+    // ("\x1b[20\x1b[201~1~"), so repeat until none is left.
+    for end in ["\x1b[201~", "\u{9b}201~"] {
+        while s.contains(end) {
+            s = s.replace(end, "");
+        }
+    }
+    let mut v = b"\x1b[200~".to_vec();
+    v.extend_from_slice(s.as_bytes());
+    v.extend_from_slice(b"\x1b[201~");
+    v
 }
 
 /// The arrow key sequences sent for wheel scrolling in the alternate screen:
@@ -1064,10 +1081,36 @@ mod tests {
     #[test]
     fn paste() {
         assert_eq!(paste_bytes("a\nb\r\nc", false), b"a\rb\rc");
-        assert_eq!(paste_bytes("hi\x1b[201~x", true), b"\x1b[200~hi[201~x\x1b[201~");
-        // Control characters never reach the program, bracketed or not.
-        assert_eq!(paste_bytes("a\x1b[31m\x03\x7fb\u{9b}c\td", false), b"a[31mbc\td");
         assert_eq!(paste_bytes("a\r\rb", false), b"a\r\rb");
+        assert_eq!(paste_bytes("a\n\nb", false), b"a\r\rb");
+    }
+
+    #[test]
+    fn paste_unbracketed_strips_controls() {
+        // ESC, other C0, DEL, C1 and line/paragraph separators are dropped.
+        assert_eq!(paste_bytes("a\x1b[31m\x03\x7fb\u{9b}c\td", false), b"a[31mbc\td");
+        assert_eq!(paste_bytes("x\x1b]0;evil\x07y", false), b"x]0;evily");
+        assert_eq!(paste_bytes("x\x1b_Gq\x1b\\y\x1bPz\x1b\\", false), b"x_Gq\\yPz\\");
+        assert_eq!(paste_bytes("a\u{2028}b\u{2029}c\u{85}d\0e", false), b"abcde");
+        // Ordinary non-ASCII text survives.
+        assert_eq!(paste_bytes("h\u{e9}llo \u{4e16}", false), "h\u{e9}llo \u{4e16}".as_bytes());
+    }
+
+    #[test]
+    fn paste_bracketed_keeps_text_but_not_the_terminator() {
+        assert_eq!(paste_bytes("hi", true), b"\x1b[200~hi\x1b[201~");
+        assert_eq!(paste_bytes("hi\x1b[201~x", true), b"\x1b[200~hix\x1b[201~");
+        // Splicing trick: removing the inner marker must not create a new one.
+        assert_eq!(
+            paste_bytes("a\x1b[20\x1b[201~1~b", true),
+            b"\x1b[200~ab\x1b[201~"
+        );
+        // Other escape sequences and newlines pass through (kitty behaviour).
+        assert_eq!(
+            paste_bytes("a\x1b[31mb\nc\x1b[200~", true),
+            b"\x1b[200~a\x1b[31mb\rc\x1b[200~\x1b[201~"
+        );
+        assert_eq!(paste_bytes("a\u{9b}201~b", true), b"\x1b[200~ab\x1b[201~");
     }
 
     #[test]

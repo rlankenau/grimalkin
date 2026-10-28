@@ -753,7 +753,15 @@ impl Running {
                 }
                 TermEvent::ClipboardSet(text) => {
                     if self.cfg.clipboard.osc52_write {
-                        self.set_clipboard(text);
+                        if text.len() > grimalkin_vt::MAX_CLIPBOARD_BYTES {
+                            log::warn!(
+                                "OSC 52: rejecting clipboard write of {} bytes (limit {})",
+                                text.len(),
+                                grimalkin_vt::MAX_CLIPBOARD_BYTES
+                            );
+                        } else {
+                            self.set_clipboard(text);
+                        }
                     }
                 }
                 TermEvent::ClipboardQuery => {
