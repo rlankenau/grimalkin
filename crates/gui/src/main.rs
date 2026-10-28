@@ -51,6 +51,10 @@ pub struct LaunchOptions {
     pub theme: Option<String>,
     /// Window skin given with `--skin` (overrides the config file).
     pub skin: Option<String>,
+    /// `--install-skin PATH_OR_URL`: install a WinAMP `.wsz` and exit.
+    pub install_skin: Option<String>,
+    /// `--force`: let `--install-skin` overwrite an installed skin.
+    pub force: bool,
 }
 
 pub enum Parsed {
@@ -69,7 +73,11 @@ Options:
       --working-directory DIR   Start in DIR
       --theme NAME              Use this color theme (see --list-themes)
       --list-themes             List the available themes and exit
-      --skin NAME               Use the window skin NAME (none = normal window)
+      --skin NAME               Use the window skin NAME (none = normal window;
+                                winamp:NAME or a .wsz path for a WinAMP skin)
+      --list-skins              List the built-in and installed skins and exit
+      --install-skin SRC        Install a WinAMP .wsz (file path or https URL) and exit
+      --force                   Overwrite an already installed skin
   -h, --help                    Show this help
   -V, --version                 Show the version
 ";
@@ -110,6 +118,12 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Parsed {
                 Some(n) => opts.theme = Some(n),
                 None => return Parsed::Error("--theme requires a name".into()),
             },
+            "--install-skin" => match inline.or_else(|| it.next()) {
+                Some(s) => opts.install_skin = Some(s),
+                None => return Parsed::Error("--install-skin requires a path or URL".into()),
+            },
+            "--force" => opts.force = true,
+            "--list-skins" => return Parsed::Info(skin::winamp::install::list_text(skin::user_skin_dir().as_deref())),
             "--list-themes" => return Parsed::Info(theme::list_text(theme::user_dir().as_deref())),
             other => return Parsed::Error(format!("unknown argument {other:?}")),
         }
@@ -131,6 +145,9 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(src) = &opts.install_skin {
+        std::process::exit(skin::winamp::install::run(src, opts.force));
+    }
     let mut config = Config::load(opts.config_path.as_deref());
     if let Some(t) = &opts.theme {
         config.theme = t.clone();
@@ -188,6 +205,26 @@ mod tests {
             _ => panic!(),
         }
         assert!(matches!(parse_args(args(&["--skin"])), Parsed::Error(_)));
+    }
+
+    #[test]
+    fn parses_skin_install_and_list_flags() {
+        match parse_args(args(&["--install-skin", "a.wsz", "--force"])) {
+            Parsed::Run(o) => {
+                assert_eq!(o.install_skin.as_deref(), Some("a.wsz"));
+                assert!(o.force);
+            }
+            _ => panic!(),
+        }
+        match parse_args(args(&["--install-skin=https://x/y.wsz"])) {
+            Parsed::Run(o) => assert_eq!(o.install_skin.as_deref(), Some("https://x/y.wsz")),
+            _ => panic!(),
+        }
+        assert!(matches!(parse_args(args(&["--install-skin"])), Parsed::Error(_)));
+        match parse_args(args(&["--list-skins"])) {
+            Parsed::Info(s) => assert!(s.lines().any(|l| l == "llama")),
+            _ => panic!(),
+        }
     }
 
     #[test]

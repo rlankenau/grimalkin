@@ -98,6 +98,12 @@ maximize = { rect = { x = -76, y = 8, w = 14, h = 14 }, sprite = [42, 0] }
 grip = { x = -20, y = -20, w = 20, h = 20 }   # drag to resize; plus edges of
 border = 6                                    # `border` px around the frame
 
+# Optional picture in the titlebar, cut from the buttons sheet (WinAMP's baked-in
+# title art uses this); centred in the titlebar rect, not drawn on the shade bar:
+#   [titlebar]  image = { sprite = [0, 27], size = [100, 20], align = "center" }
+# A button may use a different sprite while the window is shaded:
+#   shade = { rect = {...}, sprite = [9, 0], shaded_sprite = [18, 0] }
+
 [shade]                                       # optional windowshade layout
 image = "shade.png"                           # a thin bar; same titlebar/buttons rules
 height = 14
@@ -208,6 +214,13 @@ Details the format above leaves open, for skin authors:
   (which also move the window origin). A button state that reads "up" or a
   focus loss ends the drag, and the pointer icon is re-derived from the hit
   test afterwards. Title-bar moves use winit's `drag_window`, which is native.
+
+* **WinAMP skins**: `skin = "winamp:NAME"`, a path to a `.wsz`, or a folder with
+  `pledit.bmp` is built in memory by `skin/winamp.rs` into the same structures,
+  see `WINAMP_SKINS.md`. Their `viewport_inset` is smaller than the 9-slice caps
+  (the viewport is drawn over the left and right columns); for the engine only
+  the viewport must contain the centre patch, i.e. each inset is at most the
+  matching slice.
 
 ## Testing hooks
 

@@ -218,6 +218,31 @@ impl Fonts {
     }
 }
 
+/// Is a monospaced font of family `name` installed? Used to decide whether a
+/// WinAMP skin's `Font=` hint may become the terminal font (a proportional
+/// face such as Arial would wreck the cell grid). Uses the font index when it
+/// is current, so only the matching font files are opened.
+pub fn monospace_family_installed(name: &str) -> bool {
+    let mono = |db: &Database| {
+        db.faces()
+            .any(|f| f.monospaced && f.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)))
+    };
+    let stamps = dir_stamps();
+    if let Some(index) = read_index(&stamps) {
+        let mut db = Database::new();
+        for (path, names) in &index.files {
+            if names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                let _ = db.load_font_file(path);
+            }
+        }
+        return mono(&db);
+    }
+    let mut db = Database::new();
+    db.load_system_fonts();
+    write_index(&stamps, &db);
+    mono(&db)
+}
+
 fn locale_of_default() -> String {
     sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string())
 }

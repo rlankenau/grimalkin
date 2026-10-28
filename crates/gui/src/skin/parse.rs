@@ -101,12 +101,25 @@ impl Default for TextDef {
     }
 }
 
+/// A picture in the titlebar (sprite in the buttons sheet), e.g. WinAMP's
+/// baked-in "WINAMP PLAYLIST EDITOR" art. Not drawn on the shade bar.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TitleImageDef {
+    /// Top-left of the sprite in the buttons sheet.
+    pub sprite: [u32; 2],
+    /// Sprite size in skin pixels.
+    pub size: [u32; 2],
+    pub align: Align,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct TitlebarDef {
     pub rect: RectDef,
     pub double_click: DoubleClick,
     pub text: Option<TextDef>,
+    pub image: Option<TitleImageDef>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -115,6 +128,8 @@ pub struct ButtonDef {
     /// Top-left of the "normal" sprite in the sheet; hover and pressed are
     /// stacked below it, each `rect.h` apart.
     pub sprite: [u32; 2],
+    /// Sprite to use instead while the window is shaded (optional).
+    pub shaded_sprite: Option<[u32; 2]>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
