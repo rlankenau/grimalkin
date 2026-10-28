@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 fn main() {
+    embed_windows_resources();
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let skins = manifest.join("assets").join("skins");
     println!("cargo:rerun-if-changed=assets/skins");
@@ -41,4 +42,31 @@ fn main() {
     out.push_str("];\n");
     let dest = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("builtin_skins.rs");
     std::fs::write(dest, out).expect("write builtin_skins.rs");
+}
+
+/// Windows only: embeds the app icon and version info (FileVersion,
+/// ProductName, ...) into `grimalkin.exe` through `winresource`, which drives
+/// the resource compiler (`rc.exe` from the Windows SDK on MSVC). The check is
+/// on the *target* OS, not the host, so macOS/Linux builds never touch it.
+fn embed_windows_resources() {
+    println!("cargo:rerun-if-changed=../../assets/icon/grimalkin.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let icon = manifest.join("..").join("..").join("assets").join("icon").join("grimalkin.ico");
+    let version = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon(&icon.to_string_lossy())
+        .set("ProductName", "Grimalkin")
+        .set("FileDescription", "Grimalkin terminal emulator")
+        .set("InternalName", "grimalkin")
+        .set("OriginalFilename", "grimalkin.exe")
+        .set("FileVersion", &version)
+        .set("ProductVersion", &version)
+        .set("LegalCopyright", "Copyright (C) Grimalkin contributors. MIT OR Apache-2.0");
+    if let Err(e) = res.compile() {
+        // Fail loudly: a silently icon-less release exe is worse than a red build.
+        panic!("embedding Windows resources failed: {e}");
+    }
 }

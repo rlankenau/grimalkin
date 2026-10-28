@@ -25,6 +25,7 @@ mod debug_script;
 mod fonts;
 mod glyphs;
 mod graphics_glue;
+mod icon;
 mod images;
 mod input;
 mod links;

@@ -328,6 +328,21 @@ Tested facts (Windows 10, ConPTY package 1.25):
 - `viu`'s kitty auto-detection hangs on Windows in any terminal (a bug in
   viuer's input parsing); `viu -b` (block mode) works.
 
+## App icon
+
+The pixel-art cat lives in `assets/icon/`: `grimalkin-<size>.png` (16 to 1024),
+`grimalkin.ico` (16 to 256, PNG entries, Windows Vista+) and `grimalkin.icns`
+(macOS, for the `.app` bundle). They are generated, byte-for-byte reproducibly,
+by `python3 scripts/gen-icon.py` (pure Python; the `.icns` step needs macOS
+`iconutil`, pass `--no-icns` to skip it).
+
+On Windows, `crates/gui/build.rs` and `crates/launcher/build.rs` embed the `.ico`
+plus version info (ProductName, FileVersion from the crate version, ...) into
+`grimalkin.exe` and `grimalkin.com` through the `winresource` crate (needs
+`rc.exe`, which the MSVC toolchain provides); CI checks the result. On Windows
+and Linux the window icon is also set at runtime from the 64 px PNG
+(`crates/gui/src/icon.rs`).
+
 ## Crate layout
 
 - `crates/vt` (`grimalkin-vt`): terminal state machine, no I/O or GUI
