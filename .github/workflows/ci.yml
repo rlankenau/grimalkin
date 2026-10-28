@@ -190,7 +190,10 @@ jobs:
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           foreach ($name in 'grimalkin.exe', 'grimalkin.com') {
             $path = (Resolve-Path "dist/$name").Path
-            $icons = [IconProbe]::ExtractIconEx($path, -1, $null, $null, 0)
+            # ExtractIconEx keys off the extension (.com is treated as a DOS program), so probe a .exe copy.
+            $probe = Join-Path $env:RUNNER_TEMP "probe-$name.exe"
+            Copy-Item $path $probe -Force
+            $icons = [IconProbe]::ExtractIconEx($probe, -1, $null, $null, 0)
             $info = (Get-Item $path).VersionInfo
             Write-Host "$name icons=$icons product=$($info.ProductName) file=$($info.FileVersion) desc=$($info.FileDescription)"
             if ($icons -lt 1) { throw "$name has no embedded icon" }
