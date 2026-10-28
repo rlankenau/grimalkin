@@ -124,10 +124,14 @@ Download `grimalkin-<version>-macos-arm64.dmg` (Apple Silicon) or
 `grimalkin-<version>-macos-x86_64.dmg` (Intel) from the latest release or the
 CI artifacts, open it and drag `grimalkin.app` onto the Applications shortcut.
 
-The app is ad-hoc signed but not notarized (there is no Apple Developer ID
-behind it), so Gatekeeper blocks the first launch. Either right-click the app
-in Applications, choose Open, then Open again in the dialog (once is enough),
-or clear the quarantine flag from a terminal:
+Release builds are signed with a Developer ID and notarized by Apple, so the
+app opens normally with no Gatekeeper warning.
+
+A build you make from source (or a CI artifact from a fork or pull request,
+which has no signing secrets) is only ad-hoc signed and not notarized, so
+Gatekeeper blocks the first launch. Either right-click the app in
+Applications, choose Open, then Open again in the dialog (once is enough), or
+clear the quarantine flag from a terminal:
 
 ```
 xattr -d com.apple.quarantine /Applications/grimalkin.app
@@ -135,7 +139,34 @@ xattr -d com.apple.quarantine /Applications/grimalkin.app
 
 When started from Finder the shell opens in your home directory. To build the
 app and dmg yourself run `scripts/make-app-bundle.sh` (output in `dist/`;
-options `--target`, `--binary`, `--no-dmg`).
+options `--target`, `--binary`, `--no-dmg`, `--no-notarize`; `--help` lists the
+signing variables). It signs with the first "Developer ID Application"
+identity in your keychain (or `GRIMALKIN_SIGN_IDENTITY`; `-` forces ad-hoc) and,
+if `GRIMALKIN_NOTARY_PROFILE` names a `notarytool` keychain profile, notarizes
+and staples both the app and the dmg:
+
+```
+xcrun notarytool store-credentials grimalkin --apple-id you@example.com \
+    --team-id TEAMID --password <app-specific-password>
+GRIMALKIN_NOTARY_PROFILE=grimalkin scripts/make-app-bundle.sh
+```
+
+### Release signing setup
+
+The `macos bundle` CI job signs and notarizes when these repository secrets
+exist (Settings > Secrets and variables > Actions). With any of them missing it
+builds ad-hoc signed as before.
+
+| Secret | What it is |
+| --- | --- |
+| `MACOS_CERT_P12_BASE64` | Developer ID Application certificate and private key as base64 `.p12`. In Keychain Access export it (File > Export Items, format .p12), then `base64 -i cert.p12 \| pbcopy`. |
+| `MACOS_CERT_PASSWORD` | The password you chose when exporting the `.p12`. |
+| `NOTARY_KEY_P8_BASE64` | App Store Connect API key (Users and Access > Integrations > App Store Connect API, a team key), the downloaded `AuthKey_XXXX.p8` as base64: `base64 -i AuthKey_XXXX.p8 \| pbcopy`. |
+| `NOTARY_KEY_ID` | That key's Key ID. |
+| `NOTARY_ISSUER_ID` | The Issuer ID shown above the key list. |
+
+The certificate secrets alone give a signed (not notarized) build; notarization
+needs all three `NOTARY_*` secrets.
 
 ## Configuration
 
