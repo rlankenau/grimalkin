@@ -1119,6 +1119,8 @@ dependencies = [
  "sys-locale",
  "toml",
  "toml_edit",
+ "unicode-segmentation",
+ "unicode-width",
  "ureq",
  "wgpu 29.0.4",
  "wgpu 30.0.1",

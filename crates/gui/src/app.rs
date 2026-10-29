@@ -299,7 +299,7 @@ impl App {
         let palette = skin_palette(resolved.palette, &self.cfg, skin.as_deref());
         let cfg = &resolved.config;
         let mut attrs = Window::default_attributes()
-            .with_title(cfg.window.title.as_str())
+            .with_title(sanitize_title(&cfg.window.title))
             .with_inner_size(LogicalSize::new(900.0, 600.0))
             .with_window_icon(crate::icon::window_icon())
             .with_visible(false);
@@ -402,7 +402,7 @@ impl App {
 
         let font_pt = cfg.font.size;
         let mut running = Running {
-            title: cfg.window.title.clone(),
+            title: sanitize_title(&cfg.window.title),
             skin: skin_rt,
             chrome_cursor: false,
             manual_resize: None,
@@ -413,6 +413,9 @@ impl App {
             term,
             pty,
             rx,
+            more_output: false,
+            pty_wake_requested: false,
+            occluded: false,
             writer,
             gfx: Graphics::with_cursor_moves(cfg.pty.graphics_cursor.follows_protocol_here()),
             clipboard: None,
@@ -429,7 +432,6 @@ impl App {
             bell_until: None,
             mouse_inside: false,
             pointer_cursor: false,
-            cursor_shape_event: None,
             blink_epoch: Instant::now(),
             blink_deadline: None,
             sync_poll: None,
@@ -506,7 +508,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            UserEvent::PtyWake => r.on_pty_wake(),
+            // Only noted here; the drain itself runs from `about_to_wait`. winit
+            // (macOS) keeps taking user events until its queue is empty, and a
+            // reader that posts a new wake per chunk would keep it there for
+            // as long as the flood lasts, starving window events (close, keys).
+            UserEvent::PtyWake => r.pty_wake_requested = true,
             UserEvent::Redraw => r.window.request_redraw(),
             UserEvent::ConfigChanged => {
                 r.reload_config();
@@ -562,7 +568,12 @@ impl ApplicationHandler<UserEvent> for App {
                 r.window.request_redraw();
             }
             WindowEvent::RedrawRequested => r.redraw(),
-            WindowEvent::Occluded(false) => r.window.request_redraw(),
+            WindowEvent::Occluded(o) => {
+                r.occluded = o;
+                if !o {
+                    r.window.request_redraw();
+                }
+            }
             WindowEvent::Focused(f) => r.on_focus(f),
             WindowEvent::ModifiersChanged(m) => r.on_modifiers(m.state()),
             WindowEvent::CursorLeft { .. } => r.on_cursor_left(),
@@ -588,6 +599,17 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Continue a budget-limited output drain, one budget per loop turn,
+        // after the OS events of this turn were handled.
+        if let Some(r) = self.running.as_mut() {
+            if r.more_output || std::mem::take(&mut r.pty_wake_requested) {
+                r.on_pty_wake();
+                if r.exit_requested {
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
         let now = Instant::now();
         let mut next = self.running.as_mut().and_then(|r| r.poll_timers(now));
         for w in self.secondary.values() {
@@ -596,6 +618,10 @@ impl ApplicationHandler<UserEvent> for App {
                 Some(t) => next = Some(next.map_or(t, |n| n.min(t))),
                 None => {}
             }
+        }
+        if self.running.as_ref().is_some_and(|r| r.more_output) {
+            event_loop.set_control_flow(ControlFlow::Poll);
+            return;
         }
         match next {
             Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
@@ -625,6 +651,14 @@ struct Running {
     term: Terminal,
     pty: Pty,
     rx: Receiver<PtyEvent>,
+    /// Output queued between the pty reader and `rx` (throttles the child).
+    /// The last drain stopped at its budget with output still queued; the
+    /// loop continues it from `about_to_wait` after handling other events.
+    more_output: bool,
+    /// The window is occluded or minimised (nothing is drawn).
+    occluded: bool,
+    /// A `PtyWake` arrived; drained on the next `about_to_wait`.
+    pty_wake_requested: bool,
     writer: PtyWriter,
     gfx: Graphics,
     clipboard: Option<arboard::Clipboard>,
@@ -646,8 +680,6 @@ struct Running {
     mouse_inside: bool,
     /// The pointer cursor is currently shown for a hovered link.
     pointer_cursor: bool,
-    /// Cursor shape last set by the program (DECSCUSR); `None` = config default.
-    cursor_shape_event: Option<CursorShape>,
     blink_epoch: Instant,
     blink_deadline: Option<Instant>,
     sync_poll: Option<Instant>,
@@ -707,7 +739,7 @@ impl Running {
         self.wake_pending.store(false, Ordering::Release);
         let mut budget = PTY_BUDGET;
         let mut got_output = false;
-        let mut more = false;
+        self.more_output = false;
         loop {
             match self.rx.try_recv() {
                 Ok(PtyEvent::Output(bytes)) => {
@@ -715,7 +747,7 @@ impl Running {
                     got_output = true;
                     budget = budget.saturating_sub(bytes.len());
                     if budget == 0 {
-                        more = true;
+                        self.more_output = true;
                         break;
                     }
                 }
@@ -731,9 +763,9 @@ impl Running {
                 }
             }
         }
-        if more && !self.wake_pending.swap(true, Ordering::AcqRel) {
-            let _ = self.proxy.send_event(UserEvent::PtyWake);
-        }
+        // Not re-posted as an event: the loop would drain its own events
+        // before looking at the OS queue, and a flood would never let a
+        // keypress or the close button through. `about_to_wait` continues.
         if got_output {
             self.after_advance();
         }
@@ -748,7 +780,10 @@ impl Running {
             match ev {
                 TermEvent::Title(t) => {
                     if self.cfg.window.dynamic_title {
-                        let title = if t.is_empty() { self.cfg.window.title.clone() } else { t };
+                        // Sanitised and truncated once, here: the title is
+                        // drawn every frame and handed to the OS.
+                        let t = sanitize_title(&t);
+                        let title = if t.is_empty() { sanitize_title(&self.cfg.window.title) } else { t };
                         self.window.set_title(&title);
                         if self.skin.is_some() && title != self.title {
                             self.title = title;
@@ -792,10 +827,9 @@ impl Running {
                     self.renderer.invalidate();
                     need_redraw = true;
                 }
-                TermEvent::CursorShape(s) => {
-                    self.cursor_shape_event = Some(s);
-                    need_redraw = true;
-                }
+                // The shape/blink are read from the terminal at draw time
+                // (`cursor_shape_override`), so DECSCUSR 0 and RIS undo them.
+                TermEvent::CursorShape(_) => need_redraw = true,
                 // Handled by `Graphics` (graphics_glue.rs) as the bytes are fed.
                 TermEvent::GraphicsCommand(_) => {}
             }
@@ -928,9 +962,9 @@ impl Running {
         }
         // The configured title replaces the shown one only if a program has
         // not set its own.
-        if new.window.title != old.window.title && self.title == old.window.title {
-            self.window.set_title(&new.window.title);
-            self.title = new.window.title.clone();
+        if new.window.title != old.window.title && self.title == sanitize_title(&old.window.title) {
+            self.title = sanitize_title(&new.window.title);
+            self.window.set_title(&self.title);
         }
 
         let font_changed = new.font.family != old.font.family
@@ -999,12 +1033,7 @@ impl Running {
     }
 
     fn zoom(&mut self, op: ZoomOp) {
-        let new = match op {
-            ZoomOp::In => self.font_pt + 1.0,
-            ZoomOp::Out => self.font_pt - 1.0,
-            ZoomOp::Reset => self.cfg.font.size,
-        }
-        .clamp(6.0, 96.0);
+        let new = zoomed_size(self.font_pt, self.cfg.font.size, op);
         if (new - self.font_pt).abs() < f32::EPSILON {
             return;
         }
@@ -1017,7 +1046,7 @@ impl Running {
     // -- drawing -----------------------------------------------------------
 
     fn cursor_blinking(&self) -> bool {
-        self.focused && self.term.cursor_visible() && (self.cfg.cursor.blink || self.term.cursor_blink())
+        self.focused && self.term.cursor_visible() && self.term.cursor_blink_override().unwrap_or(self.cfg.cursor.blink)
     }
 
     fn blink_on(&self, now: Instant) -> bool {
@@ -1033,8 +1062,15 @@ impl Running {
     }
 
     fn redraw(&mut self) {
+        // Nothing can be shown while occluded or minimised, and every frame
+        // uploads buffers that are only released by a submit: skip the frame
+        // and let `Occluded(false)` request a fresh one. The terminal's damage
+        // keeps accumulating, so that frame catches up in one go.
+        if skip_frame(self.occluded, self.shown, self.renderer.is_dumping()) {
+            return;
+        }
         let now = Instant::now();
-        let shape = self.cursor_shape_event.unwrap_or(match self.cfg.cursor.shape {
+        let shape = self.term.cursor_shape_override().unwrap_or(match self.cfg.cursor.shape {
             CursorShapeCfg::Block => CursorShape::Block,
             CursorShapeCfg::Underline => CursorShape::Underline,
             CursorShapeCfg::Bar => CursorShape::Bar,
@@ -1072,6 +1108,10 @@ impl Running {
             // Occluded: wait for WindowEvent::Occluded(false).
             FrameStatus::Occluded => {}
             FrameStatus::Presented => {}
+        }
+        // Glyphs left out to keep this frame short are filled in by the next.
+        if self.renderer.take_followup_frame() {
+            self.window.request_redraw();
         }
         if matches!(status, FrameStatus::Presented | FrameStatus::Occluded) {
             self.retries = 0;
@@ -1311,17 +1351,7 @@ impl Running {
     }
 
     fn on_dropped_file(&mut self, path: PathBuf) {
-        let s = path.to_string_lossy();
-        let quoted: String = s
-            .chars()
-            .flat_map(|c| {
-                if c.is_alphanumeric() || "/._-~:+@%".contains(c) {
-                    vec![c]
-                } else {
-                    vec!['\\', c]
-                }
-            })
-            .collect();
+        let quoted = quote_dropped_path(&path.to_string_lossy(), cfg!(windows));
         self.paste_text(&format!("{quoted} "));
     }
 
@@ -1891,13 +1921,145 @@ mod skin_palette_tests {
     }
 }
 
+/// Whether a redraw request is dropped because the window cannot be seen.
+/// Never before the first frame: the window is created hidden and is only
+/// shown once that frame is drawn.
+fn skip_frame(occluded: bool, shown: bool, dumping: bool) -> bool {
+    occluded && shown && !dumping
+}
+
+#[cfg(test)]
+mod occlusion_tests {
+    use super::skip_frame;
+
+    #[test]
+    fn occluded_windows_skip_frames_but_never_the_first() {
+        // F29: every redraw while occluded queued uploads that were never submitted.
+        assert!(skip_frame(true, true, false));
+        assert!(!skip_frame(true, false, false), "first frame must still be drawn");
+        assert!(!skip_frame(true, true, true), "frame dumps render offscreen");
+        assert!(!skip_frame(false, true, false));
+    }
+}
+
+/// A dropped path as the shell wants to read it. POSIX shells: backslash
+/// before anything unusual. Windows (cmd / PowerShell): backslashes are path
+/// separators, so wrap the path in double quotes when it needs quoting at all
+/// (`"` cannot occur in a Windows path).
+fn quote_dropped_path(s: &str, windows: bool) -> String {
+    if windows {
+        let plain = |c: char| c.is_alphanumeric() || "\\/._-~:+@%".contains(c);
+        return if s.chars().all(plain) { s.to_string() } else { format!("\"{s}\"") };
+    }
+    s.chars()
+        .flat_map(|c| {
+            if c.is_alphanumeric() || "/._-~:+@%".contains(c) {
+                vec![c]
+            } else {
+                vec!['\\', c]
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod drop_quote_tests {
+    use super::quote_dropped_path;
+
+    #[test]
+    fn quoting_matches_the_platform() {
+        // F46: the POSIX quoting doubled backslashes on Windows.
+        assert_eq!(
+            quote_dropped_path("C:\\Users\\Alice\\My Documents\\a.txt", true),
+            "\"C:\\Users\\Alice\\My Documents\\a.txt\""
+        );
+        assert_eq!(quote_dropped_path("C:\\tmp\\a.txt", true), "C:\\tmp\\a.txt");
+        assert_eq!(quote_dropped_path("/home/a b/c(1).txt", false), "/home/a\\ b/c\\(1\\).txt");
+    }
+}
+
+/// Longest window title kept, in chars.
+const MAX_TITLE_CHARS: usize = 512;
+
+/// A title that is safe to show and to hand to the window system: control
+/// characters (C0, DEL, C1), line / paragraph separators and bidirectional
+/// override / isolate marks are dropped (they can spoof or reorder what the
+/// user reads), and the result is cut to [`MAX_TITLE_CHARS`] so a multi-MiB
+/// OSC title costs nothing per frame.
+pub(crate) fn sanitize_title(s: &str) -> String {
+    s.chars()
+        .filter(|&c| {
+            !c.is_control() && !crate::textsafe::is_bidi_or_separator(c) && c != '\u{feff}'
+        })
+        .take(MAX_TITLE_CHARS)
+        .collect()
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    #[test]
+    fn titles_are_stripped_and_bounded() {
+        // F45: bidi override and C1 controls reached set_title unchanged.
+        assert_eq!(sanitize_title("x\u{202e}evil\u{85}\u{2028}\u{9b}31m\x07"), "xevil31m");
+        assert_eq!(sanitize_title("plain \u{4e16}\u{754c}"), "plain \u{4e16}\u{754c}");
+        // F31: a 2 MB title is cut once.
+        let big = "W".repeat(2_000_000);
+        assert_eq!(sanitize_title(&big).chars().count(), MAX_TITLE_CHARS);
+    }
+}
+
+/// The font size after a zoom step. Uses the config's size range so a size
+/// set at either end never jumps the wrong way (it used to clamp to 6..96).
+fn zoomed_size(current: f32, configured: f32, op: ZoomOp) -> f32 {
+    let (lo, hi) = crate::config::FONT_SIZE_RANGE;
+    match op {
+        ZoomOp::In => current + 1.0,
+        ZoomOp::Out => current - 1.0,
+        ZoomOp::Reset => configured,
+    }
+    .clamp(lo, hi)
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    #[test]
+    fn zoom_never_moves_the_wrong_way_at_the_extremes() {
+        // F49: size 4 + zoom out grew to 6; size 200 + zoom in shrank to 96.
+        assert_eq!(zoomed_size(4.0, 13.0, ZoomOp::Out), 4.0);
+        assert_eq!(zoomed_size(200.0, 13.0, ZoomOp::In), 200.0);
+        assert_eq!(zoomed_size(4.0, 13.0, ZoomOp::In), 5.0);
+        assert_eq!(zoomed_size(200.0, 13.0, ZoomOp::Out), 199.0);
+        assert_eq!(zoomed_size(30.0, 4.0, ZoomOp::Reset), 4.0);
+        for pt in [4.0, 5.5, 13.0, 96.0, 150.0, 200.0] {
+            assert!(zoomed_size(pt, 13.0, ZoomOp::In) >= pt);
+            assert!(zoomed_size(pt, 13.0, ZoomOp::Out) <= pt);
+        }
+    }
+}
+
 /// The directory the shell starts in. An explicit `--working-directory` wins.
 /// Otherwise the inherited cwd is kept, except when it is the filesystem root:
 /// that is what a macOS app launched from Finder/Dock/`open` gets (launchd
 /// starts it in `/`), and a terminal that opens in `/` is never what anyone
 /// wants, so fall back to the home directory.
 fn default_cwd(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(w) = cwd_warning(explicit.as_deref()) {
+        log::warn!("{w}");
+    }
     pick_cwd(explicit, std::env::current_dir().ok(), dirs::home_dir())
+}
+
+/// Why an explicit `--working-directory` will not be used, if so.
+fn cwd_warning(explicit: Option<&std::path::Path>) -> Option<String> {
+    let p = explicit.filter(|p| !p.is_dir())?;
+    Some(format!(
+        "--working-directory {} is not a directory; the shell starts in the default location instead",
+        p.display()
+    ))
 }
 
 fn pick_cwd(explicit: Option<PathBuf>, current: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
@@ -1917,6 +2079,14 @@ mod cwd_tests {
 
     fn p(s: &str) -> Option<PathBuf> {
         Some(PathBuf::from(s))
+    }
+
+    #[test]
+    fn unusable_explicit_cwd_is_reported() {
+        // F48: a nonexistent --working-directory fell back to $HOME silently.
+        assert!(super::cwd_warning(Some(std::path::Path::new("/nonexistent/dir/x"))).is_some());
+        assert!(super::cwd_warning(Some(&std::env::temp_dir())).is_none());
+        assert!(super::cwd_warning(None).is_none());
     }
 
     #[test]

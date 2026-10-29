@@ -417,7 +417,7 @@ impl Config {
         let Some(path) = explicit.map(Path::to_path_buf).or_else(Config::default_path) else {
             return Ok(Config::default());
         };
-        match std::fs::read_to_string(&path) {
+        match crate::fsutil::read_regular_string(&path, crate::fsutil::MAX_CONFIG_BYTES) {
             Ok(text) => Config::from_toml(&text).map_err(|e| format!("{}: {e}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(format!("cannot read {}: {e}", path.display())),
@@ -434,7 +434,7 @@ impl Config {
         let Some(path) = path else {
             return Config::default();
         };
-        match std::fs::read_to_string(&path) {
+        match crate::fsutil::read_regular_string(&path, crate::fsutil::MAX_CONFIG_BYTES) {
             Ok(text) => match Config::from_toml(&text) {
                 Ok(c) => {
                     log::info!("loaded config from {}", path.display());
@@ -470,7 +470,7 @@ impl Config {
             }
             *v = new;
         }
-        fix("font.size", &mut self.font.size, 4.0, 200.0, 13.0);
+        fix("font.size", &mut self.font.size, FONT_SIZE_RANGE.0, FONT_SIZE_RANGE.1, 13.0);
         fix("font.line_height", &mut self.font.line_height, 0.5, 3.0, 1.0);
         fix("window.opacity", &mut self.window.opacity, 0.0, 1.0, 1.0);
         fix("window.padding", &mut self.window.padding, 0.0, 200.0, 4.0);
@@ -498,6 +498,10 @@ impl Config {
 }
 
 /// Upper bound for `scrollback_lines`.
+/// Allowed `font.size` (points); the zoom commands use the same range so
+/// zooming never moves the size the wrong way at the ends.
+pub const FONT_SIZE_RANGE: (f32, f32) = (4.0, 200.0);
+
 pub const MAX_SCROLLBACK_LINES: usize = 1_000_000;
 
 #[cfg(test)]

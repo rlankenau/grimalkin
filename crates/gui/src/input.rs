@@ -913,6 +913,8 @@ fn text_bytes(text: Option<&str>, alt: bool) -> Option<Vec<u8>> {
 /// the markers and treats the content as data) except that the end marker is
 /// removed, repeatedly, so pasted text cannot close the paste early and
 /// smuggle in keystrokes. NUL is dropped as well.
+const PASTE_END_MARKERS: [&str; 2] = ["\x1b[201~", "\u{9b}201~"];
+
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let mut s = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -927,7 +929,23 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
             '\n' => s.push('\r'),
             '\t' => s.push('\t'),
             '\0' => {}
-            _ if bracketed => s.push(c),
+            _ if bracketed => {
+                s.push(c);
+                // Streaming removal of both end-marker spellings. Pushing
+                // and then truncating the tail reaches the fixpoint in one
+                // pass: a marker spliced together by an earlier removal
+                // (`ESC[20 <marker> 1~`, or mixed ESC / U+009B forms) is
+                // seen as soon as its last character arrives, and no marker
+                // can survive in the output. Linear in the input.
+                if c == '~' {
+                    for end in PASTE_END_MARKERS {
+                        if s.ends_with(end) {
+                            s.truncate(s.len() - end.len());
+                            break;
+                        }
+                    }
+                }
+            }
             '\u{2028}' | '\u{2029}' => {}
             c if c.is_control() => {}
             _ => s.push(c),
@@ -935,13 +953,6 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
     if !bracketed {
         return s.into_bytes();
-    }
-    // Removing one occurrence can splice a new one together
-    // ("\x1b[20\x1b[201~1~"), so repeat until none is left.
-    for end in ["\x1b[201~", "\u{9b}201~"] {
-        while s.contains(end) {
-            s = s.replace(end, "");
-        }
     }
     let mut v = b"\x1b[200~".to_vec();
     v.extend_from_slice(s.as_bytes());
@@ -1150,6 +1161,32 @@ mod tests {
             b"\x1b[200~a\x1b[31mb\rc\x1b[200~\x1b[201~"
         );
         assert_eq!(paste_bytes("a\u{9b}201~b", true), b"\x1b[200~ab\x1b[201~");
+    }
+
+    #[test]
+    fn paste_mixed_marker_forms_cannot_splice_a_live_end_marker() {
+        // F19: removing a U+009B form must not complete an ESC form (and v.v.).
+        for evil in [
+            "\x1b[2\u{9b}201~01~\rtouch /tmp/pwned\r",
+            "\x1b[20\u{9b}201~1~\rtouch /tmp/pwned\r",
+            "\u{9b}2\x1b[201~01~\rtouch /tmp/pwned\r",
+        ] {
+            let out = paste_bytes(evil, true);
+            let body = &out[b"\x1b[200~".len()..out.len() - b"\x1b[201~".len()];
+            let body = std::str::from_utf8(body).unwrap();
+            assert!(!body.contains("\x1b[201~") && !body.contains("\u{9b}201~"), "{evil:?} -> {body:?}");
+        }
+    }
+
+    #[test]
+    fn paste_nested_end_markers_are_linear_time() {
+        // F12: N nested splices used to cost O(N^2) or worse.
+        let n = 200_000;
+        let s = format!("{}\x1b[201~{}", "\x1b[2".repeat(n), "01~".repeat(n));
+        let t = std::time::Instant::now();
+        let out = paste_bytes(&s, true);
+        assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+        assert_eq!(out, b"\x1b[200~\x1b[201~");
     }
 
     #[test]

@@ -268,9 +268,14 @@ pub enum Source {
     BuiltIn,
 }
 
-/// Theme names are file names: no separators, no leading dots.
+/// Theme names are file names: no separators, no leading dots, and no control
+/// or bidi characters (names are printed by `--list-themes` and shown in
+/// menus, where an ESC sequence in a file name would be an injection).
 fn valid_name(name: &str) -> bool {
-    !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\\', ':', '\0'])
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', ':', '\0'])
+        && !crate::textsafe::has_unsafe_chars(name)
 }
 
 fn builtin(name: &str) -> Option<&'static str> {
@@ -285,11 +290,11 @@ pub fn load(name: &str, user_dir: Option<&Path>) -> Result<Theme, String> {
     }
     if let Some(dir) = user_dir {
         let toml_path = dir.join(format!("{name}.toml"));
-        if let Ok(text) = std::fs::read_to_string(&toml_path) {
+        if let Ok(text) = crate::fsutil::read_regular_string(&toml_path, crate::fsutil::MAX_CONFIG_BYTES) {
             return Theme::from_toml(&text).map_err(|e| format!("{}: {e}", toml_path.display()));
         }
         let conf_path = dir.join(format!("{name}.conf"));
-        if let Ok(text) = std::fs::read_to_string(&conf_path) {
+        if let Ok(text) = crate::fsutil::read_regular_string(&conf_path, crate::fsutil::MAX_CONFIG_BYTES) {
             return Ok(Theme::from_kitty(name, &text));
         }
     }
@@ -471,6 +476,19 @@ fn resolve_with(cfg: &Config, dir: Option<&Path>, skin_theme: Option<&SkinTheme>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_never_prints_control_characters_from_file_names() {
+        // F21: x\x1b]0;PWNED\x07.toml reached the user's terminal verbatim.
+        let d = tmpdir("ctl");
+        std::fs::write(d.join("x\x1b]0;PWNED\x07.toml"), "").unwrap();
+        std::fs::write(d.join("ok.toml"), "").unwrap();
+        let text = list_text(Some(&d));
+        assert!(text.lines().any(|l| l.starts_with("ok\t")));
+        assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text:?}");
+        assert!(load("x\x1b]0;PWNED\x07", Some(&d)).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("grimalkin-theme-{tag}-{}", std::process::id()));

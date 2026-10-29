@@ -23,7 +23,7 @@ impl Perform for Terminal {
     fn execute(&mut self, byte: u8) {
         self.last_cell = None;
         match byte {
-            0x07 => self.events.push(TermEvent::Bell),
+            0x07 => self.push_event(TermEvent::Bell),
             0x08 => {
                 self.pending_wrap = false;
                 self.cursor.col = self.cursor.col.saturating_sub(1);
@@ -211,7 +211,7 @@ impl Perform for Terminal {
                         self.erase_cells(r, 0, c + 1);
                     }
                     2 => {
-                        self.display_clear_count += 1;
+                        self.note_display_clear();
                         self.erase_rows(0, rows);
                     }
                     3 => {
@@ -341,7 +341,8 @@ impl Perform for Terminal {
                 self.push_response(r.as_bytes());
             }
             ([b' '], 'q') => {
-                let (shape, blink) = match arg0(&ps, 0) {
+                let n = arg0(&ps, 0);
+                let (shape, blink) = match n {
                     0 | 1 => (CursorShape::Block, true),
                     2 => (CursorShape::Block, false),
                     3 => (CursorShape::Underline, true),
@@ -351,10 +352,14 @@ impl Perform for Terminal {
                     _ => return,
                 };
                 self.modes.cursor_blink = blink;
+                // 0 means "the user's default": hand shape and blink back to
+                // the host's configuration instead of forcing a blinking block.
+                self.modes.cursor_blink_set = n != 0;
+                self.modes.cursor_shape_set = n != 0;
                 if shape != self.cursor_shape {
                     self.cursor_shape = shape;
                 }
-                self.events.push(TermEvent::CursorShape(shape));
+                self.push_event(TermEvent::CursorShape(shape));
             }
             ([b'!'], 'p') => self.soft_reset(),
             ([b'?', b'$'], 'p') => {
@@ -453,7 +458,7 @@ impl Perform for Terminal {
             b"0" | b"2" => {
                 let t = String::from_utf8_lossy(&rest_joined(1)).into_owned();
                 self.title = t.clone();
-                self.events.push(TermEvent::Title(t));
+                self.push_event(TermEvent::Title(t));
             }
             b"1" => {}
             b"4" => {
@@ -477,7 +482,7 @@ impl Perform for Terminal {
                 }
                 if changed {
                     self.mark_all();
-                    self.events.push(TermEvent::ColorChanged);
+                    self.push_event(TermEvent::ColorChanged);
                 }
             }
             b"104" => {
@@ -497,7 +502,7 @@ impl Perform for Terminal {
                     }
                 }
                 self.mark_all();
-                self.events.push(TermEvent::ColorChanged);
+                self.push_event(TermEvent::ColorChanged);
             }
             b"10" | b"11" | b"12" => {
                 let first = match *cmd {
@@ -530,7 +535,7 @@ impl Perform for Terminal {
                 }
                 if changed {
                     self.mark_all();
-                    self.events.push(TermEvent::ColorChanged);
+                    self.push_event(TermEvent::ColorChanged);
                 }
             }
             b"110" | b"111" | b"112" => {
@@ -541,13 +546,13 @@ impl Perform for Terminal {
                 };
                 self.reset_dyn_color(which);
                 self.mark_all();
-                self.events.push(TermEvent::ColorChanged);
+                self.push_event(TermEvent::ColorChanged);
             }
             b"7" => {
                 let uri = String::from_utf8_lossy(&rest_joined(1)).into_owned();
                 let path = util::parse_cwd_uri(&uri);
                 self.cwd = Some(path.clone());
-                self.events.push(TermEvent::CwdChanged(path));
+                self.push_event(TermEvent::CwdChanged(path));
             }
             b"8" => {
                 if params.len() < 3 {
@@ -583,12 +588,12 @@ impl Perform for Terminal {
                     // for any number of queries queued before it is served.
                     if !self.clip_query_pending {
                         self.clip_query_pending = true;
-                        self.events.push(TermEvent::ClipboardQuery);
+                        self.push_event(TermEvent::ClipboardQuery);
                     }
                 } else if params[2].len() > MAX_CLIPBOARD_B64 {
                     // Refuse oversized writes without decoding them.
                 } else if let Some(bytes) = util::base64_decode_strict(params[2]) {
-                    self.events.push(TermEvent::ClipboardSet(
+                    self.push_event(TermEvent::ClipboardSet(
                         String::from_utf8_lossy(&bytes).into_owned(),
                     ));
                 }
@@ -683,7 +688,10 @@ impl Terminal {
                     self.pending_wrap = false;
                 }
             }
-            12 => self.modes.cursor_blink = on,
+            12 => {
+                self.modes.cursor_blink = on;
+                self.modes.cursor_blink_set = true;
+            }
             25 => self.modes.cursor_visible = on,
             47 | 1047 => {
                 if on {
@@ -747,7 +755,7 @@ impl Terminal {
             _ => {}
         }
         if mouse_changed {
-            self.events.push(TermEvent::SetMouseMode);
+            self.push_event(TermEvent::SetMouseMode);
         }
     }
 

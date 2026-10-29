@@ -35,7 +35,8 @@ pub struct Graphics {
     prev_esc: bool,
     last_screen: Screen,
     last_alt_enter: u64,
-    last_clear_count: u64,
+    /// ED 2 / RIS count seen per screen (`[main, alt]`).
+    last_clear_count: [u64; 2],
     last_reset_count: u64,
     /// Oldest retained absolute row per screen (`[main, alt]`).
     last_oldest: [u64; 2],
@@ -79,7 +80,7 @@ impl Graphics {
             prev_esc: false,
             last_screen: Screen::Main,
             last_alt_enter: 0,
-            last_clear_count: 0,
+            last_clear_count: [0; 2],
             last_reset_count: 0,
             last_oldest: [0; 2],
         }
@@ -118,7 +119,9 @@ impl Graphics {
     /// Terminal events not consumed by the graphics layer.
     pub fn drain_events(&mut self, term: &mut Terminal) -> Vec<TermEvent> {
         self.pump(term);
-        std::mem::take(&mut self.deferred)
+        let mut ev = std::mem::take(&mut self.deferred);
+        grimalkin_vt::coalesce_events(&mut ev);
+        ev
     }
 
     fn pump(&mut self, term: &mut Terminal) {
@@ -127,6 +130,10 @@ impl Graphics {
                 TermEvent::GraphicsCommand(payload) => self.handle(term, &payload),
                 other => self.deferred.push(other),
             }
+        }
+        // Bounded however long the program floods BEL / titles / clipboard.
+        if self.deferred.len() >= 1024 {
+            grimalkin_vt::coalesce_events(&mut self.deferred);
         }
     }
 
@@ -184,13 +191,24 @@ impl Graphics {
             self.dirty = true;
         }
 
-        let clears = term.display_clear_count();
-        if clears != self.last_clear_count {
-            self.last_clear_count = clears;
-            // ED 2 / RIS: delete what is visible (kitty `a=d,d=a`); the image
-            // data stays, so later `a=p` puts still work.
-            let ctx = Self::context(term);
-            self.protocol.set_viewport_top(ctx.screen, live_top(term));
+        // ED 2 / RIS: delete what was visible on the screen it ran on (kitty
+        // `a=d,d=a`); the image data stays, so later `a=p` puts still work.
+        // Counted per screen: a clear and a screen switch can arrive in one
+        // read, and the clear must not hit the other screen's images. The
+        // alternate screen's placements are dropped wholesale when it is left.
+        for screen in [Screen::Main, Screen::Alt] {
+            let idx = screen_index(screen);
+            let (clears, top) = term.display_clear(screen);
+            if clears == self.last_clear_count[idx] {
+                continue;
+            }
+            self.last_clear_count[idx] = clears;
+            if screen == Screen::Alt && term.screen() != Screen::Alt {
+                continue;
+            }
+            let mut ctx = Self::context(term);
+            ctx.screen = map_screen(screen);
+            self.protocol.set_viewport_top(ctx.screen, top);
             let _ = self.protocol.handle(b"a=d,d=a,q=2", &ctx);
             self.dirty = true;
         }
@@ -292,6 +310,22 @@ mod tests {
         // Later output still works.
         g.feed(&mut t, PUT);
         assert_eq!(placements(&mut g).len(), 1);
+    }
+
+    #[test]
+    fn ed2_and_screen_switch_in_one_chunk_hit_the_right_screen() {
+        // F37: `tput smcup; clear; rmcup` in one write erased main images.
+        let (mut t, mut g) = setup();
+        g.feed(&mut t, PUT);
+        assert_eq!(placements(&mut g).len(), 1);
+        g.feed(&mut t, b"\x1b[?1049h\x1b[2J\x1b[?1049l");
+        assert_eq!(placements(&mut g).len(), 1, "main image must survive");
+
+        // Converse: ED 2 on main, then switch to alt, in one chunk.
+        let (mut t, mut g) = setup();
+        g.feed(&mut t, PUT);
+        g.feed(&mut t, b"\x1b[2J\x1b[?1049h");
+        assert!(placements(&mut g).is_empty(), "main image must be erased");
     }
 
     #[test]

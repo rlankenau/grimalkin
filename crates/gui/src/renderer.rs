@@ -138,6 +138,9 @@ impl InstanceBuf {
     }
 }
 
+/// Time a frame may spend shaping and rasterizing glyphs it has not seen yet.
+const GLYPH_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+
 /// Everything the renderer needs to know about the app/UI state for a frame.
 pub struct ViewState<'a> {
     pub focused: bool,
@@ -193,6 +196,7 @@ pub struct Renderer {
     /// presented frame is also written to that file (used for headless
     /// verification where screen capture is unavailable).
     dump_path: Option<std::path::PathBuf>,
+    followup_frame: bool,
     srgb_target: bool,
     premultiplied_clear: bool,
     /// Alpha modes the surface supports, and whether a skin needs an alpha
@@ -229,6 +233,8 @@ pub struct Renderer {
     inset: (u32, u32),
     chrome: Option<Chrome>,
     chrome_mask: Vec<GlyphInst>,
+    chrome_color: Vec<GlyphInst>,
+    chrome_color_buf: InstanceBuf,
     chrome_mask_buf: InstanceBuf,
 
     // Theme.
@@ -493,6 +499,7 @@ impl Renderer {
             queue,
             surface_config,
             dump_path: std::env::var_os("GRIMALKIN_DUMP_FRAME").map(std::path::PathBuf::from),
+            followup_frame: false,
             srgb_target,
             premultiplied_clear,
             alpha_modes: caps.alpha_modes.clone(),
@@ -525,6 +532,8 @@ impl Renderer {
             inset: (0, 0),
             chrome: None,
             chrome_mask: Vec::new(),
+            chrome_color: Vec::new(),
+            chrome_color_buf: InstanceBuf::new(&device, "chrome title color"),
             chrome_mask_buf: InstanceBuf::new(&device, "chrome title"),
             opacity: cfg.window.opacity,
             row_cache: Vec::new(),
@@ -702,6 +711,12 @@ impl Renderer {
     }
 
     /// Debug aid: redirect (or stop) the frame dump.
+    /// True when frames are being dumped to a file (they render even while
+    /// the window is occluded).
+    pub fn is_dumping(&self) -> bool {
+        self.dump_path.is_some()
+    }
+
     pub fn set_dump_path(&mut self, path: Option<std::path::PathBuf>) {
         self.dump_path = path;
     }
@@ -792,6 +807,12 @@ impl Renderer {
     /// theme changed, etc.).
     pub fn invalidate(&mut self) {
         self.force_full = true;
+    }
+
+    /// True (once) when the last frame left glyphs out to stay within its
+    /// time budget: the caller should request another redraw.
+    pub fn take_followup_frame(&mut self) -> bool {
+        std::mem::take(&mut self.followup_frame)
     }
 
     // -- instance generation ---------------------------------------------
@@ -1094,10 +1115,20 @@ impl Renderer {
 
     /// Update instances from the terminal's damage and draw one frame.
     pub fn render(&mut self, term: &mut Terminal, view: &ViewState, graphics: &mut grimalkin_graphics::Protocol) -> FrameStatus {
+        // New glyphs are built within a time budget per frame (not when
+        // dumping frames, which must be complete): see `GlyphCache::begin_frame`.
+        let budget = if self.dump_path.is_some() { None } else { Some(GLYPH_BUDGET) };
+        self.glyphs.begin_frame(budget);
         let damage = term.take_damage();
         self.update_rows(term, &damage, view);
         self.build_cursor(term, view);
         self.build_overlay(term, view);
+        if self.glyphs.deferred {
+            // Blank cells stand in for glyphs that did not fit the budget:
+            // rebuild every row next frame, which will find the cached ones.
+            self.force_full = true;
+            self.followup_frame = true;
+        }
         {
             let dev = &self.device;
             let q = &self.queue;
@@ -1173,6 +1204,12 @@ impl Renderer {
                     });
                     self.draw(&tex, term);
                     self.dump_frame(&tex);
+                } else {
+                    // The buffer / texture uploads above were queued but no
+                    // frame will be submitted: flush them now, or staging
+                    // memory piles up with every redraw while occluded.
+                    self.queue.submit(std::iter::empty());
+                    let _ = self.device.poll(wgpu::PollType::Poll);
                 }
                 return FrameStatus::Occluded;
             }
@@ -1194,8 +1231,10 @@ impl Renderer {
     /// Build the skin chrome (frame, buttons, title) for this frame.
     fn prepare_chrome(&mut self, term: &Terminal, view: &ViewState) {
         self.chrome_mask.clear();
+        self.chrome_color.clear();
         let (Some(chrome), Some(cv)) = (self.chrome.as_mut(), view.chrome.as_ref()) else {
             self.chrome_mask_buf.upload(&self.device, &self.queue, &self.chrome_mask);
+            self.chrome_color_buf.upload(&self.device, &self.queue, &self.chrome_color);
             return;
         };
         let (r, g, b) = term.colors().background;
@@ -1205,12 +1244,12 @@ impl Renderer {
         let scale = skin::pixel_scale(self.scale);
         let title = chrome.prepare(&self.device, &self.queue, cv, win, scale, [r, g, b, a]);
         if let Some(t) = title {
-            let mut unused = Vec::new();
             for (x, y, q) in &t.quads {
-                push_glyphs(std::slice::from_ref(q), *x, *y, t.color, &mut self.chrome_mask, &mut unused);
+                push_glyphs(std::slice::from_ref(q), *x, *y, t.color, &mut self.chrome_mask, &mut self.chrome_color);
             }
         }
         self.chrome_mask_buf.upload(&self.device, &self.queue, &self.chrome_mask);
+        self.chrome_color_buf.upload(&self.device, &self.queue, &self.chrome_color);
     }
 
     /// Write the frame to `GRIMALKIN_DUMP_FRAME` as a PNG (debug aid).
@@ -1352,6 +1391,7 @@ impl Renderer {
             if let Some(chrome) = &self.chrome {
                 chrome.draw(&mut pass);
                 self.draw_glyphs(&mut pass, &self.mask_pipeline, chrome.title_bind(), &self.chrome_mask_buf);
+                self.draw_glyphs(&mut pass, &self.color_pipeline, chrome.title_color_bind(), &self.chrome_color_buf);
             }
             if !self.shaded() {
                 self.draw_terminal(&mut pass);

@@ -8,6 +8,8 @@
 //! an `Rgba8Unorm` atlas with premultiplied alpha.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::fonts::Fonts;
 use cosmic_text::{
@@ -50,6 +52,14 @@ pub struct CellMetrics {
     /// Strikethrough top, relative to the cell top.
     pub strike_y: i32,
 }
+
+/// Most distinct (cluster, style) entries kept before the cache is emptied
+/// and rebuilt from the screen (a stream of distinct clusters would otherwise
+/// grow it without bound).
+const MAX_ENTRIES: usize = 65536;
+
+/// Colour emoji fonts, in order of preference.
+const EMOJI_FAMILIES: [&str; 3] = ["Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"];
 
 pub const STYLE_BOLD: u8 = 1;
 pub const STYLE_ITALIC: u8 = 2;
@@ -232,6 +242,20 @@ pub struct GlyphCache {
     /// Set when an atlas is full at its maximum size. The renderer reacts by
     /// calling [`GlyphCache::clear`] and regenerating all rows.
     pub overflowed: bool,
+    /// Configured families that exist in the font database (cached: scanning
+    /// every face for each shaped cluster dominated the cost of new glyphs).
+    installed: Arc<Vec<String>>,
+    /// Colour emoji family: `None` = not looked up yet, `Some(None)` = none installed.
+    emoji: Option<Option<String>>,
+    /// Per-frame limit on new glyph work, see [`GlyphCache::begin_frame`].
+    deadline: Option<Instant>,
+    built_this_frame: u32,
+    /// Some glyph was left blank this frame because the budget ran out; the
+    /// renderer must draw another frame to fill it in.
+    pub deferred: bool,
+    /// Scale glyphs wider than their cells down to fit (the skin title, where
+    /// an over-wide glyph such as U+FDFD would overwrite its neighbours).
+    pub fit_to_cells: bool,
 }
 
 struct ShapedGlyph {
@@ -271,7 +295,14 @@ impl GlyphCache {
             mask,
             color,
             overflowed: false,
+            installed: Arc::new(Vec::new()),
+            emoji: None,
+            deadline: None,
+            built_this_frame: 0,
+            deferred: false,
+            fit_to_cells: false,
         };
+        gc.refresh_installed();
         gc.metrics = gc.compute_metrics();
         gc
     }
@@ -282,6 +313,7 @@ impl GlyphCache {
         self.px_size = px_size;
         self.line_height = line_height;
         self.clear();
+        self.refresh_installed();
         self.metrics = self.compute_metrics();
     }
 
@@ -289,6 +321,25 @@ impl GlyphCache {
         let fam = self.families.clone();
         let lh = self.line_height;
         self.reconfigure(&fam, px_size, lh);
+    }
+
+    /// Start a frame. With a `budget`, glyphs not yet in the cache are only
+    /// built until it is used up (always at least one, so every frame makes
+    /// progress); the rest are left blank and [`GlyphCache::deferred`] is set.
+    /// Shaping and rasterizing thousands of new glyphs (a screen of distinct
+    /// CJK, or hostile combining sequences) would otherwise take seconds.
+    pub fn begin_frame(&mut self, budget: Option<Duration>) {
+        self.deadline = budget.map(|b| Instant::now() + b);
+        self.built_this_frame = 0;
+        self.deferred = false;
+    }
+
+    fn over_budget(&self) -> bool {
+        self.built_this_frame > 0 && self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    fn refresh_installed(&mut self) {
+        self.installed = Arc::new(self.installed_families());
     }
 
     /// Drop every cached glyph and empty the atlases (their textures keep
@@ -394,16 +445,49 @@ impl GlyphCache {
         Some((out, first))
     }
 
+    /// The installed colour emoji family, if any (loads the full system font
+    /// set the first time, since the quick start-up set may lack it).
+    fn emoji_family(&mut self) -> Option<String> {
+        if self.fonts.is_partial() {
+            self.fonts.upgrade();
+            self.refresh_installed();
+            self.emoji = None;
+        }
+        if self.emoji.is_none() {
+            let db = self.fonts.fs.db();
+            let found = EMOJI_FAMILIES
+                .iter()
+                .find(|want| db.faces().any(|f| f.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(want))))
+                .map(|s| (*s).to_string());
+            self.emoji = Some(found);
+        }
+        self.emoji.clone().flatten()
+    }
+
     /// Shape a cluster honoring the family fallback order: the first
     /// configured family that provides every glyph wins; otherwise the
     /// first family plus the system fallback.
     fn shape_cluster(&mut self, text: &str, style: u8) -> Vec<ShapedGlyph> {
         let weight = if style & STYLE_BOLD != 0 { Weight::BOLD } else { Weight::NORMAL };
         let fstyle = if style & STYLE_ITALIC != 0 { Style::Italic } else { Style::Normal };
-        let installed = self.installed_families();
+        // U+FE0F asks for the emoji presentation. The primary (text) font often
+        // has a plain glyph for the base character and would win, drawing a
+        // monochrome symbol; use the colour emoji font instead. (U+FE0E, the
+        // text selector, takes the normal path below.)
+        if text.contains('\u{fe0f}') {
+            if let Some(name) = self.emoji_family() {
+                let attrs = Attrs::new().family(Family::Name(&name)).weight(weight).style(fstyle);
+                if let Some((glyphs, _)) = self.shape_with(text, &attrs) {
+                    if !glyphs.is_empty() && glyphs.iter().any(|g| g.key.glyph_id != 0) {
+                        return glyphs;
+                    }
+                }
+            }
+        }
+        let installed = self.installed.clone();
         let mut fallback: Option<Vec<ShapedGlyph>> = None;
         let partial = self.fonts.is_partial();
-        for name in &installed {
+        for name in installed.iter() {
             let attrs = Attrs::new().family(Family::Name(name)).weight(weight).style(fstyle);
             let Some((glyphs, _)) = self.shape_with(text, &attrs) else { continue };
             if glyphs.is_empty() {
@@ -430,6 +514,7 @@ impl GlyphCache {
             // A glyph is missing from every configured family: load the
             // complete system font set (emoji / CJK fallback) and retry.
             self.fonts.upgrade();
+            self.refresh_installed();
             return self.shape_cluster(text, style);
         }
         if let Some(f) = fallback {
@@ -447,6 +532,10 @@ impl GlyphCache {
             match self.simple.get(&(ch, style)) {
                 Some(&i) => i,
                 None => {
+                    if self.over_budget() {
+                        self.deferred = true;
+                        return &[];
+                    }
                     let mut s = String::new();
                     s.push(ch);
                     let i = self.build(gpu, &s, style);
@@ -461,6 +550,10 @@ impl GlyphCache {
             match self.complex.get(&(s.clone(), style)) {
                 Some(&i) => i,
                 None => {
+                    if self.over_budget() {
+                        self.deferred = true;
+                        return &[];
+                    }
                     let i = self.build(gpu, &s, style);
                     self.complex.insert((s, style), i);
                     i
@@ -471,6 +564,12 @@ impl GlyphCache {
     }
 
     fn build(&mut self, gpu: &Gpu, text: &str, style: u8) -> u32 {
+        self.built_this_frame += 1;
+        if self.entries.len() >= MAX_ENTRIES {
+            // Same recovery as a full atlas: the renderer clears the cache
+            // and regenerates the visible rows.
+            self.overflowed = true;
+        }
         let wide = style & KEY_WIDE != 0;
         let ncells = if wide { 2.0 } else { 1.0 };
         let cell_w = self.metrics.cell_w as f32;
@@ -563,6 +662,13 @@ impl GlyphCache {
                     dy = (cell_h - dh) / 2.0;
                 }
                 AtlasKind::Mask => {
+                    if self.fit_to_cells && dw > cell_w * ncells {
+                        let s = cell_w * ncells / dw;
+                        dw *= s;
+                        dh *= s;
+                        dx = 0.0;
+                        dy = baseline - (baseline - dy) * s;
+                    }
                     if wide && total_adv > 0.0 && total_adv < cell_w * ncells {
                         dx += ((cell_w * ncells - total_adv) / 2.0).floor();
                     }
@@ -582,5 +688,88 @@ impl GlyphCache {
         }
         self.entries.push(quads);
         (self.entries.len() - 1) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device without a window; `None` where there is no adapter at all.
+    fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            apply_limit_buckets: false,
+        }))
+        .ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("glyph test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .ok()
+    }
+
+    #[test]
+    fn new_glyph_work_per_frame_is_bounded() {
+        // F16: thousands of new clusters in one frame took 0.5-0.8 s (release).
+        let Some((device, queue)) = device() else { return };
+        let gpu = Gpu { device: &device, queue: &queue };
+        let mut gc = GlyphCache::new(&gpu, 4096, &["Menlo".to_string()], 16.0, 1.0);
+        let marks = ['\u{300}', '\u{301}', '\u{302}', '\u{303}', '\u{304}', '\u{305}', '\u{306}', '\u{307}'];
+        gc.begin_frame(Some(Duration::ZERO));
+        for i in 0..200u32 {
+            let ch = char::from_u32(0x4e00 + i).unwrap();
+            let _ = gc.lookup(&gpu, ch, &marks, 0, true);
+        }
+        assert!(gc.deferred, "an exhausted budget defers new glyphs");
+        assert_eq!(gc.entries.len(), 1, "exactly one glyph per frame once over budget");
+        // Without a budget everything is built, and cached results are free.
+        gc.begin_frame(None);
+        for i in 0..200u32 {
+            let ch = char::from_u32(0x4e00 + i).unwrap();
+            let _ = gc.lookup(&gpu, ch, &marks, 0, true);
+        }
+        assert!(!gc.deferred);
+        assert_eq!(gc.entries.len(), 200);
+        gc.begin_frame(Some(Duration::ZERO));
+        let _ = gc.lookup(&gpu, '\u{4e00}', &marks, 0, true);
+        assert!(!gc.deferred, "cache hits never count against the budget");
+    }
+
+    #[test]
+    fn vs16_selects_the_colour_emoji_and_vs15_stays_text() {
+        // F41: U+2764 U+FE0F drew the text glyph, same as U+FE0E.
+        let Some((device, queue)) = device() else { return };
+        let gpu = Gpu { device: &device, queue: &queue };
+        let mut gc = GlyphCache::new(&gpu, 4096, &["Menlo".to_string()], 16.0, 1.0);
+        if gc.emoji_family().is_none() {
+            eprintln!("vs16 test: no colour emoji font, skipped");
+            return; // no colour emoji font on this machine
+        }
+        gc.begin_frame(None);
+        let vs16 = gc.lookup(&gpu, '\u{2764}', &['\u{fe0f}'], 0, true).to_vec();
+        assert!(vs16.iter().any(|q| q.kind == AtlasKind::Color), "VS16 must draw the colour emoji: {vs16:?}");
+        let vs15 = gc.lookup(&gpu, '\u{2764}', &['\u{fe0e}'], 0, true).to_vec();
+        assert!(vs15.iter().all(|q| q.kind == AtlasKind::Mask), "VS15 must stay a text glyph: {vs15:?}");
+    }
+
+    #[test]
+    fn entries_are_capped() {
+        let Some((device, queue)) = device() else { return };
+        let gpu = Gpu { device: &device, queue: &queue };
+        let mut gc = GlyphCache::new(&gpu, 4096, &["Menlo".to_string()], 16.0, 1.0);
+        gc.begin_frame(None);
+        gc.entries.resize(MAX_ENTRIES, Vec::new());
+        let _ = gc.lookup(&gpu, 'x', &[], 0, false);
+        assert!(gc.overflowed, "the renderer clears the cache when it flags overflow");
+        gc.clear();
+        assert!(gc.entries.is_empty());
     }
 }

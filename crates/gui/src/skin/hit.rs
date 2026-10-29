@@ -468,9 +468,17 @@ fn edge_dir(x: i32, y: i32, w: i32, h: i32, b: i32) -> Option<ResizeDir> {
 /// Alpha threshold (0-255): pixels below it are outside the window.
 pub const ALPHA_CUTOFF: u8 = 128;
 
+/// Most rectangles `shape_rects` returns. A region of millions of rectangles
+/// (a noisy alpha channel) costs seconds and tens of MB per `WM_SIZE`.
+pub const MAX_SHAPE_RECTS: usize = 8192;
+
 /// Axis-aligned rectangles (x0, y0, x1, y1; exclusive max) covering exactly
 /// the pixels of the window shape, for `SetWindowRgn`. `alpha(tx, ty)` gives
 /// the frame texel alpha; the viewport is always inside.
+///
+/// When the exact shape needs more than [`MAX_SHAPE_RECTS`] rectangles, falls
+/// back to one span per row (from the first to the last inside pixel), which
+/// is bounded by the window height and only ever adds pixels between runs.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn shape_rects(
     spec: &SliceSpec,
@@ -483,11 +491,28 @@ pub fn shape_rects(
     if win_w <= 0 || win_h <= 0 {
         return Vec::new();
     }
+    shape_rects_with(spec, win_w, win_h, k, viewport, &alpha, false)
+        .or_else(|| shape_rects_with(spec, win_w, win_h, k, viewport, &alpha, true))
+        .unwrap_or_default()
+}
+
+/// `coarse` = one span per row. Returns `None` when an exact result would
+/// exceed [`MAX_SHAPE_RECTS`].
+fn shape_rects_with(
+    spec: &SliceSpec,
+    win_w: i32,
+    win_h: i32,
+    k: i32,
+    viewport: PxRect,
+    alpha: &impl Fn(u32, u32) -> u8,
+    coarse: bool,
+) -> Option<Vec<[i32; 4]>> {
+    use std::collections::HashMap;
     // The column mapping depends on the row only for the split top band.
     let cols_of = |y: i32| -> Vec<u32> { (0..win_w).map(|x| spec.texel_at(win_w, win_h, k, x, y).0).collect() };
     let (cols_top, cols) = (cols_of(0), cols_of(win_h - 1));
     let mut rects: Vec<[i32; 4]> = Vec::new();
-    // Rectangles still growing downwards, keyed by their (x0, x1) run.
+    // Rectangles still growing downwards, by their (x0, x1) run -> index in `open`.
     let mut open: Vec<[i32; 4]> = Vec::new();
     for y in 0..win_h {
         let ty = spec.texel_at(win_w, win_h, k, 0, y).1;
@@ -508,28 +533,66 @@ pub fn shape_rects(
         if let Some(s) = start {
             runs.push((s, win_w));
         }
-        // Extend open rects whose run repeats on this row; close the rest.
-        let mut next_open = Vec::with_capacity(runs.len());
-        for (x0, x1) in runs {
-            if let Some(i) = open.iter().position(|r| r[0] == x0 && r[2] == x1) {
-                let mut r = open.swap_remove(i);
-                r[3] = y + 1;
-                next_open.push(r);
-            } else {
-                next_open.push([x0, y, x1, y + 1]);
+        if coarse {
+            if let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) {
+                runs = vec![(first, last)];
             }
         }
-        rects.append(&mut open);
+        // Extend open rects whose run repeats on this row; close the rest.
+        let mut by_run: HashMap<(i32, i32), usize> = open.iter().enumerate().map(|(i, r)| ((r[0], r[2]), i)).collect();
+        let mut taken = vec![false; open.len()];
+        let mut next_open = Vec::with_capacity(runs.len());
+        for (x0, x1) in runs {
+            match by_run.remove(&(x0, x1)) {
+                Some(i) => {
+                    taken[i] = true;
+                    let mut r = open[i];
+                    r[3] = y + 1;
+                    next_open.push(r);
+                }
+                None => next_open.push([x0, y, x1, y + 1]),
+            }
+        }
+        for (i, r) in open.iter().enumerate() {
+            if !taken[i] {
+                rects.push(*r);
+            }
+        }
         open = next_open;
+        if !coarse && rects.len() + open.len() > MAX_SHAPE_RECTS {
+            return None;
+        }
     }
     rects.append(&mut open);
-    rects
+    Some(rects)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skin::parse::SkinDef;
+
+    #[test]
+    fn noisy_alpha_cannot_produce_millions_of_rects() {
+        // F17: a 1 px checkerboard gave 280k rects at 1080p, millions at 4K.
+        let spec = SliceSpec {
+            region: [0, 0, 64, 64],
+            caps: Insets { left: 8, right: 8, top: 16, bottom: 8 },
+            mode: EdgeMode::Tile,
+        };
+        let none = PxRect { x: 0, y: 0, w: 0, h: 0 };
+        let checker = |x: u32, y: u32| if (x + y).is_multiple_of(2) { 255 } else { 0 };
+        let t = std::time::Instant::now();
+        let r = shape_rects(&spec, 3840, 2160, 1, none, checker);
+        assert!(r.len() <= 2160 && r.len() <= MAX_SHAPE_RECTS, "{} rects", r.len());
+        assert!(t.elapsed().as_secs() < 20, "{:?}", t.elapsed());
+        // The fallback is a superset of the exact shape: every inside pixel is covered.
+        let covers = |x: i32, y: i32| r.iter().any(|q| x >= q[0] && x < q[2] && y >= q[1] && y < q[3]);
+        assert!(covers(0, 0) && covers(3838, 2158));
+        // Ordinary shapes are exact and unchanged.
+        let solid = shape_rects(&spec, 300, 200, 1, none, |_, _| 255);
+        assert_eq!(solid, vec![[0, 0, 300, 200]]);
+    }
 
     #[test]
     fn sat_i32_clamps() {

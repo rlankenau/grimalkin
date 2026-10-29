@@ -72,6 +72,12 @@ pub struct Modes {
     pub wrap: bool,
     /// Cursor blink (12)
     pub cursor_blink: bool,
+    /// A program chose the blink (DECSCUSR 1-6 or mode 12) and it has not
+    /// been put back to "default" (DECSCUSR 0 / RIS); until then the host's
+    /// configured blink applies.
+    pub cursor_blink_set: bool,
+    /// Likewise for the cursor shape (DECSCUSR 1-6).
+    pub cursor_shape_set: bool,
     /// DECTCEM (25)
     pub cursor_visible: bool,
     /// IRM (ANSI 4)
@@ -96,6 +102,8 @@ impl Default for Modes {
             origin: false,
             wrap: true,
             cursor_blink: true,
+            cursor_blink_set: false,
+            cursor_shape_set: false,
             cursor_visible: true,
             insert: false,
             mouse_mode: MouseMode::None,
@@ -126,6 +134,49 @@ pub enum TermEvent {
     SetMouseMode,
     /// APC `G` payload (bytes between `ESC _ G` and `ESC \`, exclusive of `G`).
     GraphicsCommand(Vec<u8>),
+}
+
+const EVENTS_COMPACT_MIN: usize = 1024;
+
+/// Most OSC 52 queries kept per batch; each is answered, but a flood of them
+/// is not worth answering in full.
+const MAX_QUERIES_PER_BATCH: usize = 16;
+
+/// Collapse a batch of events to what the host needs: only the last title,
+/// clipboard write and working directory, and one each of the idempotent
+/// notifications (bell, colour / cursor-shape / mouse-mode change), keeping
+/// the order of the survivors. Graphics commands are never dropped and
+/// clipboard queries are capped at [`MAX_QUERIES_PER_BATCH`] (the latest).
+pub fn coalesce_events(events: &mut Vec<TermEvent>) {
+    if events.len() < 2 {
+        return;
+    }
+    let mut seen = [false; 7];
+    let mut queries = 0usize;
+    let mut keep = vec![true; events.len()];
+    for (i, ev) in events.iter().enumerate().rev() {
+        let kind = match ev {
+            TermEvent::Title(_) => 0,
+            TermEvent::Bell => 1,
+            TermEvent::ClipboardSet(_) => 2,
+            TermEvent::CwdChanged(_) => 3,
+            TermEvent::ColorChanged => 4,
+            TermEvent::CursorShape(_) => 5,
+            TermEvent::SetMouseMode => 6,
+            TermEvent::ClipboardQuery => {
+                queries += 1;
+                keep[i] = queries <= MAX_QUERIES_PER_BATCH;
+                continue;
+            }
+            TermEvent::GraphicsCommand(_) => continue,
+        };
+        if seen[kind] {
+            keep[i] = false;
+        }
+        seen[kind] = true;
+    }
+    let mut it = keep.into_iter();
+    events.retain(|_| it.next().unwrap_or(true));
 }
 
 /// RGB triple.
@@ -335,13 +386,16 @@ pub struct Terminal {
     pub(crate) events: Vec<TermEvent>,
     /// A `ClipboardQuery` event is queued and not yet drained.
     pub(crate) clip_query_pending: bool,
+    events_compact_at: usize,
     dirty: Vec<bool>,
     full_redraw: bool,
     pub(crate) last_cell: Option<(usize, usize)>,
     pub(crate) last_char: Option<char>,
     pub(crate) cell_px: (u32, u32),
     alt_enter_count: u64,
-    pub(crate) display_clear_count: u64,
+    /// Per screen (`[main, alt]`): ED 2 / RIS count and the absolute row of
+    /// the screen's first row when the last one ran.
+    display_clears: [(u64, u64); 2],
     sync_since: Option<Instant>,
     pub(crate) clip_selection: String,
     drawn_cursor: (Cursor, bool, CursorShape, bool),
@@ -405,13 +459,14 @@ impl Terminal {
             responses: Vec::new(),
             clip_query_pending: false,
             events: Vec::new(),
+            events_compact_at: EVENTS_COMPACT_MIN,
             dirty: vec![true; rows],
             full_redraw: true,
             last_cell: None,
             last_char: None,
             cell_px: (8, 16),
             alt_enter_count: 0,
-            display_clear_count: 0,
+            display_clears: [(0, 0); 2],
             sync_since: None,
             clip_selection: "c".into(),
             drawn_cursor: (Cursor::default(), true, CursorShape::Block, true),
@@ -595,8 +650,7 @@ impl Terminal {
                     if b == b'\\' {
                         let buf = std::mem::take(&mut self.apc_buf);
                         if !self.str_overflow && buf.first() == Some(&b'G') {
-                            self.events
-                                .push(TermEvent::GraphicsCommand(buf[1..].to_vec()));
+                            self.push_event(TermEvent::GraphicsCommand(buf[1..].to_vec()));
                         }
                         self.end_string_buffers();
                         // Let vte leave its APC state.
@@ -770,10 +824,25 @@ impl Terminal {
         self.responses.extend_from_slice(bytes);
     }
 
-    /// Drain queued events.
+    /// Drain queued events (already coalesced, see [`coalesce_events`]).
     pub fn drain_events(&mut self) -> Vec<TermEvent> {
         self.clip_query_pending = false;
-        std::mem::take(&mut self.events)
+        self.events_compact_at = EVENTS_COMPACT_MIN;
+        let mut v = std::mem::take(&mut self.events);
+        coalesce_events(&mut v);
+        v
+    }
+
+    /// Queue an event for the host. A flood of BEL / title / clipboard
+    /// sequences would otherwise grow this queue without bound (and make the
+    /// host do one OS call per sequence), so the queue is coalesced whenever
+    /// it reaches a threshold that doubles while it stays large.
+    pub(crate) fn push_event(&mut self, ev: TermEvent) {
+        self.events.push(ev);
+        if self.events.len() >= self.events_compact_at {
+            coalesce_events(&mut self.events);
+            self.events_compact_at = (self.events.len() * 2).max(EVENTS_COMPACT_MIN);
+        }
     }
 
     /// Answer a [`TermEvent::ClipboardQuery`] with the clipboard contents.
@@ -853,6 +922,16 @@ impl Terminal {
     pub fn cursor_blink(&self) -> bool {
         self.modes.cursor_blink
     }
+    /// The blink a program asked for, or `None` when the host's configured
+    /// default should apply (nothing set it, or DECSCUSR 0 / RIS undid it).
+    pub fn cursor_blink_override(&self) -> Option<bool> {
+        self.modes.cursor_blink_set.then_some(self.modes.cursor_blink)
+    }
+    /// The shape a program asked for with DECSCUSR 1-6, or `None` for the
+    /// host's configured shape.
+    pub fn cursor_shape_override(&self) -> Option<CursorShape> {
+        self.modes.cursor_shape_set.then_some(self.cursor_shape)
+    }
     pub fn mouse_mode(&self) -> MouseMode {
         self.modes.mouse_mode
     }
@@ -885,10 +964,29 @@ impl Terminal {
     pub fn alt_enter_count(&self) -> u64 {
         self.alt_enter_count
     }
-    /// Incremented on every ED 2 (erase whole display) and RIS, so a host can
-    /// drop things that live outside the grid (kitty graphics placements).
-    pub fn display_clear_count(&self) -> u64 {
-        self.display_clear_count
+    /// `(count, top)` for `screen`: incremented on every ED 2 (erase whole
+    /// display) that ran on it and on RIS (main), with `top` the absolute row
+    /// of its first row at that time, so a host can drop things that live
+    /// outside the grid (kitty graphics placements) from the right screen even
+    /// when the clear and a screen switch arrive in one read.
+    pub fn display_clear(&self, screen: Screen) -> (u64, u64) {
+        self.display_clears[match screen {
+            Screen::Main => 0,
+            Screen::Alt => 1,
+        }]
+    }
+
+    /// Record an ED 2 on the active screen.
+    pub(crate) fn note_display_clear(&mut self) {
+        self.note_display_clear_on(self.active);
+    }
+
+    fn note_display_clear_on(&mut self, screen: Screen) {
+        let (i, top) = match screen {
+            Screen::Main => (0, self.main.scrolled_total()),
+            Screen::Alt => (1, self.alt.scrolled_total()),
+        };
+        self.display_clears[i] = (self.display_clears[i].0 + 1, top);
     }
     /// Incremented on every RIS (full reset), which also discards scrollback,
     /// so a host can drop everything it keeps outside the grid (images).
@@ -1475,7 +1573,9 @@ impl Terminal {
                 let bg = self.pen.bg;
                 let g = self.grid_mut();
                 clear_overlap(g.row_mut(r), col, bg);
-                g.row_mut(r).cells[col] = Cell::erased(bg);
+                let mut pad = Cell::erased(bg);
+                pad.flags.insert(Flags::WRAP_PAD);
+                g.row_mut(r).cells[col] = pad;
                 self.wrap_line();
             } else {
                 return;
@@ -1798,8 +1898,9 @@ impl Terminal {
 
     /// Full reset (RIS). Keeps size and scrollback.
     pub(crate) fn full_reset(&mut self) {
-        self.display_clear_count += 1;
         self.reset_count += 1;
+        self.note_display_clear_on(Screen::Main);
+        self.note_display_clear_on(Screen::Alt);
         if self.active == Screen::Alt {
             self.leave_alt(false);
         }
@@ -1833,8 +1934,8 @@ impl Terminal {
         self.colors.background = self.colors.base_background;
         self.colors.cursor = self.colors.base_cursor;
         self.mark_all();
-        self.events.push(TermEvent::ColorChanged);
-        self.events.push(TermEvent::SetMouseMode);
+        self.push_event(TermEvent::ColorChanged);
+        self.push_event(TermEvent::SetMouseMode);
     }
 
     /// Soft reset (DECSTR).

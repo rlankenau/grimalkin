@@ -173,7 +173,7 @@ pub fn install_from(src: &str, dir: &Path, force: bool) -> Result<String, String
             MAX_DOWNLOAD >> 20
         ));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = crate::fsutil::read_regular(path, MAX_DOWNLOAD).map_err(|e| format!("{}: {e}", path.display()))?;
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -209,7 +209,7 @@ pub fn list_text(user_dir: Option<&Path>) -> String {
         let mut dirs: Vec<(String, PathBuf)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
-                if e.path().join("skin.toml").is_file() {
+                if e.path().join("skin.toml").is_file() && !crate::textsafe::has_unsafe_chars(&e.file_name().to_string_lossy()) {
                     dirs.push((e.file_name().to_string_lossy().into_owned(), e.path()));
                 }
             }
@@ -231,6 +231,22 @@ mod tests {
 
     use super::super::archive::testutil::zip_of;
     use super::*;
+
+    #[test]
+    fn list_skins_never_prints_control_characters_from_file_names() {
+        // F21: a skin directory named with ESC[2J cleared the user's screen.
+        let d = std::env::temp_dir().join(format!("grimalkin-listskins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for n in ["evil\x1b[2J", "fine"] {
+            std::fs::create_dir_all(d.join(n)).unwrap();
+            std::fs::write(d.join(n).join("skin.toml"), "").unwrap();
+        }
+        std::fs::write(d.join("w\x1b]0;x\x07.wsz"), b"x").unwrap();
+        let text = list_text(Some(&d));
+        assert!(text.contains("fine\t"));
+        assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn good_wsz() -> Vec<u8> {
         let mut out = Cursor::new(Vec::new());
