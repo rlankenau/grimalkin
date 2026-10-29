@@ -477,6 +477,8 @@ fn resolve_with(cfg: &Config, dir: Option<&Path>, skin_theme: Option<&SkinTheme>
 mod tests {
     use super::*;
 
+    // Windows forbids control characters in file names, so the attack cannot exist there.
+    #[cfg(not(windows))]
     #[test]
     fn listing_never_prints_control_characters_from_file_names() {
         // F21: x\x1b]0;PWNED\x07.toml reached the user's terminal verbatim.

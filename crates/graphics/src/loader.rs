@@ -217,7 +217,7 @@ fn fill_rgba(src: &mut impl Read, pixels: usize, bpp: usize) -> Result<Arc<[u8]>
             if n < px * 3 {
                 return Err(insufficient(done * 3 + n));
             }
-            for (d, s) in dst[done * 4..(done + px) * 4].chunks_exact_mut(4).zip(buf.chunks_exact(3)) {
+            for (d, s) in dst[done * 4..(done + px) * 4].as_chunks_mut::<4>().0.iter_mut().zip(buf.as_chunks::<3>().0) {
                 d.copy_from_slice(&[s[0], s[1], s[2], 255]);
             }
             done += px;
@@ -229,7 +229,7 @@ fn fill_rgba(src: &mut impl Read, pixels: usize, bpp: usize) -> Result<Arc<[u8]>
 /// Expand an `N`-bytes-per-pixel 8-bit image into a fresh RGBA buffer.
 fn expand<const N: usize>(src: &[u8], total: usize, f: impl Fn(&[u8]) -> [u8; 4]) -> Arc<[u8]> {
     let mut arc = rgba_buffer(total);
-    for (d, s) in buf_mut(&mut arc).chunks_exact_mut(4).zip(src.chunks_exact(N)) {
+    for (d, s) in buf_mut(&mut arc).as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<N>().0) {
         d.copy_from_slice(&f(s));
     }
     arc

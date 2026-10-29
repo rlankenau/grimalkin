@@ -232,6 +232,8 @@ mod tests {
     use super::super::archive::testutil::zip_of;
     use super::*;
 
+    // Windows forbids control characters in file names, so the attack cannot exist there.
+    #[cfg(not(windows))]
     #[test]
     fn list_skins_never_prints_control_characters_from_file_names() {
         // F21: a skin directory named with ESC[2J cleared the user's screen.
