@@ -116,14 +116,18 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
 ; --- Explorer context menu --------------------------------------------------
 ; HKA is HKCU for a per-user install (HKCU\Software\Classes\...) and HKLM for
 ; an all-users one. The keys are deleted on uninstall.
+; %V is quoted in the command line. A path that ends in a backslash (a drive
+; or UNC root such as C:\ or \\srv\share\) would turn the closing quote into an
+; escaped literal quote under CommandLineToArgvW rules, so "%V" is written as
+; "%V." (C:\. is the same directory and never ends in a backslash).
 ; Right-click on a folder:
 Root: HKA; Subkey: "Software\Classes\Directory\shell\grimalkin"; ValueType: string; ValueName: ""; ValueData: "Open grimalkin here"; Tasks: contextmenu; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Directory\shell\grimalkin"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"""; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\shell\grimalkin\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" --working-directory ""%V"""; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\Directory\shell\grimalkin\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" --working-directory ""%V."""; Tasks: contextmenu
 ; Right-click on the empty background inside an open folder:
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\grimalkin"; ValueType: string; ValueName: ""; ValueData: "Open grimalkin here"; Tasks: contextmenu; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\grimalkin"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"""; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\grimalkin\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" --working-directory ""%V"""; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\grimalkin\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" --working-directory ""%V."""; Tasks: contextmenu
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; WorkingDir: "{%USERPROFILE}"; Flags: nowait postinstall skipifsilent
