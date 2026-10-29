@@ -596,12 +596,20 @@ fn virtual_placements_are_stored_with_flag_and_do_not_move_cursor() {
     assert!(v[0].is_virtual);
     assert_eq!((v[0].cols, v[0].rows), (4, 2));
     // Position-based deletes never touch virtual placements.
-    run(&mut p, "a=d,d=a");
     run(&mut p, "a=d,d=z,z=0");
+    run(&mut p, "a=d,d=c");
     assert_eq!(p.virtual_placements(Screen::Main).count(), 1);
     // d=i does.
     run(&mut p, "a=d,d=i,i=1");
     assert_eq!(p.virtual_placements(Screen::Main).count(), 0);
+    // So does delete-all (which is also what ED 2 / RIS send), for both cases.
+    for d in ["a", "A"] {
+        run(&mut p, "a=p,i=1,U=1,c=4,r=2,p=9");
+        assert_eq!(p.virtual_placements(Screen::Main).count(), 1);
+        run(&mut p, &format!("a=d,d={d}"));
+        assert_eq!(p.virtual_placements(Screen::Main).count(), 0, "d={d}");
+        setup(&mut p, 1, 100, 100);
+    }
 }
 
 #[test]
@@ -1261,4 +1269,297 @@ fn failed_display_of_anonymous_image_does_not_leak_it() {
     assert!(responses(&a).is_empty());
     assert_eq!(p.image_count(), 0);
     assert_eq!(p.memory_used(), 0);
+}
+
+// ------------------------------------------------- adversarial-QA regressions
+
+/// F4: `f=100` ignores `s`/`v`, so absurd values must not reach any
+/// width * height arithmetic (debug builds panicked on the multiplication).
+#[test]
+fn huge_dimensions_with_png_format_do_not_overflow() {
+    let mut p = Protocol::new();
+    for keys in ["f=100", "f=100,o=z", "f=100,t=f", "f=24", "f=32", "f=32,o=z", "f=24,o=z"] {
+        let a = run(&mut p, &format!("a=q,i=1,{keys},s=4294967295,v=4294967295;AAAA"));
+        let r = only_response(&a);
+        assert!(r.starts_with("\x1b_Gi=1;E"), "{keys}: {r:?}");
+    }
+    // A PNG whose own header is the huge part is refused too.
+    let mut png = png_bytes(2, 2);
+    png[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+    png[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
+    let a = run(&mut p, &format!("a=q,i=1,f=100;{}", b64::encode(&png)));
+    assert!(only_response(&a).starts_with("\x1b_Gi=1;E"));
+    assert_eq!(p.image_count(), 0);
+}
+
+/// F20: whatever is wrong with a file, the sender sees the same error, so it
+/// cannot probe for local files or learn their size or type.
+#[test]
+fn file_media_errors_are_uniform() {
+    let big = temp_file("grimalkin-probe-big", &[7u8; 9350]);
+    let short = temp_file("grimalkin-probe-short", &[7u8; 3]);
+    let junk_z = temp_file("grimalkin-probe-z", b"not zlib at all, but long enough");
+    let junk_png = temp_file("grimalkin-probe-png", b"definitely not a png file");
+    let empty = temp_file("grimalkin-probe-empty", b"");
+    let missing = std::env::temp_dir().join(unique("grimalkin-probe-missing"));
+    let enc = |p: &std::path::Path| b64::encode(p.to_str().unwrap().as_bytes());
+    for (keys, path) in [
+        ("f=32,s=1,v=1", &big),
+        ("f=32,s=1,v=1", &short),
+        ("f=24,s=1,v=1", &big),
+        ("f=32,s=1,v=1,o=z", &junk_z),
+        ("f=32,s=1,v=1,o=z", &big),
+        ("f=100", &junk_png),
+        ("f=100,o=z", &junk_z),
+        ("f=32,s=1,v=1", &empty),
+        ("f=32,s=0,v=0", &big),
+        ("f=32,s=99999,v=99999", &big),
+        ("f=32,s=1,v=1", &missing),
+    ] {
+        let mut p = Protocol::new();
+        let a = run(&mut p, &format!("t=f,i=1,{keys};{}", enc(path)));
+        assert_eq!(only_response(&a), format!("\x1b_Gi=1;{EBADF}\x1b\\"), "{keys}");
+        assert_eq!(p.image_count(), 0);
+    }
+    // A temp file read as t=t is just as uniform (and still deleted).
+    let tmp = std::env::temp_dir().join(format!("tty-graphics-protocol-{}", unique("probe")));
+    std::fs::write(&tmp, [1u8; 100]).unwrap();
+    let mut p = Protocol::new();
+    let a = run(&mut p, &format!("t=t,i=1,f=32,s=1,v=1;{}", enc(&tmp)));
+    assert_eq!(only_response(&a), format!("\x1b_Gi=1;{EBADF}\x1b\\"));
+    assert!(!tmp.exists());
+    // Direct transmission keeps its descriptive errors.
+    let a = run(&mut p, &format!("i=2,f=32,s=1,v=1;{}", b64::encode(&[0u8; 9])));
+    assert!(only_response(&a).contains("EFBIG:Too much image data: 9 > 4"));
+    for f in [big, short, junk_z, junk_png, empty] {
+        std::fs::remove_file(f).unwrap();
+    }
+}
+
+/// F9: re-placing with ever new placement ids was quadratic, and nothing
+/// bounded the number of placements.
+#[test]
+fn placement_floods_are_fast_and_capped() {
+    let mut p = Protocol::new();
+    setup(&mut p, 1, 1, 1);
+    let start = std::time::Instant::now();
+    let n = 3 * MAX_PLACEMENTS;
+    for k in 1..=n {
+        run(&mut p, &format!("a=p,i=1,p={k},q=2"));
+    }
+    assert!(p.placement_count() <= MAX_PLACEMENTS);
+    assert!(p.placement_count() > MAX_PLACEMENTS / 2);
+    // The oldest are the ones dropped; the newest survive.
+    assert!(p.placements_in(Screen::Main, 0..).any(|x| x.placement_id == n as u32));
+    assert!(!p.placements_in(Screen::Main, 0..).any(|x| x.placement_id == 1));
+    // Id-less placements and virtual ones are capped as well.
+    for _ in 0..2 * MAX_PLACEMENTS {
+        run(&mut p, "a=p,i=1,q=2");
+        run(&mut p, "a=p,i=1,U=1,q=2");
+    }
+    assert!(p.placement_count() <= MAX_PLACEMENTS);
+    assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
+}
+
+#[test]
+fn placement_replacement_by_id_keeps_one_and_indexes_stay_consistent() {
+    let mut p = Protocol::new();
+    setup(&mut p, 1, 1, 1);
+    setup(&mut p, 2, 1, 1);
+    for _ in 0..5 {
+        run(&mut p, "a=p,i=1,p=7,q=2");
+        run(&mut p, "a=p,i=2,p=7,q=2");
+    }
+    assert_eq!(p.placement_count(), 2);
+    run(&mut p, "a=d,d=i,i=1,p=7");
+    assert_eq!(p.placement_count(), 1);
+    run(&mut p, "a=p,i=1,p=7,q=2");
+    assert_eq!(p.placement_count(), 2);
+    run(&mut p, "a=d,d=I,i=1");
+    assert_eq!(p.placement_count(), 1);
+    assert!(p.image(1).is_none());
+    run(&mut p, "a=d,d=A");
+    assert_eq!(p.placement_count(), 0);
+    assert_eq!(p.image_count(), 0);
+    assert!(p.by_pid.is_empty() && p.by_image.is_empty() && p.lru.is_empty());
+}
+
+/// F10: evicting N small images to make room for one big one must not cost
+/// O(N) per victim.
+#[test]
+fn evicting_many_small_images_is_linear() {
+    let n = MAX_IMAGES as u32;
+    let mut p = Protocol::with_memory_limit(8 * 1024 * 1024);
+    let start = std::time::Instant::now();
+    for i in 1..=n {
+        run(&mut p, &format!("a=t,f=24,s=1,v=1,i={i},q=2;/wAA"));
+    }
+    assert_eq!(p.image_count(), n as usize);
+    let _ = p.take_dirty_images();
+    // One image that needs nearly the whole quota.
+    let big = b64::encode(&zlib(&vec![0u8; 1024 * 2048 * 4]));
+    let a = run(&mut p, &format!("a=t,f=32,s=1024,v=2048,i={},o=z,q=2;{big}", n + 1));
+    assert!(responses(&a).is_empty(), "{a:?}");
+    assert!(p.image(n + 1).is_some());
+    assert!(p.memory_used() <= p.memory_limit());
+    assert_eq!(p.image_count(), 1);
+    assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
+    // Every evicted image is reported removed exactly once.
+    let removed = p.take_removed_images();
+    assert!(removed.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(removed.len() + p.image_count() - 1, n as usize);
+    assert_eq!(p.take_dirty_images(), vec![n + 1]);
+}
+
+#[test]
+fn eviction_prefers_unplaced_then_least_recently_used() {
+    // Like `setup`, but eviction may legitimately report a redraw.
+    fn put(p: &mut Protocol, id: u32, w: u32, h: u32) {
+        run(p, &format!("i={id},s={w},v={h},f=32,q=2;{}", rgba_b64(w, h)));
+    }
+    let mut p = Protocol::with_memory_limit(16 * 3);
+    for id in 1..=3u32 {
+        put(&mut p, id, 2, 2);
+    }
+    run(&mut p, "a=p,i=1,q=2"); // placed and oldest
+    run(&mut p, "a=p,i=3,q=2");
+    run(&mut p, "a=p,i=2,U=1,q=2"); // virtual placements count as placed too
+    put(&mut p, 4, 2, 2);
+    // All three had placements; the least recently used (1) goes.
+    assert!(p.image(1).is_none() && p.image(2).is_some() && p.image(3).is_some());
+    put(&mut p, 5, 2, 2);
+    // 4 has no placement, so it is the first victim even though it is newer.
+    assert!(p.image(4).is_none() && p.image(2).is_some() && p.image(3).is_some() && p.image(5).is_some());
+    run(&mut p, "a=p,i=5,q=2");
+    put(&mut p, 6, 2, 2);
+    // Everything is placed again: 3 was put least recently.
+    assert!(p.image(3).is_none() && p.image(2).is_some() && p.image(5).is_some() && p.image(6).is_some());
+}
+
+/// F26: the number of images is bounded too, not only their pixel bytes.
+#[test]
+fn image_count_is_capped() {
+    let mut p = Protocol::new();
+    for i in 1..=(MAX_IMAGES as u32 + 100) {
+        run(&mut p, &format!("a=t,f=24,s=1,v=1,i={i},q=2;/wAA"));
+    }
+    assert_eq!(p.image_count(), MAX_IMAGES);
+    assert!(p.image(1).is_none());
+    assert!(p.image(MAX_IMAGES as u32 + 100).is_some());
+}
+
+/// F26: delete-all (and so ED 2 / RIS, which send it) clears virtual
+/// placements, which have no position for the position-based deletes.
+#[test]
+fn delete_all_clears_virtual_placements() {
+    let mut p = Protocol::new();
+    setup(&mut p, 1, 1, 1);
+    for _ in 0..1000 {
+        run(&mut p, "a=p,i=1,U=1,q=2");
+    }
+    assert_eq!(p.virtual_placements(Screen::Main).count(), 1000);
+    run(&mut p, "a=d,d=A");
+    assert_eq!(p.virtual_placements(Screen::Main).count(), 0);
+    assert_eq!(p.placement_count(), 0);
+}
+
+/// F32: pixels land in the right place for every decode path, including
+/// ones that stream in chunks.
+#[test]
+fn streamed_decoding_is_exact_for_every_format() {
+    let (w, h) = (300u32, 100u32); // 30000 px: more than one 16K-pixel chunk
+    let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i % 253) as u8).collect();
+    let want: Vec<u8> = rgb.chunks(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect();
+    let mut p = Protocol::new();
+    for (i, keys, data) in [
+        (1, "f=24", rgb.clone()),
+        (2, "f=24,o=z", zlib(&rgb)),
+        (3, "f=32,o=z", zlib(&want)),
+        (4, "f=32", want.clone()),
+    ] {
+        let a = run(&mut p, &format!("i={i},s={w},v={h},{keys};{}", b64::encode(&data)));
+        assert_eq!(only_response(&a), ok(i));
+        assert_eq!(&p.image(i).unwrap().rgba[..], &want[..], "{keys}");
+    }
+    // Truncated and over-long streams.
+    let a = run(&mut p, &format!("i=5,s={w},v={h},f=24,o=z;{}", b64::encode(&zlib(&rgb[..rgb.len() - 1]))));
+    assert!(only_response(&a).contains("ENODATA:Insufficient image data"));
+    let mut long = rgb.clone();
+    long.push(0);
+    let a = run(&mut p, &format!("i=5,s={w},v={h},f=24,o=z;{}", b64::encode(&zlib(&long))));
+    assert!(only_response(&a).contains("EFBIG:Too much image data"));
+    let a = run(&mut p, &format!("i=5,s={w},v={h},f=24,o=z;{}", b64::encode(&[0x78, 0x9c, 1, 2, 3, 4])));
+    assert!(only_response(&a).contains("EINVAL:Failed to inflate"));
+    assert!(p.image(5).is_none());
+}
+
+#[test]
+fn png_color_types_decode_to_rgba() {
+    let mut p = Protocol::new();
+    let enc = |img: image::DynamicImage| {
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+        b64::encode(&out)
+    };
+    let luma = image::GrayImage::from_raw(2, 1, vec![10, 200]).unwrap();
+    let la = image::GrayAlphaImage::from_raw(2, 1, vec![10, 20, 200, 30]).unwrap();
+    let rgb = image::RgbImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6]).unwrap();
+    let rgb16 = image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(1, 1, vec![0xffffu16, 0, 0x8080]).unwrap();
+    for (i, img, want) in [
+        (1u32, image::DynamicImage::ImageLuma8(luma), vec![10, 10, 10, 255, 200, 200, 200, 255]),
+        (2, image::DynamicImage::ImageLumaA8(la), vec![10, 10, 10, 20, 200, 200, 200, 30]),
+        (3, image::DynamicImage::ImageRgb8(rgb), vec![1, 2, 3, 255, 4, 5, 6, 255]),
+        (4, image::DynamicImage::ImageRgb16(rgb16), vec![255, 0, 128, 255]),
+    ] {
+        let a = run(&mut p, &format!("i={i},f=100;{}", enc(img)));
+        assert_eq!(only_response(&a), ok(i));
+        assert_eq!(&p.image(i).unwrap().rgba[..], &want[..], "image {i}");
+    }
+    let a = run(&mut p, &format!("i=9,f=100;{}", b64::encode(&png_bytes(3, 2))));
+    assert_eq!(only_response(&a), ok(9));
+    assert_eq!(p.image(9).unwrap().rgba.len(), 24);
+}
+
+/// F32: room is made before the new pixels are allocated (so old and new are
+/// not resident together), but only for transmissions known to be good.
+#[test]
+fn eviction_happens_only_for_valid_uploads() {
+    let mut p = Protocol::with_memory_limit(16 * 2);
+    for id in 1..=2u32 {
+        run(&mut p, &format!("i={id},s=2,v=2,f=32,q=2;{}", rgba_b64(2, 2)));
+    }
+    assert_eq!(p.image_count(), 2);
+    let px = vec![9u8; 16];
+    let bad = [
+        // truncated, over-long, bad stream, and a query that would fit
+        format!("i=3,s=2,v=2,f=32,o=z;{}", b64::encode(&zlib(&px[..15]))),
+        format!("i=3,s=2,v=2,f=32,o=z;{}", b64::encode(&zlib(&[px.clone(), vec![0]].concat()))),
+        format!("i=3,s=2,v=2,f=32,o=z;{}", b64::encode(&[0x78, 0x9c, 1, 2, 3])),
+        format!("i=3,s=2,v=2,f=32;{}", b64::encode(&px[..15])),
+        format!("a=q,i=3,s=2,v=2,f=32;{}", b64::encode(&px)),
+    ];
+    for cmd in &bad {
+        let a = run(&mut p, cmd);
+        assert_eq!(p.image_count(), 2, "{cmd}");
+        assert!(p.take_removed_images().is_empty(), "{cmd}: {a:?}");
+    }
+    // A valid one evicts exactly what it needs, compressed or not.
+    for (id, cmd) in [
+        (3, format!("i=3,s=2,v=2,f=32,o=z;{}", b64::encode(&zlib(&px)))),
+        (4, format!("i=4,s=2,v=2,f=32;{}", b64::encode(&px))),
+    ] {
+        let a = run(&mut p, &cmd);
+        assert_eq!(only_response(&a), ok(id));
+        assert_eq!(&p.image(id).unwrap().rgba[..], &px[..]);
+        assert_eq!(p.image_count(), 2);
+    }
+    // Re-sending an id at full quota replaces it instead of evicting others.
+    let mut q = Protocol::with_memory_limit(16 * 2);
+    for id in 1..=2u32 {
+        run(&mut q, &format!("i={id},s=2,v=2,f=32,q=2;{}", rgba_b64(2, 2)));
+    }
+    let a = run(&mut q, &format!("i=2,s=2,v=2,f=32,o=z;{}", b64::encode(&zlib(&px))));
+    assert_eq!(only_response(&a), ok(2));
+    assert!(q.image(1).is_some());
+    assert_eq!(&q.image(2).unwrap().rgba[..], &px[..]);
 }

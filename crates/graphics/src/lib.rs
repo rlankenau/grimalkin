@@ -24,7 +24,7 @@ mod loader;
 
 use cmd::Cmd;
 use loader::{err, GErr};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -32,6 +32,14 @@ use std::sync::Arc;
 pub const MAX_DIMENSION: u32 = 10_000;
 /// Default image memory quota (matches kitty).
 pub const DEFAULT_MEMORY_LIMIT: usize = 320 * 1024 * 1024;
+/// Maximum number of stored images. Pixel bytes are what the memory quota
+/// counts, so without this a flood of 1x1 images would cost ~200 bytes of
+/// bookkeeping each while "using" 4 bytes of quota. Beyond it the
+/// least-recently-used image is evicted.
+pub const MAX_IMAGES: usize = 65_536;
+/// Maximum number of live placements (real and virtual). Beyond it the oldest
+/// placement is dropped, so the per-frame and per-command cost stays bounded.
+pub const MAX_PLACEMENTS: usize = 32_768;
 const FALLBACK_CELL_W: u32 = 8;
 const FALLBACK_CELL_H: u32 = 16;
 const FIRST_AUTO_ID: u32 = 0x8000_0000;
@@ -154,10 +162,21 @@ struct Pending {
 pub struct Protocol {
     images: HashMap<u32, Image>,
     meta: HashMap<u32, Meta>,
-    placements: Vec<Placement>,
+    /// Live placements keyed by creation order (so iteration is oldest first).
+    placements: BTreeMap<u64, Placement>,
+    /// Keys into `placements` of each image's placements.
+    by_image: HashMap<u32, BTreeSet<u64>>,
+    /// Key of the placement with a given `(image id, placement id)`; only for
+    /// non-zero placement ids.
+    by_pid: HashMap<(u32, u32), u64>,
+    next_pkey: u64,
+    /// Eviction order: images without placements first, then least recently
+    /// used. Kept in step with `Meta::last_used` and `by_image` by
+    /// [`Protocol::lru_remove`] / [`Protocol::lru_insert`].
+    lru: BTreeSet<(bool, u64, u32)>,
     pending: Option<Pending>,
-    dirty: Vec<u32>,
-    removed: Vec<u32>,
+    dirty: HashSet<u32>,
+    removed: HashSet<u32>,
     memory_limit: usize,
     used: usize,
     next_seq: u64,
@@ -182,10 +201,14 @@ impl Protocol {
         Protocol {
             images: HashMap::new(),
             meta: HashMap::new(),
-            placements: Vec::new(),
+            placements: BTreeMap::new(),
+            by_image: HashMap::new(),
+            by_pid: HashMap::new(),
+            next_pkey: 0,
+            lru: BTreeSet::new(),
             pending: None,
-            dirty: Vec::new(),
-            removed: Vec::new(),
+            dirty: HashSet::new(),
+            removed: HashSet::new(),
             memory_limit: bytes,
             used: 0,
             next_seq: 1,
@@ -246,7 +269,7 @@ impl Protocol {
             Bound::Excluded(&v) => v.checked_sub(1),
             Bound::Unbounded => Some(u64::MAX),
         };
-        self.placements.iter().filter(move |p| {
+        self.placements.values().filter(move |p| {
             !p.is_virtual
                 && p.screen == screen
                 && hi.is_some_and(|hi| p.abs_row <= hi && p.last_row() >= lo)
@@ -265,18 +288,18 @@ impl Protocol {
 
     /// Virtual (`U=1`) placements on `screen`.
     pub fn virtual_placements(&self, screen: Screen) -> impl Iterator<Item = &Placement> + '_ {
-        self.placements.iter().filter(move |p| p.is_virtual && p.screen == screen)
+        self.placements.values().filter(move |p| p.is_virtual && p.screen == screen)
     }
 
     /// Ids of images whose pixel data is new or replaced since the last call.
     pub fn take_dirty_images(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.dirty)
+        sorted(std::mem::take(&mut self.dirty))
     }
 
     /// Ids of images that were deleted/evicted since the last call, so the
     /// renderer can drop their textures.
     pub fn take_removed_images(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.removed)
+        sorted(std::mem::take(&mut self.removed))
     }
 
     /// Drop placements on `screen` that end above `abs_row` (scrolled out of
@@ -389,7 +412,18 @@ impl Protocol {
             reply(out, command, command.id, command.number, place_pid, Err(err("EINVAL", "Cannot specify both i and I")));
             return;
         }
-        let decoded = match loader::load(command, data, self.memory_limit) {
+        let (cid, is_query, limit) = (command.id, action == b'q', self.memory_limit);
+        let mut make_room = |n: usize| {
+            if !is_query {
+                // The upload is certain to succeed from here, and replaces
+                // any image with the same id.
+                if cid != 0 {
+                    self.remove_image(cid);
+                }
+                self.evict_for(n, cid);
+            }
+        };
+        let decoded = match loader::load(command, data, limit, &mut make_room) {
             Ok(d) => d,
             Err(e) => {
                 reply(out, command, command.id, command.number, place_pid, Err(e));
@@ -446,10 +480,7 @@ impl Protocol {
         if let Err(e) = self.place(command, id, command.pid, ctx, out) {
             return fail(out, e);
         }
-        let seq = self.bump();
-        if let Some(m) = self.meta.get_mut(&id) {
-            m.last_used = seq;
-        }
+        self.touch(id);
         let shown = if command.number != 0 { id } else { command.id };
         reply(out, command, shown, command.number, command.pid, Ok(()));
     }
@@ -479,6 +510,35 @@ impl Protocol {
 
     // ---------------------------------------------------------------- storage
 
+    fn lru_key(&self, id: u32) -> Option<(bool, u64, u32)> {
+        let m = self.meta.get(&id)?;
+        Some((self.by_image.contains_key(&id), m.last_used, id))
+    }
+
+    /// Take `id` out of the eviction order. Call before changing its
+    /// `last_used` or whether it has placements, then [`Self::lru_insert`].
+    fn lru_remove(&mut self, id: u32) {
+        if let Some(k) = self.lru_key(id) {
+            self.lru.remove(&k);
+        }
+    }
+
+    fn lru_insert(&mut self, id: u32) {
+        if let Some(k) = self.lru_key(id) {
+            self.lru.insert(k);
+        }
+    }
+
+    /// Mark `id` as just used.
+    fn touch(&mut self, id: u32) {
+        let seq = self.bump();
+        self.lru_remove(id);
+        if let Some(m) = self.meta.get_mut(&id) {
+            m.last_used = seq;
+        }
+        self.lru_insert(id);
+    }
+
     fn store(&mut self, id: u32, number: u32, anonymous: bool, d: loader::Decoded) -> Result<(), GErr> {
         let size = d.rgba.len();
         if size > self.memory_limit {
@@ -487,78 +547,130 @@ impl Protocol {
         // Retransmitting an id wipes the old image and all its placements.
         self.remove_image(id);
         self.evict_for(size, id);
+        while self.images.len() >= MAX_IMAGES && self.evict_one(id) {}
         let seq = self.bump();
         let version = self.next_version;
         self.next_version += 1;
         self.images.insert(
             id,
-            Image {
-                id,
-                number,
-                width: d.width,
-                height: d.height,
-                rgba: Arc::from(d.rgba),
-                texture_version: version,
-            },
+            Image { id, number, width: d.width, height: d.height, rgba: d.rgba, texture_version: version },
         );
         self.meta.insert(id, Meta { seq, last_used: seq, anonymous });
+        self.lru_insert(id);
         self.used += size;
-        self.dirty.push(id);
+        self.dirty.insert(id);
         // A re-upload must not tell the renderer to drop the new texture.
-        self.removed.retain(|&r| r != id);
+        self.removed.remove(&id);
         Ok(())
     }
 
     /// Evict images (never `keep`) until `extra` more bytes fit.
     fn evict_for(&mut self, extra: usize, keep: u32) {
-        while self.used.saturating_add(extra) > self.memory_limit {
-            let with_placements: std::collections::HashSet<u32> =
-                self.placements.iter().map(|p| p.image_id).collect();
-            let victim = self
-                .meta
-                .iter()
-                .filter(|(&id, _)| id != keep)
-                .min_by_key(|(id, m)| (with_placements.contains(id), m.last_used))
-                .map(|(&id, _)| id);
-            match victim {
-                Some(v) => self.remove_image(v),
-                None => break,
+        while self.used.saturating_add(extra) > self.memory_limit && self.evict_one(keep) {}
+    }
+
+    /// Evict the best victim other than `keep`; false if there is none.
+    fn evict_one(&mut self, keep: u32) -> bool {
+        let victim = self.lru.iter().find(|k| k.2 != keep).map(|k| k.2);
+        match victim {
+            Some(v) => {
+                self.remove_image(v);
+                true
             }
+            None => false,
         }
     }
 
     fn remove_image(&mut self, id: u32) {
+        // Placements first: while the image is still known they leave the
+        // eviction order cleanly.
+        if let Some(keys) = self.by_image.get(&id) {
+            let keys: Vec<u64> = keys.iter().copied().collect();
+            for k in keys {
+                self.remove_placement(k);
+            }
+            self.changed = true;
+        }
         if let Some(img) = self.images.remove(&id) {
+            self.lru_remove(id);
             self.used = self.used.saturating_sub(img.rgba.len());
             self.meta.remove(&id);
-            self.dirty.retain(|&d| d != id);
-            self.removed.push(id);
-        }
-        let before = self.placements.len();
-        self.placements.retain(|p| p.image_id != id);
-        if self.placements.len() != before {
-            self.changed = true;
+            self.dirty.remove(&id);
+            self.removed.insert(id);
         }
     }
 
-    fn remove_where(&mut self, free: bool, pred: impl Fn(&Placement) -> bool) {
-        let mut affected = Vec::new();
-        self.placements.retain(|p| {
-            if pred(p) {
-                affected.push(p.image_id);
-                false
-            } else {
-                true
+    /// Drop one placement, keeping every index consistent. Does not free
+    /// the image, even if this was its last placement.
+    fn remove_placement(&mut self, key: u64) -> Option<Placement> {
+        let p = self.placements.get(&key)?;
+        let (image_id, pid) = (p.image_id, p.placement_id);
+        self.lru_remove(image_id);
+        let p = self.placements.remove(&key);
+        if let Some(set) = self.by_image.get_mut(&image_id) {
+            set.remove(&key);
+            if set.is_empty() {
+                self.by_image.remove(&image_id);
             }
-        });
-        if affected.is_empty() {
+        }
+        if pid != 0 && self.by_pid.get(&(image_id, pid)) == Some(&key) {
+            self.by_pid.remove(&(image_id, pid));
+        }
+        self.lru_insert(image_id);
+        p
+    }
+
+    /// Whether an anonymous image has lost its last placement, so nothing
+    /// can ever refer to it again.
+    fn free_if_orphaned_anon(&mut self, id: u32) {
+        if !self.by_image.contains_key(&id) && self.meta.get(&id).is_some_and(|m| m.anonymous) {
+            self.remove_image(id);
+        }
+    }
+
+    fn add_placement(&mut self, p: Placement) {
+        // A placement id names at most one placement per image.
+        if p.placement_id != 0 {
+            if let Some(&old) = self.by_pid.get(&(p.image_id, p.placement_id)) {
+                self.remove_placement(old);
+            }
+        }
+        while self.placements.len() >= MAX_PLACEMENTS {
+            let Some(&oldest) = self.placements.keys().next() else { break };
+            let id = self.placements[&oldest].image_id;
+            self.remove_placement(oldest);
+            if id != p.image_id {
+                self.free_if_orphaned_anon(id);
+            }
+        }
+        let key = self.next_pkey;
+        self.next_pkey += 1;
+        let image_id = p.image_id;
+        self.lru_remove(image_id);
+        if p.placement_id != 0 {
+            self.by_pid.insert((image_id, p.placement_id), key);
+        }
+        self.by_image.entry(image_id).or_default().insert(key);
+        self.placements.insert(key, p);
+        self.lru_insert(image_id);
+    }
+
+    fn remove_where(&mut self, free: bool, pred: impl Fn(&Placement) -> bool) {
+        let doomed: Vec<u64> = self.placements.iter().filter(|(_, p)| pred(p)).map(|(&k, _)| k).collect();
+        if doomed.is_empty() {
             return;
         }
         self.changed = true;
+        let mut affected = Vec::new();
+        for k in doomed {
+            if let Some(p) = self.remove_placement(k) {
+                affected.push(p.image_id);
+            }
+        }
         affected.sort_unstable();
         affected.dedup();
         for id in affected {
-            if self.placements.iter().any(|p| p.image_id == id) {
+            if self.by_image.contains_key(&id) {
                 continue;
             }
             let anon = self.meta.get(&id).is_some_and(|m| m.anonymous);
@@ -576,10 +688,13 @@ impl Protocol {
             None => return Err(err("ENOENT", "Image not found")),
         };
         if c.parent_image != 0 || c.parent_placement != 0 {
-            let parent_exists = self
-                .placements
-                .iter()
-                .any(|p| p.image_id == c.parent_image && p.placement_id == c.parent_placement);
+            let parent_exists = if c.parent_placement != 0 {
+                self.by_pid.contains_key(&(c.parent_image, c.parent_placement))
+            } else {
+                self.by_image.get(&c.parent_image).is_some_and(|keys| {
+                    keys.iter().any(|k| self.placements.get(k).is_some_and(|p| p.placement_id == 0))
+                })
+            };
             return Err(if parent_exists {
                 err("EINVAL", "Relative placements are not supported")
             } else {
@@ -618,10 +733,7 @@ impl Protocol {
         };
         let is_virtual = c.virt == 1;
 
-        if pid != 0 {
-            self.placements.retain(|p| !(p.image_id == image_id && p.placement_id == pid));
-        }
-        self.placements.push(Placement {
+        self.add_placement(Placement {
             image_id,
             placement_id: pid,
             screen: ctx.screen,
@@ -662,7 +774,14 @@ impl Protocol {
         let cell_y = top.saturating_add(c.y.saturating_sub(1) as u64);
 
         match d.to_ascii_lowercase() {
-            b'a' => self.remove_where(free, |p| real(p) && p.abs_row <= bottom && p.last_row() >= top),
+            b'a' => {
+                // Virtual placements have no position, so "visible" cannot
+                // exclude them: delete-all removes them too (or they could
+                // never be cleared short of deleting their images).
+                self.remove_where(free, |p| {
+                    p.screen == screen && (p.is_virtual || (p.abs_row <= bottom && p.last_row() >= top))
+                })
+            }
             b'i' => {
                 if c.id == 0 {
                     return;
@@ -718,6 +837,12 @@ impl Protocol {
 }
 
 // ------------------------------------------------------------------ responses
+
+fn sorted(set: HashSet<u32>) -> Vec<u32> {
+    let mut v: Vec<u32> = set.into_iter().collect();
+    v.sort_unstable();
+    v
+}
 
 fn sanitize(msg: &str) -> String {
     msg.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).collect()

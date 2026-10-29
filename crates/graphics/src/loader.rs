@@ -4,8 +4,10 @@
 use crate::cmd::Cmd;
 use crate::{b64, MAX_DIMENSION};
 use flate2::read::ZlibDecoder;
+use image::codecs::png::PngDecoder;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A protocol error: POSIX-style code plus a short printable message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,11 +20,12 @@ pub(crate) fn err(code: &'static str, msg: impl Into<String>) -> GErr {
     GErr { code, msg: msg.into() }
 }
 
-/// Decoded pixels, always RGBA8.
+/// Decoded pixels, always RGBA8. The buffer is allocated once, at its final
+/// size and in its final type, so storing it never copies it again.
 pub(crate) struct Decoded {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub rgba: Arc<[u8]>,
 }
 
 /// The single, identical error for every failure to read an image file, so a
@@ -31,9 +34,52 @@ fn read_failure() -> GErr {
     err("EBADF", "Failed to read image file")
 }
 
+/// Largest ratio between deflate output and input (RFC 1951: 1032:1).
+const MAX_INFLATE_RATIO: usize = 1032;
+
+/// A zeroed RGBA buffer of `bytes` bytes, allocated exactly once.
+fn rgba_buffer(bytes: usize) -> Arc<[u8]> {
+    std::iter::repeat_n(0u8, bytes).collect()
+}
+
+/// Mutable access to a buffer from [`rgba_buffer`] (always uniquely owned).
+fn buf_mut(a: &mut Arc<[u8]>) -> &mut [u8] {
+    Arc::get_mut(a).expect("freshly created Arc is unique")
+}
+
+/// Read until `buf` is full or the stream ends cleanly; returns the count.
+fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
 /// Decode a command's payload into pixels. `memory_limit` bounds any single
 /// allocation we are willing to make on behalf of the client.
-pub(crate) fn load(cmd: &Cmd, payload: &[u8], memory_limit: usize) -> Result<Decoded, GErr> {
+///
+/// For file media (`t=f`, `t=t`) every failure, whatever its cause, is the
+/// same `EBADF`: otherwise the size/validity errors would let a program that
+/// can only write to the terminal (an ssh session, say) probe the existence,
+/// size and type of local files it cannot read itself.
+///
+/// `make_room(n)` is called, for raw formats only, once the data has been
+/// proven to be exactly the declared size and immediately before the final
+/// `n`-byte buffer is allocated: the store evicts then, so that the old images
+/// and the new one are not resident together, yet a malformed transmission
+/// never evicts anything.
+pub(crate) fn load(
+    cmd: &Cmd,
+    payload: &[u8],
+    memory_limit: usize,
+    make_room: &mut dyn FnMut(usize),
+) -> Result<Decoded, GErr> {
     if cmd.format == 8 || cmd.format == 16 {
         return Err(err("EINVAL", "Indexed color formats are not supported"));
     }
@@ -51,76 +97,149 @@ pub(crate) fn load(cmd: &Cmd, payload: &[u8], memory_limit: usize) -> Result<Dec
         b's' => return Err(err("EINVAL", "Shared memory transmission is not supported")),
         _ => return Err(err("EINVAL", "Unknown transmission medium")),
     };
+    let result = decode(cmd, raw, memory_limit, make_room);
+    if matches!(cmd.medium, b'f' | b't') {
+        return result.map_err(|_| read_failure());
+    }
+    result
+}
+
+fn decode(cmd: &Cmd, raw: Vec<u8>, memory_limit: usize, make_room: &mut dyn FnMut(usize)) -> Result<Decoded, GErr> {
     if raw.is_empty() {
         return Err(err("ENODATA", "No image data"));
     }
-
-    let bpp: u64 = match cmd.format {
-        24 => 3,
-        _ => 4,
-    };
-    let raw_format = cmd.format != 100;
-    if raw_format {
-        if cmd.width == 0 || cmd.height == 0 {
-            return Err(err("EINVAL", "Zero width or height"));
-        }
-        if cmd.width > MAX_DIMENSION || cmd.height > MAX_DIMENSION {
-            return Err(err("EFBIG", "Image too large"));
-        }
+    if cmd.format == 100 {
+        let data = if cmd.compression == Some(b'z') {
+            let limit: u64 = if cmd.size > 0 && cmd.medium == b'd' { cmd.size as u64 } else { memory_limit as u64 };
+            inflate_all(&raw, limit)?
+        } else {
+            raw
+        };
+        return decode_png(&data, memory_limit);
     }
-    let expected: u64 = cmd.width as u64 * cmd.height as u64 * bpp;
-    if raw_format && cmd.width as u64 * cmd.height as u64 * 4 > memory_limit as u64 {
+
+    // Raw RGB / RGBA. Sizes are only computed once both dimensions are known
+    // to be small, so none of the arithmetic below can overflow.
+    let bpp: usize = if cmd.format == 24 { 3 } else { 4 };
+    if cmd.width == 0 || cmd.height == 0 {
+        return Err(err("EINVAL", "Zero width or height"));
+    }
+    if cmd.width > MAX_DIMENSION || cmd.height > MAX_DIMENSION {
+        return Err(err("EFBIG", "Image too large"));
+    }
+    let pixels = cmd.width as u64 * cmd.height as u64;
+    if pixels * 4 > memory_limit as u64 {
         return Err(err("ENOSPC", "Image exceeds the storage quota"));
     }
-
-    // Decompression.
-    let data = if cmd.compression == Some(b'z') {
-        let limit: u64 = if raw_format {
-            expected
-        } else if cmd.size > 0 && cmd.medium == b'd' {
-            cmd.size as u64
-        } else {
-            memory_limit as u64
-        };
-        let mut out = Vec::new();
-        let mut dec = ZlibDecoder::new(&raw[..]).take(limit.saturating_add(1));
-        dec.read_to_end(&mut out)
-            .map_err(|_| err("EINVAL", "Failed to inflate image data"))?;
-        if out.len() as u64 > limit {
-            return Err(err("EFBIG", "Too much image data"));
-        }
-        out
+    let expected = pixels * bpp as u64;
+    let rgba = if cmd.compression == Some(b'z') {
+        // First pass: prove the stream inflates to exactly the right size,
+        // using no memory to speak of. Then make room and inflate for real.
+        check_inflated_len(ZlibDecoder::new(&raw[..]), expected)?;
+        make_room(pixels as usize * 4);
+        fill_rgba(&mut ZlibDecoder::new(&raw[..]), pixels as usize, bpp)?
     } else {
-        raw
-    };
-
-    if raw_format {
-        let got = data.len() as u64;
+        let got = raw.len() as u64;
         if got < expected {
             return Err(err("ENODATA", format!("Insufficient image data: {got} < {expected}")));
         }
         if got > expected {
             return Err(err("EFBIG", format!("Too much image data: {got} > {expected}")));
         }
-        let rgba = if bpp == 4 {
-            data
-        } else {
-            let mut v = Vec::with_capacity(data.len() / 3 * 4);
-            for px in data.as_chunks::<3>().0 {
-                v.extend_from_slice(&[px[0], px[1], px[2], 255]);
-            }
-            v
-        };
-        return Ok(Decoded { width: cmd.width, height: cmd.height, rgba });
-    }
+        make_room(pixels as usize * 4);
+        fill_rgba(&mut &raw[..], pixels as usize, bpp)?
+    };
+    Ok(Decoded { width: cmd.width, height: cmd.height, rgba })
+}
 
-    decode_png(&data, memory_limit)
+/// Run a decoder to its end, checking it yields exactly `expected` bytes.
+fn check_inflated_len(mut dec: impl Read, expected: u64) -> Result<(), GErr> {
+    let mut buf = [0u8; 32 * 1024];
+    let mut total = 0u64;
+    loop {
+        match dec.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n as u64;
+                if total > expected {
+                    return Err(err("EFBIG", "Too much image data"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(err("EINVAL", "Failed to inflate image data")),
+        }
+    }
+    if total < expected {
+        return Err(err("ENODATA", format!("Insufficient image data: {total} < {expected}")));
+    }
+    Ok(())
+}
+
+/// Inflate a whole zlib stream, refusing more than `limit` output bytes.
+fn inflate_all(raw: &[u8], limit: u64) -> Result<Vec<u8>, GErr> {
+    // The output cannot exceed ratio * input, so reserving that (virtual,
+    // untouched) capacity up front avoids the doubling-and-copying growth.
+    let cap = raw
+        .len()
+        .saturating_mul(MAX_INFLATE_RATIO)
+        .saturating_add(64)
+        .min(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
+    let mut out = Vec::with_capacity(cap);
+    let mut dec = ZlibDecoder::new(raw).take(limit.saturating_add(1));
+    dec.read_to_end(&mut out).map_err(|_| err("EINVAL", "Failed to inflate image data"))?;
+    if out.len() as u64 > limit {
+        return Err(err("EFBIG", "Too much image data"));
+    }
+    Ok(out)
+}
+
+/// Stream `pixels` pixels of `bpp` (3 or 4) bytes each from `src` straight
+/// into a single RGBA allocation.
+fn fill_rgba(src: &mut impl Read, pixels: usize, bpp: usize) -> Result<Arc<[u8]>, GErr> {
+    let total = pixels * 4;
+    let mut arc = rgba_buffer(total);
+    let dst = buf_mut(&mut arc);
+    let inflate = |_| err("EINVAL", "Failed to inflate image data");
+    let insufficient =
+        |got: usize| err("ENODATA", format!("Insufficient image data: {} < {}", got, pixels * bpp));
+    if bpp == 4 {
+        let n = read_full(src, dst).map_err(inflate)?;
+        if n < total {
+            return Err(insufficient(n));
+        }
+    } else {
+        const CHUNK_PX: usize = 16 * 1024;
+        let mut buf = vec![0u8; CHUNK_PX * 3];
+        let mut done = 0usize;
+        while done < pixels {
+            let px = CHUNK_PX.min(pixels - done);
+            let n = read_full(src, &mut buf[..px * 3]).map_err(inflate)?;
+            if n < px * 3 {
+                return Err(insufficient(done * 3 + n));
+            }
+            for (d, s) in dst[done * 4..(done + px) * 4].chunks_exact_mut(4).zip(buf.chunks_exact(3)) {
+                d.copy_from_slice(&[s[0], s[1], s[2], 255]);
+            }
+            done += px;
+        }
+    }
+    Ok(arc)
+}
+
+/// Expand an `N`-bytes-per-pixel 8-bit image into a fresh RGBA buffer.
+fn expand<const N: usize>(src: &[u8], total: usize, f: impl Fn(&[u8]) -> [u8; 4]) -> Arc<[u8]> {
+    let mut arc = rgba_buffer(total);
+    for (d, s) in buf_mut(&mut arc).chunks_exact_mut(4).zip(src.chunks_exact(N)) {
+        d.copy_from_slice(&f(s));
+    }
+    arc
 }
 
 fn decode_png(data: &[u8], memory_limit: usize) -> Result<Decoded, GErr> {
+    use image::{DynamicImage, ImageDecoder};
     let bad = || err("EINVAL", "Failed to decode PNG data");
-    let reader = image::ImageReader::with_format(Cursor::new(data), image::ImageFormat::Png);
-    let (w, h) = reader.into_dimensions().map_err(|_| bad())?;
+    let mut dec = PngDecoder::new(Cursor::new(data)).map_err(|_| bad())?;
+    let (w, h) = dec.dimensions();
     if w == 0 || h == 0 {
         return Err(bad());
     }
@@ -130,11 +249,27 @@ fn decode_png(data: &[u8], memory_limit: usize) -> Result<Decoded, GErr> {
     if (w as u64) * (h as u64) * 4 > memory_limit as u64 {
         return Err(err("ENOSPC", "Image exceeds the storage quota"));
     }
-    let img = image::load_from_memory_with_format(data, image::ImageFormat::Png)
-        .map_err(|_| bad())?
-        .into_rgba8();
-    let (width, height) = img.dimensions();
-    Ok(Decoded { width, height, rgba: img.into_raw() })
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some((memory_limit as u64).saturating_mul(2).min(1 << 30));
+    dec.set_limits(limits).map_err(|_| err("ENOSPC", "Image exceeds the storage quota"))?;
+    let total = w as usize * h as usize * 4;
+
+    if dec.color_type() == image::ColorType::Rgba8 {
+        // Decode directly into the buffer that will be stored.
+        let mut arc = rgba_buffer(total);
+        dec.read_image(buf_mut(&mut arc)).map_err(|_| bad())?;
+        return Ok(Decoded { width: w, height: h, rgba: arc });
+    }
+    let img = DynamicImage::from_decoder(dec).map_err(|_| bad())?;
+    // Expand the common 8-bit layouts straight into the final buffer; only
+    // the exotic ones go through an intermediate RGBA image.
+    let rgba: Arc<[u8]> = match img {
+        DynamicImage::ImageLuma8(b) => expand::<1>(b.as_raw(), total, |s| [s[0], s[0], s[0], 255]),
+        DynamicImage::ImageLumaA8(b) => expand::<2>(b.as_raw(), total, |s| [s[0], s[0], s[0], s[1]]),
+        DynamicImage::ImageRgb8(b) => expand::<3>(b.as_raw(), total, |s| [s[0], s[1], s[2], 255]),
+        other => Arc::from(other.into_rgba8().into_raw()),
+    };
+    Ok(Decoded { width: w, height: h, rgba })
 }
 
 // ---------------------------------------------------------------------------
