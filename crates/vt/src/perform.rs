@@ -47,7 +47,9 @@ impl Perform for Terminal {
         self.last_cell = None;
     }
     fn put(&mut self, _: u8) {}
-    fn unhook(&mut self) {}
+    fn unhook(&mut self) {
+        self.dcs_unhooked = true;
+    }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         self.last_cell = None;
@@ -73,12 +75,14 @@ impl Perform for Terminal {
             ([b'#'], b'8') => {
                 // DECALN
                 let style = Style::default();
-                for r in 0..self.rows {
-                    for c in 0..self.cols {
-                        *self.grid_mut().cell_mut(r, c) =
-                            Cell::with_style('E', &style, CellWidth::Single);
+                if self.try_spend(self.rows as u64 * self.cols as u64) {
+                    for r in 0..self.rows {
+                        for c in 0..self.cols {
+                            *self.grid_mut().cell_mut(r, c) =
+                                Cell::with_style('E', &style, CellWidth::Single);
+                        }
+                        self.mark_row(r);
                     }
-                    self.mark_row(r);
                 }
                 self.cursor = Cursor::default();
                 self.pending_wrap = false;
@@ -169,13 +173,22 @@ impl Perform for Terminal {
                 self.set_cursor_pos(arg(&ps, 0, 1) - 1, col);
             }
             ([], 'I') => {
-                for _ in 0..arg(&ps, 0, 1) {
-                    self.cursor.col = self.next_tab(self.cursor.col);
+                // At most `cols` stops exist; stop once the column is stuck.
+                for _ in 0..arg(&ps, 0, 1).min(cols) {
+                    let next = self.next_tab(self.cursor.col);
+                    if next == self.cursor.col {
+                        break;
+                    }
+                    self.cursor.col = next;
                 }
             }
             ([], 'Z') => {
-                for _ in 0..arg(&ps, 0, 1) {
-                    self.cursor.col = self.prev_tab(self.cursor.col);
+                for _ in 0..arg(&ps, 0, 1).min(cols) {
+                    let prev = self.prev_tab(self.cursor.col);
+                    if prev == self.cursor.col {
+                        break;
+                    }
+                    self.cursor.col = prev;
                 }
             }
             ([], 'g') => match arg0(&ps, 0) {
@@ -231,7 +244,8 @@ impl Perform for Terminal {
                 if r >= self.region_top && r <= self.region_bottom {
                     let bg = self.pen.bg;
                     let bottom = self.region_bottom;
-                    self.grid_mut().insert_lines(r, bottom, arg(&ps, 0, 1), bg);
+                    let n = self.spend_rows(arg(&ps, 0, 1).min(bottom - r + 1));
+                    self.grid_mut().insert_lines(r, bottom, n, bg);
                     self.cursor.col = 0;
                     self.mark_rows(r, bottom);
                 }
@@ -241,24 +255,30 @@ impl Perform for Terminal {
                 if r >= self.region_top && r <= self.region_bottom {
                     let bg = self.pen.bg;
                     let bottom = self.region_bottom;
-                    self.grid_mut().delete_lines(r, bottom, arg(&ps, 0, 1), bg);
+                    let n = self.spend_rows(arg(&ps, 0, 1).min(bottom - r + 1));
+                    self.grid_mut().delete_lines(r, bottom, n, bg);
                     self.cursor.col = 0;
                     self.mark_rows(r, bottom);
                 }
             }
             ([], 'S') => {
                 let (t, b) = (self.region_top, self.region_bottom);
-                self.scroll_up(t, b, arg(&ps, 0, 1));
+                let n = self.spend_rows(arg(&ps, 0, 1).min(b - t + 1));
+                self.scroll_up(t, b, n);
             }
             ([], 'T') => {
                 if ps.len() <= 1 {
                     let (t, b) = (self.region_top, self.region_bottom);
-                    self.scroll_down(t, b, arg(&ps, 0, 1));
+                    let n = self.spend_rows(arg(&ps, 0, 1).min(b - t + 1));
+                    self.scroll_down(t, b, n);
                 }
             }
             ([], 'b') => {
                 if let Some(c) = self.last_char {
-                    for _ in 0..arg(&ps, 0, 1).min(65535) {
+                    // More than a screenful is indistinguishable from a
+                    // screenful, and the total is bounded by input volume.
+                    let want = arg(&ps, 0, 1).min(rows * cols);
+                    for _ in 0..self.spend_cells(want) {
                         self.print_char(c);
                     }
                     self.last_cell = None;
@@ -548,13 +568,21 @@ impl Perform for Terminal {
                 if params.len() < 3 {
                     return;
                 }
-                let sel = String::from_utf8_lossy(params[1]).into_owned();
-                self.clip_selection = if sel.is_empty() { "c".into() } else { sel };
+                // Only real selection names are ever echoed back in a reply.
+                let sel = params[1];
+                self.clip_selection = if !sel.is_empty()
+                    && sel.len() <= 8
+                    && sel.iter().all(|b| matches!(b, b'c' | b'p' | b'q' | b's' | b'0'..=b'7'))
+                {
+                    String::from_utf8_lossy(sel).into_owned()
+                } else {
+                    "c".into()
+                };
                 if params[2] == b"?" {
                     self.events.push(TermEvent::ClipboardQuery);
                 } else if params[2].len() > MAX_CLIPBOARD_B64 {
                     // Refuse oversized writes without decoding them.
-                } else if let Some(bytes) = util::base64_decode(params[2]) {
+                } else if let Some(bytes) = util::base64_decode_strict(params[2]) {
                     self.events.push(TermEvent::ClipboardSet(
                         String::from_utf8_lossy(&bytes).into_owned(),
                     ));

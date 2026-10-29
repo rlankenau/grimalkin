@@ -27,19 +27,28 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-pub fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
+/// Strict standard base64 (RFC 4648 alphabet, canonical padding, no
+/// whitespace). Anything else is `None`, so malformed OSC 52 payloads are
+/// ignored rather than half-decoded.
+pub fn base64_decode_strict(data: &[u8]) -> Option<Vec<u8>> {
+    if !data.len().is_multiple_of(4) {
+        return None;
+    }
+    let pad = data.iter().rev().take_while(|&&c| c == b'=').count();
+    if pad > 2 {
+        return None;
+    }
+    let body = &data[..data.len() - pad];
     let mut out = Vec::with_capacity(data.len() / 4 * 3);
     let mut acc: u32 = 0;
     let mut bits = 0;
-    for &c in data {
+    for &c in body {
         let v = match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' => break,
-            b'\r' | b'\n' | b' ' => continue,
+            b'+' => 62,
+            b'/' => 63,
             _ => return None,
         };
         acc = (acc << 6) | v as u32;
@@ -145,11 +154,17 @@ mod tests {
     fn base64_roundtrip() {
         for s in ["", "f", "fo", "foo", "foob", "fooba", "foobar", "héllo wörld"] {
             let e = base64_encode(s.as_bytes());
-            assert_eq!(base64_decode(e.as_bytes()).unwrap(), s.as_bytes());
+            assert_eq!(base64_decode_strict(e.as_bytes()).unwrap(), s.as_bytes());
         }
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert!(base64_decode(b"!!!").is_none());
+        assert!(base64_decode_strict(b"!!!").is_none());
+        // Short, unpadded, misplaced-padding, whitespace and padding-only
+        // inputs are all rejected rather than half-decoded.
+        for bad in ["A", "AAA", "====", "QQ==QQ==", "QQ=", "Q===", "QQ Q", "QQ\n=", "AA=A", "-_-_"] {
+            assert!(base64_decode_strict(bad.as_bytes()).is_none(), "{bad:?}");
+        }
+        assert_eq!(base64_decode_strict(b"").unwrap(), b"");
     }
 
     #[test]

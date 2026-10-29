@@ -91,13 +91,53 @@ pub struct Style {
     pub hyperlink_id: Option<u32>,
 }
 
+/// Combining marks of a cell. Nearly all cells have none, so this is a single
+/// (null) pointer rather than an inline `Vec`: 16 bytes less per cell, which
+/// is what scrollback is made of.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::box_collection)] // deliberate: a thin pointer, not a 24-byte Vec
+pub struct Combining(Option<Box<Vec<char>>>);
+
+impl Combining {
+    pub const fn new() -> Combining {
+        Combining(None)
+    }
+    pub fn push(&mut self, c: char) {
+        self.0.get_or_insert_with(Default::default).push(c);
+    }
+}
+
+impl std::ops::Deref for Combining {
+    type Target = [char];
+    fn deref(&self) -> &[char] {
+        match &self.0 {
+            Some(v) => v,
+            None => &[],
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Combining {
+    type Item = &'a char;
+    type IntoIter = std::slice::Iter<'a, char>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl PartialEq<Vec<char>> for Combining {
+    fn eq(&self, other: &Vec<char>) -> bool {
+        **self == other[..]
+    }
+}
+
 /// One grid cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     /// Base character (`' '` for empty cells).
     pub ch: char,
     /// Zero-width combining characters / grapheme extension that follow `ch`.
-    pub combining: Vec<char>,
+    pub combining: Combining,
     pub fg: Color,
     pub bg: Color,
     pub flags: Flags,
@@ -117,7 +157,7 @@ impl Cell {
     pub const fn blank() -> Cell {
         Cell {
             ch: ' ',
-            combining: Vec::new(),
+            combining: Combining::new(),
             fg: Color::Default,
             bg: Color::Default,
             flags: Flags::empty(),
@@ -139,7 +179,7 @@ impl Cell {
     pub fn with_style(ch: char, style: &Style, width: CellWidth) -> Cell {
         Cell {
             ch,
-            combining: Vec::new(),
+            combining: Combining::new(),
             fg: style.fg,
             bg: style.bg,
             flags: style.flags,
@@ -257,7 +297,13 @@ impl Row {
     /// Resize the row, truncating or extending with blank cells.
     pub fn resize(&mut self, cols: usize) {
         self.cells.resize(cols, Cell::blank());
-        self.fix_wide();
+        // Rows are consistent on entry, so the only wide cell that can have
+        // lost its spacer is one now sitting in the last column.
+        if let Some(last) = self.cells.last_mut() {
+            if last.width == CellWidth::Wide {
+                *last = Cell::erased(last.bg);
+            }
+        }
     }
 
     /// Repair orphaned wide cells / spacers anywhere in the row.
