@@ -91,7 +91,11 @@ fn load_path(path: &Path) -> Result<Skin, String> {
 }
 
 fn is_wsz(name: &str) -> bool {
-    name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".wsz")
+    // `get`: a multibyte name (`日本語`) has no char boundary at len-4.
+    name.len() > 4
+        && name
+            .get(name.len() - 4..)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(".wsz"))
 }
 
 /// Installed `.wsz` skins in `dir`: (skin name, file), sorted by name.
@@ -100,7 +104,7 @@ pub fn installed(dir: &Path) -> Vec<(String, PathBuf)> {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let file = e.file_name().to_string_lossy().into_owned();
-            if is_wsz(&file) && e.file_type().is_ok_and(|t| t.is_file()) {
+            if is_wsz(&file) && !crate::textsafe::has_unsafe_chars(&file) && e.file_type().is_ok_and(|t| t.is_file()) {
                 v.push((file[..file.len() - 4].to_string(), e.path()));
             }
         }
@@ -177,6 +181,25 @@ mod tests {
     use crate::config::Rgb;
     use crate::skin::hit::{ButtonKind, Hit};
     use crate::skin::{Action, SkinRuntime};
+
+    /// F1: names with multibyte characters at the end must not panic.
+    #[test]
+    fn multibyte_names_are_not_wsz_and_do_not_panic() {
+        for n in ["日本語", "日日", "éé", "皮肤", "a日", "日.wsz", "é.WSZ"] {
+            assert_eq!(is_wsz(n), n.to_ascii_lowercase().ends_with(".wsz") && n.len() > 4, "{n}");
+        }
+        let dir = std::env::temp_dir().join(format!("grimalkin-f1-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("日本語")).unwrap();
+        std::fs::write(dir.join("é.wsz"), b"x").unwrap();
+        std::fs::write(dir.join("皮肤"), b"x").unwrap();
+        let v = installed(&dir);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].0, "é");
+        for r in ["日本語", "winamp:日日", "winamp:éé", "winamp:皮肤", "éé"] {
+            let _ = resolve(r, Some(&dir));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A 280 x 186 pledit.bmp whose sprite regions are flat colours, so the
     /// composition can be checked pixel by pixel.

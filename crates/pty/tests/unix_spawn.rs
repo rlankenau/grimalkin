@@ -5,7 +5,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use grimalkin_pty::{Pty, PtyEvent, SpawnConfig};
+use grimalkin_pty::{Backlog, Pty, PtyEvent, SpawnConfig};
 
 /// Collect output until `pred(accumulated)` is true or timeout; returns the
 /// accumulated bytes and any Exited event seen.
@@ -182,6 +182,7 @@ fn on_wake_called() {
         login_shell: false,
         passthrough: false,
         tx: txs,
+        backlog: None,
         on_wake: Some(Box::new(move || {
             n2.fetch_add(1, Ordering::SeqCst);
         })),
@@ -367,4 +368,54 @@ fn shutdown_kills_child_that_ignores_hup() {
     pty.shutdown(Duration::from_millis(300));
     assert!(start.elapsed() < Duration::from_secs(2));
     assert!(!pty.is_alive());
+}
+
+/// F14: a child that outruns the consumer must be throttled, not queued.
+#[test]
+fn backlog_throttles_a_flooding_child() {
+    let (tx, rx) = channel();
+    let limit = 256 * 1024;
+    let backlog = Backlog::new(limit);
+    let mut pty = Pty::spawn_with(SpawnConfig {
+        cmd: "/bin/sh".into(),
+        args: vec!["-c".into(), "yes".into()],
+        cwd: None,
+        env: vec![],
+        cols: 80,
+        rows: 24,
+        pixel_width: 0,
+        pixel_height: 0,
+        login_shell: false,
+        passthrough: false,
+        tx,
+        backlog: Some(backlog.clone()),
+        on_wake: None,
+    })
+    .unwrap();
+    // Nobody drains for a while: the queue must stop growing near the limit.
+    std::thread::sleep(Duration::from_millis(700));
+    let queued = backlog.queued();
+    assert!(queued >= limit, "reader should have filled the backlog, got {queued}");
+    assert!(queued <= limit + grimalkin_pty::MAX_CHUNK, "backlog grew past its limit: {queued}");
+    let mut in_channel = 0usize;
+    while let Ok(PtyEvent::Output(b)) = rx.try_recv() {
+        in_channel += b.len();
+        backlog.consumed(b.len());
+    }
+    assert!(in_channel <= limit + grimalkin_pty::MAX_CHUNK, "channel held {in_channel} bytes");
+    // Draining lets it run again.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(backlog.queued() > 0);
+    // Stopping the child ends the stream even with the reader throttled.
+    let _ = pty.kill();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut exited = false;
+    while Instant::now() < deadline && !exited {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(PtyEvent::Output(b)) => backlog.consumed(b.len()),
+            Ok(PtyEvent::Exited(_)) => exited = true,
+            Err(_) => {}
+        }
+    }
+    assert!(exited, "no Exited after kill");
 }

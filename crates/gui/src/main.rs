@@ -23,6 +23,7 @@ mod config;
 mod config_edit;
 mod debug_script;
 mod fonts;
+mod fsutil;
 mod glyphs;
 mod graphics_glue;
 mod icon;
@@ -37,8 +38,10 @@ mod renderer;
 mod selection;
 mod skin;
 mod terminfo;
+mod textsafe;
 mod theme;
 
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 use winit::event_loop::EventLoop;
@@ -88,20 +91,73 @@ Options:
   -V, --version                 Show the version
 ";
 
-pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Parsed {
-    let mut opts = LaunchOptions::default();
-    let mut it = args.into_iter();
-    while let Some(a) = it.next() {
-        let (flag, inline) = match a.split_once('=') {
-            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
-            _ => (a.clone(), None),
+/// Split `--flag=value` at the first `=` without requiring valid Unicode (a
+/// folder name can legally contain unpaired surrogates / non-UTF-8 bytes).
+/// Returns the flag text (lossy: only compared against known ASCII flags) and
+/// the raw value when the argument was `--flag=value`.
+fn split_flag(a: &OsStr) -> (String, Option<OsString>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let b = a.as_bytes();
+        if b.starts_with(b"--") {
+            if let Some(i) = b.iter().position(|&c| c == b'=') {
+                return (
+                    String::from_utf8_lossy(&b[..i]).into_owned(),
+                    Some(OsString::from_vec(b[i + 1..].to_vec())),
+                );
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let w: Vec<u16> = a.encode_wide().collect();
+        let eq = u16::from(b'=');
+        if w.len() > 2 && w[0] == u16::from(b'-') && w[1] == u16::from(b'-') {
+            if let Some(i) = w.iter().position(|&c| c == eq) {
+                return (
+                    String::from_utf16_lossy(&w[..i]),
+                    Some(OsString::from_wide(&w[i + 1..])),
+                );
+            }
+        }
+    }
+    (a.to_string_lossy().into_owned(), None)
+}
+
+/// A value that must be Unicode (names, URLs, the command line).
+fn unicode_value(flag: &str, v: OsString) -> Result<String, String> {
+    v.into_string()
+        .map_err(|_| format!("{flag}: argument is not valid Unicode"))
+}
+
+pub fn parse_args<I, S>(args: I) -> Parsed
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    macro_rules! unicode {
+        ($flag:expr, $v:expr) => {
+            match unicode_value($flag, $v) {
+                Ok(s) => s,
+                Err(e) => return Parsed::Error(e),
+            }
         };
+    }
+    let mut opts = LaunchOptions::default();
+    let mut it = args.into_iter().map(Into::into);
+    while let Some(a) = it.next() {
+        let a: OsString = a;
+        let (flag, inline) = split_flag(&a);
         match flag.as_str() {
             "-h" | "--help" => return Parsed::Info(USAGE.to_string()),
             "-V" | "--version" => return Parsed::Info(format!("grimalkin {}\n", env!("CARGO_PKG_VERSION"))),
             "-e" | "--command" => {
-                let mut cmd: Vec<String> = inline.into_iter().collect();
-                cmd.extend(it.by_ref());
+                let mut cmd: Vec<String> = Vec::new();
+                for v in inline.into_iter().chain(it.by_ref()) {
+                    cmd.push(unicode!(&flag, v));
+                }
                 if cmd.is_empty() {
                     return Parsed::Error(format!("{flag} requires a command"));
                 }
@@ -113,7 +169,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Parsed {
                 None => return Parsed::Error("--config requires a path".into()),
             },
             "--skin" => match inline.or_else(|| it.next()) {
-                Some(s) => opts.skin = Some(s),
+                Some(s) => opts.skin = Some(unicode!(&flag, s)),
                 None => return Parsed::Error("--skin requires a name".into()),
             },
             "--working-directory" => match inline.or_else(|| it.next()) {
@@ -121,11 +177,11 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Parsed {
                 None => return Parsed::Error("--working-directory requires a path".into()),
             },
             "--theme" => match inline.or_else(|| it.next()) {
-                Some(n) => opts.theme = Some(n),
+                Some(n) => opts.theme = Some(unicode!(&flag, n)),
                 None => return Parsed::Error("--theme requires a name".into()),
             },
             "--install-skin" => match inline.or_else(|| it.next()) {
-                Some(s) => opts.install_skin = Some(s),
+                Some(s) => opts.install_skin = Some(unicode!(&flag, s)),
                 None => return Parsed::Error("--install-skin requires a path or URL".into()),
             },
             "--force" => opts.force = true,
@@ -237,24 +293,65 @@ fn install_panic_hook() {
         let backtrace = std::backtrace::Backtrace::force_capture().to_string();
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let report = format_panic_report(secs, &thread, &message, &location, &backtrace);
-        eprintln!("{report}");
+        // Never panic from inside the hook: a closed stderr pipe makes
+        // `eprintln!` panic, and a panic in the hook aborts the process
+        // (exit 134 and an OS crash report), the very thing the hook prevents.
+        use std::io::Write;
+        let mut err = std::io::stderr();
+        let _ = writeln!(err, "{report}");
         match panic_log_path() {
             Some(path) => match append_panic_log(&path, &report) {
-                Ok(()) => eprintln!("grimalkin: panic report written to {}", path.display()),
-                Err(e) => eprintln!("grimalkin: cannot write {}: {e}", path.display()),
+                Ok(()) => {
+                    let _ = writeln!(err, "grimalkin: panic report written to {}", path.display());
+                }
+                Err(e) => {
+                    let _ = writeln!(err, "grimalkin: cannot write {}: {e}", path.display());
+                }
             },
-            None => eprintln!("grimalkin: no data directory; panic report not saved"),
+            None => {
+                let _ = writeln!(err, "grimalkin: no data directory; panic report not saved");
+            }
         }
         std::process::exit(101);
     }));
 }
 
+/// Tell the user about a fatal start-up failure when there is no terminal to
+/// print to. Best effort; silent where there is no native dialog helper.
+fn fatal_dialog(msg: &str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (text, title) = (wide(msg), wide("grimalkin"));
+        // SAFETY: both buffers are NUL-terminated and outlive the call.
+        unsafe {
+            MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // The message is an argument, not part of the script text.
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", "on run argv", "-e", "display alert \"grimalkin\" message (item 1 of argv) as critical", "-e", "end run"])
+            .arg(msg)
+            .status();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = msg;
+}
+
 fn main() {
     install_panic_hook();
+    // Test hook (see tests/panic_hook.rs): panic after N milliseconds.
+    if let Some(ms) = std::env::var("GRIMALKIN_DEBUG_PANIC").ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        panic!("GRIMALKIN_DEBUG_PANIC");
+    }
     console::attach();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,grimalkin=info")).init();
 
-    let opts = match parse_args(std::env::args().skip(1)) {
+    let opts = match parse_args(std::env::args_os().skip(1)) {
         Parsed::Run(o) => o,
         Parsed::Info(s) => {
             print!("{s}");
@@ -291,7 +388,14 @@ fn main() {
         std::process::exit(1);
     }
     if let Some(err) = app.fatal_error() {
-        eprintln!("grimalkin: {err}");
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "grimalkin: {err}");
+        // A GUI launch (Dock, Explorer, a shortcut) has no stderr the user
+        // sees: say it in a dialog as well.
+        use std::io::IsTerminal;
+        if !std::io::stderr().is_terminal() {
+            fatal_dialog(err);
+        }
         console::exit(1);
     }
 }
@@ -372,6 +476,27 @@ mod tests {
         assert!(matches!(parse_args(args(&["--bogus"])), Parsed::Error(_)));
         assert!(matches!(parse_args(args(&["-e"])), Parsed::Error(_)));
         assert!(matches!(parse_args(args(&["--help"])), Parsed::Info(_)));
+    }
+
+    #[test]
+    fn non_unicode_arguments_do_not_panic() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = OsString::from_vec(b"a\xffb".to_vec());
+            match parse_args([OsString::from("--working-directory"), bad.clone()]) {
+                Parsed::Run(o) => assert_eq!(o.working_directory, Some(PathBuf::from(bad.clone()))),
+                _ => panic!(),
+            }
+            let mut inline = b"--working-directory=".to_vec();
+            inline.extend_from_slice(b"a\xffb");
+            match parse_args([OsString::from_vec(inline)]) {
+                Parsed::Run(o) => assert_eq!(o.working_directory, Some(PathBuf::from(bad.clone()))),
+                _ => panic!(),
+            }
+            assert!(matches!(parse_args([OsString::from("--theme"), bad.clone()]), Parsed::Error(_)));
+            assert!(matches!(parse_args([bad]), Parsed::Error(_)));
+        }
     }
 
     #[test]

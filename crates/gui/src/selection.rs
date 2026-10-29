@@ -69,6 +69,15 @@ fn class(c: char) -> Class {
     }
 }
 
+/// True when the last cell of the soft-wrapped `row` is the blank pad left
+/// because the wide character at the start of `next` did not fit (the
+/// terminal marks that cell `Flags::WRAP_PAD`; a typed space is not marked).
+pub fn wide_wrap_pad(row: &grimalkin_vt::Row, next: Option<&grimalkin_vt::Row>) -> bool {
+    row.wrapped
+        && row.cells.last().is_some_and(|c| c.flags.contains(grimalkin_vt::Flags::WRAP_PAD))
+        && next.and_then(|n| n.cells.first()).is_some_and(|c| c.width == CellWidth::Wide)
+}
+
 #[derive(Debug)]
 pub struct Selection {
     mode: Mode,
@@ -86,6 +95,8 @@ pub struct Selection {
     screen: Screen,
     alt_count: u64,
     fingerprint: u64,
+    /// Hashes of scrollback rows (which never change) under the selection.
+    row_cache: RowHashCache,
     completed: bool,
 }
 
@@ -104,6 +115,7 @@ impl Default for Selection {
             screen: Screen::Main,
             alt_count: 0,
             fingerprint: 0,
+            row_cache: RowHashCache::default(),
             completed: false,
         }
     }
@@ -287,8 +299,13 @@ impl Selection {
             let c1 = c1.min(len - 1);
             let last_row = abs == e.abs;
             let mut line = String::new();
+            let pad = c1 + 1 >= len && wide_wrap_pad(row, term.row_at_abs(abs + 1));
             if c0 <= c1 {
-                for cell in &row.cells[c0..=c1] {
+                let cells = &row.cells[c0..=c1];
+                // A wide char that did not fit at the end of a soft-wrapped
+                // row leaves an erased pad cell there; it is not text.
+                let cells = if pad { &cells[..cells.len() - 1] } else { cells };
+                for cell in cells {
                     if cell.width == CellWidth::WideSpacer {
                         continue;
                     }
@@ -365,23 +382,84 @@ impl Selection {
         }
     }
 
-    fn hash_range(&self, term: &Terminal, s: Point, e: Point) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+    /// A fingerprint of the text under `s..=e`, to notice when a program
+    /// writes over it. Rows that have scrolled into history cannot change, so
+    /// their hashes are computed once and kept; only the live screen's rows
+    /// are rehashed on each call. (Rehashing every cell of a 100k-line
+    /// selection took ~40 ms per drag event and per pty chunk.)
+    fn hash_range(&mut self, term: &Terminal, s: Point, e: Point) -> u64 {
+        let live_top = term.abs_row_of_visible_row(0) + term.display_offset() as u64;
+        self.row_cache.prepare(term.screen(), term.cols(), term.oldest_abs_row(), s.abs, live_top);
+        let mut acc = 0xcbf2_9ce4_8422_2325u64;
         for abs in s.abs..=e.abs {
-            match term.row_at_abs(abs) {
-                Some(row) => {
-                    for c in &row.cells {
-                        c.ch.hash(&mut h);
-                        for &m in &c.combining {
-                            m.hash(&mut h);
-                        }
-                    }
-                    row.wrapped.hash(&mut h);
-                }
-                None => 0u8.hash(&mut h),
-            }
+            let rh = if abs < live_top {
+                self.row_cache.get_or_hash(term, abs)
+            } else {
+                row_hash(term, abs)
+            };
+            acc = (acc ^ rh).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(5);
         }
-        h.finish()
+        acc
+    }
+}
+
+/// Hash of one row's text (and its wrap flag); rows outside the buffer hash
+/// as zero.
+fn row_hash(term: &Terminal, abs: u64) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match term.row_at_abs(abs) {
+        Some(row) => {
+            for c in &row.cells {
+                c.ch.hash(&mut h);
+                for &m in &c.combining {
+                    m.hash(&mut h);
+                }
+            }
+            row.wrapped.hash(&mut h);
+        }
+        None => 0u8.hash(&mut h),
+    }
+    h.finish()
+}
+
+/// Cached [`row_hash`]es for a contiguous run of scrollback rows.
+#[derive(Debug, Default)]
+struct RowHashCache {
+    screen: Option<Screen>,
+    cols: usize,
+    first: u64,
+    hashes: Vec<u64>,
+}
+
+impl RowHashCache {
+    /// Drop the cache when it can no longer be trusted: another screen, a
+    /// resize, history trimmed or cleared from under it, or a start row the
+    /// run does not cover.
+    fn prepare(&mut self, screen: Screen, cols: usize, oldest: u64, start: u64, live_top: u64) {
+        let end = self.first + self.hashes.len() as u64;
+        let stale = self.screen != Some(screen)
+            || self.cols != cols
+            || self.first < oldest
+            || end > live_top
+            || start < self.first
+            || start > end;
+        if stale {
+            self.screen = Some(screen);
+            self.cols = cols;
+            self.first = start;
+            self.hashes.clear();
+        }
+    }
+
+    /// The hash of scrollback row `abs` (must be `>= first`); rows are cached
+    /// in order, so a miss extends the run up to and including `abs`.
+    fn get_or_hash(&mut self, term: &Terminal, abs: u64) -> u64 {
+        let idx = (abs - self.first) as usize;
+        while self.hashes.len() <= idx {
+            let next = self.first + self.hashes.len() as u64;
+            self.hashes.push(row_hash(term, next));
+        }
+        self.hashes[idx]
     }
 }
 
@@ -473,6 +551,57 @@ mod tests {
         sel.on_press(t, a, MouseButton::Left, mods, Instant::now());
         sel.on_drag(t, b);
         sel.on_release(t, b, MouseButton::Left);
+    }
+
+    #[test]
+    fn wide_char_wrap_pad_is_not_copied() {
+        // F38: a spurious space appeared where a wide char wrapped.
+        let t = term(10, 4, "aaaaaaaaa\u{4e16}bbb");
+        let mut s = Selection::new();
+        drag(&mut s, &t, pos(0, 0), pos(9, 1), ModifiersState::empty());
+        assert_eq!(s.selected_text(&t).as_deref(), Some("aaaaaaaaa\u{4e16}bbb"));
+        let t = term(3, 4, "\u{4e16}\u{4e16}");
+        let mut s = Selection::new();
+        drag(&mut s, &t, pos(0, 0), pos(2, 1), ModifiersState::empty());
+        assert_eq!(s.selected_text(&t).as_deref(), Some("\u{4e16}\u{4e16}"));
+        // A real space before a wrapped wide char is kept.
+        let t = term(10, 4, "aaaaaaaa \u{4e16}b");
+        let mut s = Selection::new();
+        drag(&mut s, &t, pos(0, 0), pos(9, 1), ModifiersState::empty());
+        assert_eq!(s.selected_text(&t).as_deref(), Some("aaaaaaaa \u{4e16}b"));
+    }
+
+    #[test]
+    fn scrollback_rows_are_hashed_once_and_changes_still_clear_the_selection() {
+        // F44: a large selection rehashed every cell on each drag event.
+        let mut text = String::new();
+        for i in 0..20_000 {
+            text.push_str(&format!("line number {i} with some text to hash\r\n"));
+        }
+        let mut t = Terminal::new(80, 24, 100_000);
+        t.advance(text.as_bytes());
+        let mut s = Selection::new();
+        let top = CellPos { col: 0, row: 0 };
+        let bot = CellPos { col: 5, row: 23 };
+        s.on_press(&t, top, MouseButton::Left, ModifiersState::empty(), Instant::now());
+        // Scroll the view up so the selection spans history and the live screen.
+        t.scroll_display(200);
+        s.on_drag(&t, bot);
+        s.on_release(&t, bot, MouseButton::Left);
+        assert!(s.is_active());
+        let (a, b) = s.range.unwrap();
+        assert!(b.abs - a.abs > 20, "selection should reach into scrollback");
+        // Warm: the whole scrollback part is cached.
+        assert!(!s.validate(&t));
+        assert!(s.row_cache.hashes.len() as u64 >= (b.abs - a.abs).saturating_sub(24));
+        let t0 = Instant::now();
+        for _ in 0..50 {
+            assert!(!s.validate(&t));
+        }
+        assert!(t0.elapsed().as_millis() < 500, "{:?}", t0.elapsed());
+        // New output elsewhere keeps the selection; overwriting selected text drops it.
+        t.advance(b"more output\r\n");
+        assert!(!s.validate(&t));
     }
 
     #[test]

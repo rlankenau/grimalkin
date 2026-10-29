@@ -98,6 +98,64 @@ pub enum PtyEvent {
     Exited(Option<u32>),
 }
 
+/// Back-pressure between the reader thread and whoever drains the channel.
+///
+/// The channel is unbounded, so without this a child that writes faster than
+/// the application can parse (`yes`, `cat` of a huge file) builds a backlog of
+/// hundreds of MB: output keeps scrolling long after the child was stopped,
+/// and the UI never catches up. With a `Backlog` in [`SpawnConfig`] the reader
+/// stops reading (the child then blocks in `write`) while more than `limit`
+/// bytes are queued; the consumer calls [`Backlog::consumed`] for every
+/// [`PtyEvent::Output`] it takes off the channel.
+#[derive(Debug)]
+pub struct Backlog {
+    queued: Mutex<usize>,
+    cv: Condvar,
+    limit: usize,
+}
+
+impl Backlog {
+    pub fn new(limit: usize) -> Arc<Backlog> {
+        Arc::new(Backlog {
+            queued: Mutex::new(0),
+            cv: Condvar::new(),
+            limit: limit.max(MAX_CHUNK),
+        })
+    }
+
+    /// Bytes currently queued and not yet reported as consumed.
+    pub fn queued(&self) -> usize {
+        *self.queued.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Record that `n` queued output bytes were taken off the channel.
+    pub fn consumed(&self, n: usize) {
+        let mut q = self.queued.lock().unwrap_or_else(|p| p.into_inner());
+        *q = q.saturating_sub(n);
+        self.cv.notify_all();
+    }
+
+    /// Block while the queue is over the limit (polling `give_up` and calling
+    /// `tick` every 50 ms so the caller can show it is alive), then add `n`.
+    fn reserve(&self, n: usize, give_up: impl Fn() -> bool, tick: impl Fn()) {
+        let mut q = self.queued.lock().unwrap_or_else(|p| p.into_inner());
+        while *q >= self.limit {
+            if give_up() {
+                return;
+            }
+            let (g, res) = self
+                .cv
+                .wait_timeout(q, Duration::from_millis(50))
+                .unwrap_or_else(|p| p.into_inner());
+            q = g;
+            if res.timed_out() {
+                tick();
+            }
+        }
+        *q += n;
+    }
+}
+
 /// Callback invoked (from a background thread) after each event is sent.
 pub type WakeFn = Box<dyn Fn() + Send + Sync>;
 
@@ -127,6 +185,8 @@ pub struct SpawnConfig {
     pub passthrough: bool,
     /// Channel receiving [`PtyEvent`]s.
     pub tx: Sender<PtyEvent>,
+    /// Optional back-pressure on the reader (see [`Backlog`]).
+    pub backlog: Option<Arc<Backlog>>,
     /// Called after every event is sent.
     pub on_wake: Option<WakeFn>,
 }
@@ -305,6 +365,7 @@ impl Pty {
             login_shell: args.is_empty() && (cmd.is_empty() || is_known_shell(cmd)),
             passthrough: false,
             tx,
+            backlog: None,
             on_wake: None,
         })
     }
@@ -335,10 +396,11 @@ impl Pty {
             let wake = wake.clone();
             let state = reader_state.clone();
             let closed = closed.clone();
+            let backlog = cfg.backlog.clone();
             thread::Builder::new()
                 .name("grimalkin-pty-reader".into())
                 .spawn(move || {
-                    read_loop(reader, &tx, wake.as_deref(), &closed, &state);
+                    read_loop(reader, &tx, wake.as_deref(), &closed, &state, backlog.as_deref());
                     let (lock, cv) = &*state;
                     lock.lock().unwrap_or_else(|p| p.into_inner()).done = true;
                     cv.notify_all();
@@ -502,12 +564,27 @@ fn read_loop(
     wake: Option<&(dyn Fn() + Send + Sync)>,
     closed: &Mutex<bool>,
     state: &(Mutex<ReaderState>, Condvar),
+    backlog: Option<&Backlog>,
 ) {
     let mut buf = vec![0u8; MAX_CHUNK];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                if let Some(b) = backlog {
+                    // Wait for the consumer. While waiting count a "read" now
+                    // and then so the exit logic does not mistake a throttled
+                    // reader for a finished one and cut the output short.
+                    b.reserve(
+                        n,
+                        || *closed.lock().unwrap_or_else(|p| p.into_inner()),
+                        || {
+                            let (lock, cv) = state;
+                            lock.lock().unwrap_or_else(|p| p.into_inner()).reads += 1;
+                            cv.notify_all();
+                        },
+                    );
+                }
                 {
                     let c = closed.lock().unwrap_or_else(|p| p.into_inner());
                     if *c || tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
@@ -772,6 +849,7 @@ mod tests {
             login_shell: false,
             passthrough: false,
             tx,
+            backlog: None,
             on_wake: None,
         }
     }

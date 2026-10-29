@@ -36,6 +36,10 @@ impl Flags {
     pub const INVERSE: Flags = Flags(1 << 4);
     pub const HIDDEN: Flags = Flags(1 << 5);
     pub const BLINK: Flags = Flags(1 << 6);
+    /// Internal marker, not an SGR attribute: the blank left at the end of a
+    /// soft-wrapped row because a wide character did not fit there. Lets
+    /// copy / URL detection tell it from a typed space.
+    pub const WRAP_PAD: Flags = Flags(1 << 7);
 
     pub const fn empty() -> Flags {
         Flags(0)

@@ -36,6 +36,11 @@ pub enum Layer {
 }
 
 const BELOW_BG_Z: i32 = -(1 << 30);
+/// Most placements laid out and drawn in one frame. A program can put
+/// thousands of distinct images on screen (stacked on the same cells), and
+/// each costs a texture, a bind group and a draw call every frame; past this
+/// only the topmost ones (last in draw order) are shown.
+const MAX_VISIBLE_PLACEMENTS: usize = 512;
 /// Soft cap for GPU memory held by image textures (LRU-evicted above this).
 const TEXTURE_BUDGET: u64 = 512 * 1024 * 1024;
 
@@ -92,6 +97,15 @@ pub struct ImageRenderer {
     /// Scissor rectangle (x, y, w, h) clipping images to the grid.
     clip: [u32; 4],
     surface: [u32; 2],
+}
+
+/// Keep the topmost [`MAX_VISIBLE_PLACEMENTS`] of the placements given in draw
+/// order (bottom first).
+fn limit_visible<T>(mut v: Vec<T>) -> Vec<T> {
+    if v.len() > MAX_VISIBLE_PLACEMENTS {
+        v.drain(..v.len() - MAX_VISIBLE_PLACEMENTS);
+    }
+    v
 }
 
 /// Pixel rectangle and texture coordinates for a placement, given the
@@ -300,14 +314,15 @@ impl ImageRenderer {
         };
         // (layer, image id, instance) in draw order.
         let mut staged: Vec<(Layer, u32, ImageInst)> = Vec::new();
-        let placements: Vec<_> = protocol
-            .placements_in_draw_order(screen, top..=bottom)
+        let placements: Vec<_> = limit_visible(protocol.placements_in_draw_order(screen, top..=bottom))
             .into_iter()
             .cloned()
             .collect();
+        // Mip chains of the textures created this frame go out in one submit.
+        let mut mip_work: Vec<wgpu::CommandBuffer> = Vec::new();
         for p in &placements {
             let Some(img) = protocol.image(p.image_id) else { continue };
-            let Some(version) = self.ensure_texture(device, queue, protocol, p.image_id) else {
+            let Some(version) = self.ensure_texture(device, queue, protocol, p.image_id, &mut mip_work) else {
                 continue;
             };
             debug_assert!(version == img.texture_version);
@@ -323,6 +338,9 @@ impl ImageRenderer {
                 t.last_used = self.frame;
             }
             staged.push((layer, p.image_id, inst));
+        }
+        if !mip_work.is_empty() {
+            queue.submit(mip_work);
         }
         staged.sort_by_key(|(l, _, _)| *l as u8); // stable: keeps z order within a layer
         self.items.clear();
@@ -356,6 +374,7 @@ impl ImageRenderer {
         queue: &wgpu::Queue,
         protocol: &Protocol,
         id: u32,
+        mip_work: &mut Vec<wgpu::CommandBuffer>,
     ) -> Option<u64> {
         let img = protocol.image(id)?;
         if let Some(t) = self.textures.get(&id) {
@@ -408,7 +427,7 @@ impl ImageRenderer {
             },
         );
         if mips > 1 {
-            self.generate_mips(device, queue, &texture, mips);
+            mip_work.push(self.generate_mips(device, &texture, mips));
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -446,7 +465,7 @@ impl ImageRenderer {
     }
 
     /// Fill mip levels 1.. by repeatedly halving the previous level on the GPU.
-    fn generate_mips(&self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, mips: u32) {
+    fn generate_mips(&self, device: &wgpu::Device, texture: &wgpu::Texture, mips: u32) -> wgpu::CommandBuffer {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("image mips"),
         });
@@ -488,7 +507,7 @@ impl ImageRenderer {
             pass.set_bind_group(0, &bind, &[]);
             pass.draw(0..3, 0..1);
         }
-        queue.submit([enc.finish()]);
+        enc.finish()
     }
 
     /// Drop least recently used textures when over budget (never ones used by
@@ -572,6 +591,17 @@ mod tests {
         surface_w: 800,
         surface_h: 600,
     };
+
+    #[test]
+    fn thousands_of_visible_placements_are_capped_keeping_the_topmost() {
+        // F11: 20000 distinct on-screen images cost ~400 ms of CPU per frame.
+        let v: Vec<u32> = (0..20_000).collect();
+        let kept = limit_visible(v);
+        assert_eq!(kept.len(), MAX_VISIBLE_PLACEMENTS);
+        assert_eq!(*kept.last().unwrap(), 19_999);
+        assert_eq!(kept[0], 20_000 - MAX_VISIBLE_PLACEMENTS as u32);
+        assert_eq!(limit_visible(vec![1, 2, 3]), vec![1, 2, 3]);
+    }
 
     #[test]
     fn anchors_to_cell_and_offset() {

@@ -17,37 +17,56 @@ use crate::config::Config;
 /// Quiet period after the last file event before reloading.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// Longest a burst may keep postponing the reload: files that change
+/// continuously (a log or cache under `skins/`) must not starve config edits.
+const MAX_WAIT: Duration = Duration::from_secs(1);
+
 /// Pure debounce state machine: coalesces events until `window` has passed
-/// with no new event, then reports one firing. Takes timestamps as inputs so
+/// with no new event (or `max_wait` since the first one), then reports one
+/// firing. Takes timestamps as inputs so
 /// it can be tested without a filesystem or sleeping.
 #[derive(Debug)]
 struct Debouncer {
     window: Duration,
+    max_wait: Duration,
+    first_event: Option<Instant>,
     last_event: Option<Instant>,
 }
 
 impl Debouncer {
     fn new(window: Duration) -> Self {
+        Self::with_max_wait(window, MAX_WAIT)
+    }
+
+    fn with_max_wait(window: Duration, max_wait: Duration) -> Self {
         Self {
             window,
+            max_wait,
+            first_event: None,
             last_event: None,
         }
     }
 
     /// Record an event at `now`, extending the quiet period.
     fn on_event(&mut self, now: Instant) {
+        self.first_event.get_or_insert(now);
         self.last_event = Some(now);
     }
 
     /// When the pending burst (if any) becomes due.
     fn deadline(&self) -> Option<Instant> {
-        self.last_event.map(|t| t + self.window)
+        let quiet = self.last_event? + self.window;
+        Some(match self.first_event {
+            Some(first) => quiet.min(first + self.max_wait),
+            None => quiet,
+        })
     }
 
     /// True exactly once per burst, once the quiet period has elapsed.
     fn due(&mut self, now: Instant) -> bool {
         match self.deadline() {
             Some(d) if now >= d => {
+                self.first_event = None;
                 self.last_event = None;
                 true
             }
@@ -203,6 +222,24 @@ mod tests {
             }
         }
         assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn continuous_changes_cannot_postpone_the_reload_forever() {
+        // F47: 100 writes/s for 6 s produced one callback, at the end.
+        let t0 = Instant::now();
+        let mut d = Debouncer::new(ms(150));
+        let mut fired = Vec::new();
+        for i in 0..600u64 {
+            let now = t0 + ms(i * 10);
+            d.on_event(now);
+            if d.due(now) {
+                fired.push(i * 10);
+            }
+        }
+        assert!(fired.len() >= 5, "{fired:?}");
+        assert!(fired[0] <= 1000, "{fired:?}");
+        assert!(fired.windows(2).all(|w| w[1] - w[0] <= 1100), "{fired:?}");
     }
 
     #[test]

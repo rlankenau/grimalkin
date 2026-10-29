@@ -10,6 +10,7 @@
 //! events and re-applies the config exactly once, and a crash mid-write never
 //! leaves a truncated config behind.
 
+use std::hash::{BuildHasher, Hasher};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -73,8 +74,21 @@ impl ConfigEditor {
     pub fn open_at(path: &Path) -> io::Result<Self> {
         // Edit the file a symlink points at (dotfile repos) instead of
         // replacing the link with a regular file on save.
-        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let text = match fs::read_to_string(&path) {
+        let path = match fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(_) => {
+                // A dangling symlink would be replaced by a regular file on
+                // save (and the example config created in the wrong place).
+                if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} is a symbolic link to a file that does not exist", path.display()),
+                    ));
+                }
+                path.to_path_buf()
+            }
+        };
+        let text = match crate::fsutil::read_regular_string(&path, crate::fsutil::MAX_CONFIG_BYTES) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if let Some(dir) = path.parent() {
@@ -155,28 +169,67 @@ impl ConfigEditor {
         table.remove(last).is_some()
     }
 
-    /// Write the document: temp file in the same directory, then rename over
-    /// the original (atomic on the same filesystem, replacing on Windows too).
+    /// Write the document: temp file in the same directory, flushed to disk,
+    /// then renamed over the original (atomic on the same filesystem,
+    /// replacing on Windows too). The temp file is created exclusively under
+    /// an unpredictable name, so a pre-planted file or symlink of any name is
+    /// never written through. A read-only config is refused, not replaced.
     pub fn save(&self) -> io::Result<()> {
+        use std::io::Write;
+        if fs::metadata(&self.path).is_ok_and(|m| m.permissions().readonly()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is read-only", self.path.display()),
+            ));
+        }
         let dir = self.path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
         let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
         let mut text = self.doc.to_string();
         if self.crlf {
             text = text.replace("\r\n", "\n").replace('\n', "\r\n");
         }
-        let result = fs::write(&tmp, text).and_then(|()| {
-            // Keep the permissions of an existing config.
-            if let Ok(meta) = fs::metadata(&self.path) {
-                let _ = fs::set_permissions(&tmp, meta.permissions());
-            }
-            fs::rename(&tmp, &self.path)
-        });
+        let (tmp, mut file) = create_temp(dir, &name)?;
+        let result = file
+            .write_all(text.as_bytes())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| {
+                drop(file);
+                // Keep the permissions of an existing config.
+                if let Ok(meta) = fs::metadata(&self.path) {
+                    let _ = fs::set_permissions(&tmp, meta.permissions());
+                }
+                fs::rename(&tmp, &self.path)
+            });
         if result.is_err() {
             let _ = fs::remove_file(&tmp);
         }
         result
     }
+}
+
+/// Exclusively create `.<name>.<unique>.tmp` in `dir`.
+fn create_temp(dir: &Path, name: &str) -> io::Result<(PathBuf, fs::File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut last = None;
+    for _ in 0..32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        // Not secret, but not guessable in advance either; `create_new` is
+        // what makes a collision (or a planted file) harmless.
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(nanos);
+        h.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
+        h.write_u32(std::process::id());
+        let tmp = dir.join(format!(".{name}.{:016x}.tmp", h.finish()));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("cannot create a temporary file")))
 }
 
 #[cfg(test)]
@@ -188,6 +241,39 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_never_writes_through_a_planted_symlink_or_replaces_read_only_files() {
+        // F43: the temp name was predictable and non-exclusive.
+        let d = tmpdir("tmpsym");
+        let victim = d.join("victim.txt");
+        fs::write(&victim, "precious").unwrap();
+        let f = d.join("c.toml");
+        fs::write(&f, "theme = \"a\"\n").unwrap();
+        let pid = std::process::id();
+        std::os::unix::fs::symlink(&victim, d.join(format!(".c.toml.{pid}.tmp"))).unwrap();
+        let mut ed = ConfigEditor::open_at(&f).unwrap();
+        ed.set("theme", "b").unwrap();
+        ed.save().unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(fs::read_to_string(&f).unwrap().contains("\"b\""));
+
+        // Read-only configs are refused, not silently replaced.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
+        let mut ed = ConfigEditor::open_at(&f).unwrap();
+        ed.set("theme", "c").unwrap();
+        assert_eq!(ed.save().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(fs::read_to_string(&f).unwrap().contains("\"b\""));
+
+        // A dangling symlink is refused, not replaced by a regular file.
+        let link = d.join("dangling.toml");
+        std::os::unix::fs::symlink(d.join("nowhere/x.toml"), &link).unwrap();
+        assert!(ConfigEditor::open_at(&link).is_err());
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

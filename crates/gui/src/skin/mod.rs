@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use winit::window::CursorIcon;
 
 use self::hit::{ButtonKind, Hit, Layout, ResizeDir, SliceSpec, ALPHA_CUTOFF};
-use self::parse::{DoubleClick, Insets, SkinDef, MAX_SHADE_HEIGHT};
+use self::parse::{DoubleClick, Insets, SkinDef, MAX_SHADE_HEIGHT, MAX_SKIN_DIM};
 
 include!(concat!(env!("OUT_DIR"), "/builtin_skins.rs"));
 
@@ -118,15 +118,61 @@ impl Image {
         self.rgba[(y as usize * self.w as usize + x as usize) * 4 + 3]
     }
 
-    fn decode(bytes: &[u8], what: &str) -> Result<Image, String> {
-        let img = image::load_from_memory(bytes).map_err(|e| format!("{what}: {e}"))?.to_rgba8();
+    /// Image dimensions from the header alone (nothing is decoded).
+    fn probe(bytes: &[u8], what: &str) -> Result<(u32, u32), String> {
+        image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("{what}: {e}"))?
+            .into_dimensions()
+            .map_err(|e| format!("{what}: {e}"))
+    }
+
+    /// Decode, but only after the header says the result fits: each side at
+    /// most `MAX_SKIN_DIM`, at most `MAX_SKIN_IMAGE_PIXELS` pixels, and within
+    /// what is left of the skin's `budget` of pixels (decoded RGBA is 4 bytes
+    /// per pixel, and a tiny PNG can claim gigapixels). Decoding runs under
+    /// `image::Limits` as well.
+    fn decode(bytes: &[u8], what: &str, budget: &mut u64) -> Result<Image, String> {
+        let (w, h) = Image::probe(bytes, what)?;
+        Image::admit(w, h, what, budget)?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_SKIN_DIM);
+        limits.max_image_height = Some(MAX_SKIN_DIM);
+        limits.max_alloc = Some(MAX_SKIN_IMAGE_PIXELS * 4 * 2);
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("{what}: {e}"))?;
+        reader.limits(limits);
+        let img = reader.decode().map_err(|e| format!("{what}: {e}"))?.to_rgba8();
         Ok(Image {
             w: img.width(),
             h: img.height(),
             rgba: img.into_raw(),
         })
     }
+
+    /// Check a `w` x `h` image against the per-image and total limits and
+    /// charge it to `budget`.
+    fn admit(w: u32, h: u32, what: &str, budget: &mut u64) -> Result<(), String> {
+        let px = u64::from(w) * u64::from(h);
+        if w == 0 || h == 0 || w > MAX_SKIN_DIM || h > MAX_SKIN_DIM {
+            return Err(format!("{what}: {w}x{h} pixels; each side must be 1..={MAX_SKIN_DIM}"));
+        }
+        if px > MAX_SKIN_IMAGE_PIXELS {
+            return Err(format!("{what}: {w}x{h} pixels is more than {MAX_SKIN_IMAGE_PIXELS} in one image"));
+        }
+        if px > *budget {
+            return Err(format!("{what}: the skin's images together exceed {MAX_SKIN_TOTAL_PIXELS} pixels"));
+        }
+        *budget -= px;
+        Ok(())
+    }
 }
+
+/// Most pixels in one skin image (a 7680x4320 frame is 33 M).
+pub const MAX_SKIN_IMAGE_PIXELS: u64 = 36 << 20;
+/// Most pixels across all images of one skin.
+pub const MAX_SKIN_TOTAL_PIXELS: u64 = 100 << 20;
 
 /// Which texture a draw refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,7 +191,18 @@ enum Source {
 impl Source {
     fn read(&self, file: &str) -> Option<Cow<'static, [u8]>> {
         match self {
-            Source::Dir(d) => std::fs::read(d.join(file)).ok().map(Cow::Owned),
+            // Asset names come from skin.toml: never leave the skin directory
+            // (an absolute path replaces the base in `join`), and never read
+            // devices or FIFOs or more than a sane size.
+            Source::Dir(d) => {
+                if !crate::fsutil::is_contained_relative(file) {
+                    log::warn!("skin file name {file:?} is not inside the skin directory; ignored");
+                    return None;
+                }
+                crate::fsutil::read_regular(&d.join(file), crate::fsutil::MAX_SKIN_FILE_BYTES)
+                    .ok()
+                    .map(Cow::Owned)
+            }
             Source::Builtin(files) => files.iter().find(|(n, _)| *n == file).map(|(_, b)| Cow::Borrowed(*b)),
         }
     }
@@ -179,7 +236,10 @@ pub fn choices(user_dir: Option<&Path>) -> Vec<Vec<(String, String)>> {
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if e.path().join("skin.toml").is_file() && !name.starts_with('.') {
+                if e.path().join("skin.toml").is_file()
+                    && !name.starts_with('.')
+                    && !crate::textsafe::has_unsafe_chars(&name)
+                {
                     user.push((name.clone(), name));
                 }
             }
@@ -254,24 +314,43 @@ impl Skin {
         let toml = src.read("skin.toml").ok_or("skin.toml missing")?;
         let text = std::str::from_utf8(&toml).map_err(|_| "skin.toml is not UTF-8")?;
         let def = SkinDef::from_toml(text)?;
+        let budget = std::cell::Cell::new(MAX_SKIN_TOTAL_PIXELS);
         let img = |file: &str| -> Result<Image, String> {
             let bytes = src.read(file).ok_or_else(|| format!("{file} missing"))?;
-            Image::decode(&bytes, file)
+            let mut left = budget.get();
+            let r = Image::decode(&bytes, file, &mut left);
+            budget.set(left);
+            r
         };
         let frame1 = img(&def.frame.image)?;
         def.validate(frame1.w, frame1.h)?;
         let frame2 = {
             let f2 = at_2x(&def.frame.image);
-            match src.read(&f2).map(|b| Image::decode(&b, &f2)) {
-                Some(Ok(i)) if i.w == frame1.w * 2 && i.h == frame1.h * 2 => Some(i),
-                Some(Ok(_)) => {
-                    log::warn!("skin {name}: {f2} is not exactly twice the size of {}; ignored", def.frame.image);
-                    None
-                }
-                Some(Err(e)) => {
-                    log::warn!("skin {name}: {e}");
-                    None
-                }
+            match src.read(&f2) {
+                // Only decode the @2x frame when its header says it is
+                // exactly twice the size.
+                Some(bytes) => match Image::probe(&bytes, &f2) {
+                    Ok((w, h)) if w == frame1.w * 2 && h == frame1.h * 2 => {
+                        let mut left = budget.get();
+                        let r = Image::decode(&bytes, &f2, &mut left);
+                        budget.set(left);
+                        match r {
+                            Ok(i) => Some(i),
+                            Err(e) => {
+                                log::warn!("skin {name}: {e}");
+                                None
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        log::warn!("skin {name}: {f2} is not exactly twice the size of {}; ignored", def.frame.image);
+                        None
+                    }
+                    Err(e) => {
+                        log::warn!("skin {name}: {e}");
+                        None
+                    }
+                },
                 None => None,
             }
         };
@@ -632,6 +711,54 @@ mod tests {
         let r = Skin::load_from(dir.to_str().unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
         r
+    }
+
+    /// A real, tiny PNG whose header claims `w` x `h` gray pixels (the data is
+    /// all zero, so it compresses to a few hundred KB at most).
+    fn png_claiming(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            use image::ImageEncoder;
+            let enc = image::codecs::png::PngEncoder::new_with_quality(
+                &mut out,
+                image::codecs::png::CompressionType::Fast,
+                image::codecs::png::FilterType::NoFilter,
+            );
+            let row = vec![0u8; w as usize];
+            let all: Vec<u8> = (0..h).flat_map(|_| row.iter().copied()).collect();
+            enc.write_image(&all, w, h, image::ExtendedColorType::L8).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn oversized_images_are_rejected_from_the_header_before_decoding() {
+        // F28: a 261 KB frame.png cost 1.3 GB of RSS before validation.
+        let mut budget = MAX_SKIN_TOTAL_PIXELS;
+        // Too wide.
+        let e = Image::decode(&png_claiming(MAX_SKIN_DIM + 1, 1), "wide.png", &mut budget).err().expect("rejected");
+        assert!(e.contains("wide.png"), "{e}");
+        // Too many pixels in one image, though each side is legal.
+        let e = Image::decode(&png_claiming(MAX_SKIN_DIM, 2400), "big.png", &mut budget).err().expect("rejected");
+        assert!(e.contains("big.png") && e.contains("pixels"), "{e}");
+        assert_eq!(budget, MAX_SKIN_TOTAL_PIXELS, "a refused image costs nothing");
+        // A normal one is charged to the skin's total.
+        let ok = Image::decode(&png_claiming(100, 50), "ok.png", &mut budget).expect("decodes");
+        assert_eq!((ok.w, ok.h), (100, 50));
+        assert_eq!(budget, MAX_SKIN_TOTAL_PIXELS - 5000);
+        // The total runs out.
+        let mut small = 1000;
+        assert!(Image::decode(&png_claiming(100, 50), "again.png", &mut small).is_err());
+    }
+
+    #[test]
+    fn skin_asset_paths_cannot_leave_the_skin_directory() {
+        // F27: image = "/dev/zero" (join replaces the base) exhausted memory.
+        let toml = "[frame]\nimage = \"/dev/zero\"\nslices = { left = 8, right = 8, top = 8, bottom = 8 }\n";
+        let e = load_toml("abs", toml).err().expect("must not load");
+        assert!(e.contains("missing"), "{e}");
+        let toml = "[frame]\nimage = \"../../etc/passwd\"\n";
+        assert!(load_toml("dotdot", toml).is_err());
     }
 
     #[test]

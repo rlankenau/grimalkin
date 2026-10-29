@@ -22,7 +22,7 @@ pub use cell::{
 };
 pub use grid::Grid;
 pub use term::{
-    ColorTable, Cursor, CursorShape, Damage, Direction, Hyperlink, Modes, MouseEncoding,
+    coalesce_events, ColorTable, Cursor, CursorShape, Damage, Direction, Hyperlink, Modes, MouseEncoding,
     MouseMode, Rgb, Screen, TermEvent, Terminal, MAX_CLIPBOARD_BYTES, MAX_COMBINING,
     MAX_STRING_BODY,
 };

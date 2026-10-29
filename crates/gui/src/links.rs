@@ -87,8 +87,11 @@ fn url_link(term: &Terminal, pos: CellPos) -> Option<LinkSpan> {
     let mut at: Vec<(usize, usize)> = Vec::new();
     let mut idx = None;
     for r in first..=last {
-        for (c, cell) in term.visible_row(r).cells.iter().enumerate() {
-            if cell.width == CellWidth::WideSpacer {
+        let row = term.visible_row(r);
+        let next = (r < last).then(|| term.visible_row(r + 1));
+        let pad = crate::selection::wide_wrap_pad(row, next);
+        for (c, cell) in row.cells.iter().enumerate() {
+            if cell.width == CellWidth::WideSpacer || (pad && c + 1 == row.cells.len()) {
                 if r == pos.row && c == pos.col {
                     idx = Some(chars.len().saturating_sub(1));
                 }
@@ -119,6 +122,10 @@ fn url_link(term: &Terminal, pos: CellPos) -> Option<LinkSpan> {
     Some(LinkSpan { segments, uri })
 }
 
+/// Longest stretch of characters inspected on each side of the pointer when
+/// looking for a plain-text URL.
+const MAX_URL_SPAN: usize = 2048;
+
 /// Find the `http://` / `https://` URL containing `idx`; returns `[start, end)`.
 pub fn find_url(chars: &[char], idx: usize) -> Option<(usize, usize)> {
     if idx >= chars.len() || is_url_stop(chars[idx]) {
@@ -126,12 +133,16 @@ pub fn find_url(chars: &[char], idx: usize) -> Option<(usize, usize)> {
     }
     // Scan back to the start of the non-delimiter run, then look for a scheme
     // anywhere inside it that begins at or before `idx`.
+    // Bounded: the scan looks at most MAX_URL_SPAN chars either side of
+    // `idx`, so a line-sized run of URL characters cannot make this (called
+    // every frame while the link modifier is held) cost more than a fixed
+    // amount per call.
     let mut run_start = idx;
-    while run_start > 0 && !is_url_stop(chars[run_start - 1]) {
+    while run_start > 0 && idx - run_start < MAX_URL_SPAN && !is_url_stop(chars[run_start - 1]) {
         run_start -= 1;
     }
     let mut run_end = idx + 1;
-    while run_end < chars.len() && !is_url_stop(chars[run_end]) {
+    while run_end < chars.len() && run_end - idx <= MAX_URL_SPAN && !is_url_stop(chars[run_end]) {
         run_end += 1;
     }
     let mut best: Option<(usize, usize)> = None;
@@ -166,24 +177,38 @@ fn is_url_stop(c: char) -> bool {
 /// Drop trailing punctuation that is almost never part of the URL, keeping
 /// closing brackets that balance an opening one inside the URL.
 fn trim_url_end(chars: &[char], start: usize, mut end: usize) -> usize {
+    // Bracket counts are taken once and adjusted as characters are dropped,
+    // so trimming is linear however many closing brackets trail the URL.
+    let mut count = [0usize; 6]; // ( ) [ ] { }
+    let slot = |c: char| match c {
+        '(' => Some(0),
+        ')' => Some(1),
+        '[' => Some(2),
+        ']' => Some(3),
+        '{' => Some(4),
+        '}' => Some(5),
+        _ => None,
+    };
+    for &c in &chars[start..end] {
+        if let Some(i) = slot(c) {
+            count[i] += 1;
+        }
+    }
     while end > start {
         let c = chars[end - 1];
         let drop = match c {
             '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
             ')' | ']' | '}' => {
-                let open = match c {
-                    ')' => '(',
-                    ']' => '[',
-                    _ => '{',
-                };
-                let opens = chars[start..end].iter().filter(|&&x| x == open).count();
-                let closes = chars[start..end].iter().filter(|&&x| x == c).count();
-                closes > opens
+                let close = slot(c).unwrap_or(1);
+                count[close] > count[close - 1]
             }
             _ => false,
         };
         if !drop {
             break;
+        }
+        if let Some(i) = slot(c) {
+            count[i] -= 1;
         }
         end -= 1;
     }
@@ -197,17 +222,28 @@ pub fn is_openable(uri: &str) -> bool {
     matches!(
         scheme.to_ascii_lowercase().as_str(),
         "http" | "https" | "ftp" | "ftps" | "mailto"
-    ) && !uri.chars().any(|c| c.is_control())
+    ) && !uri.chars().any(|c| c.is_control() || c.is_whitespace() || crate::textsafe::is_bidi_or_separator(c))
+}
+
+/// `uri` for a log line: escaped and cut to a sane length, so a hostile
+/// (up to 2 MiB, control-laden) OSC 8 target cannot inject log lines.
+fn loggable(uri: &str) -> String {
+    let cut: String = uri.chars().take(200).collect();
+    let mut s = format!("{cut:?}");
+    if uri.chars().nth(200).is_some() {
+        s.push_str("...");
+    }
+    s
 }
 
 /// Open `uri` with the system handler.
 pub fn open(uri: &str) {
     if !is_openable(uri) {
-        log::warn!("refusing to open link with unsupported scheme: {uri}");
+        log::warn!("refusing to open link with unsupported scheme or characters: {}", loggable(uri));
         return;
     }
     if let Err(e) = open::that_detached(uri) {
-        log::warn!("cannot open {uri}: {e}");
+        log::warn!("cannot open {}: {e}", loggable(uri));
     }
 }
 
@@ -252,6 +288,27 @@ mod tests {
     }
 
     #[test]
+    fn pathological_line_is_bounded() {
+        // F13: 'http://' x300 then ')' x7900 was cubic (2.6 s at 200x50).
+        let mut s = "http://".repeat(300);
+        s.push_str(&")".repeat(7900));
+        let c = chars(&s);
+        let t = std::time::Instant::now();
+        for at in [c.len() - 1, 2000, 7, 0] {
+            let _ = find_url(&c, at);
+        }
+        assert!(t.elapsed().as_millis() < 500, "{:?}", t.elapsed());
+        // Ordinary URLs inside the window are unaffected.
+        assert_eq!(url_in("x http://a.b/c)).", 8).as_deref(), Some("http://a.b/c"));
+    }
+
+    #[test]
+    fn rejected_uris_are_logged_escaped_and_truncated() {
+        let l = loggable(&format!("evil\n\x1b[2J{}", "a".repeat(5000)));
+        assert!(!l.contains('\n') && !l.contains('\x1b') && l.len() < 300, "{l}");
+    }
+
+    #[test]
     fn scheme_gate() {
         assert!(is_openable("https://x.y"));
         assert!(is_openable("mailto:a@b.c"));
@@ -259,6 +316,10 @@ mod tests {
         assert!(!is_openable("javascript:alert(1)"));
         assert!(!is_openable("/usr/bin/true"));
         assert!(!is_openable("https://x\u{7}y"));
+        // F45: spaces and bidi marks make a link read differently than it acts.
+        assert!(!is_openable("https://x.y/a b"));
+        assert!(!is_openable("https://x.y/\u{202e}gpj.exe"));
+        assert!(is_openable("mailto:a@b.c?subject=hi"));
     }
 
     #[test]
@@ -273,6 +334,15 @@ mod tests {
         assert_eq!(l2.uri, l.uri);
         assert!(link_at(&t, CellPos { col: 0, row: 0 }).is_none());
         assert!(link_at(&t, CellPos { col: 4, row: 2 }).is_none());
+    }
+
+    #[test]
+    fn wide_char_wrap_does_not_split_url() {
+        // F38: the pad cell before a wrapped wide char used to read as a space.
+        let mut t = Terminal::new(10, 4, 10usize);
+        t.advance("http://a/\u{4e16}bc".as_bytes());
+        let l = link_at(&t, CellPos { col: 2, row: 0 }).expect("link");
+        assert_eq!(l.uri, "http://a/\u{4e16}bc");
     }
 
     #[test]

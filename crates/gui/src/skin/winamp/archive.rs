@@ -92,7 +92,7 @@ impl Archive {
                 MAX_ARCHIVE >> 20
             ));
         }
-        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let bytes = crate::fsutil::read_regular(path, MAX_ARCHIVE).map_err(|e| format!("{}: {e}", path.display()))?;
         Archive::from_bytes(bytes).map_err(|e| format!("{}: {e}", path.display()))
     }
 
@@ -176,10 +176,7 @@ impl Archive {
                     .map_err(|e| format!("{name}: {e}"))?;
             }
             Store::Dir(files) => {
-                let f = std::fs::File::open(&files[i]).map_err(|e| format!("{name}: {e}"))?;
-                f.take(limit + 1)
-                    .read_to_end(&mut out)
-                    .map_err(|e| format!("{name}: {e}"))?;
+                out = crate::fsutil::read_regular(&files[i], limit).map_err(|e| format!("{name}: {e}"))?;
             }
         }
         if out.len() as u64 > limit {

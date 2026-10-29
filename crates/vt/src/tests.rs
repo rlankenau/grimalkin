@@ -623,7 +623,8 @@ fn mouse_modes_and_events() {
     feed(&mut t, "\x1b[?1002h\x1b[?1006h");
     assert_eq!(t.mouse_mode(), MouseMode::Drag);
     assert_eq!(t.mouse_encoding(), MouseEncoding::Sgr);
-    assert_eq!(t.drain_events().len(), 2);
+    // Two changes in one batch coalesce to one notification.
+    assert_eq!(t.drain_events(), vec![TermEvent::SetMouseMode]);
     feed(&mut t, "\x1b[?1003h");
     assert_eq!(t.mouse_mode(), MouseMode::Any);
     feed(&mut t, "\x1b[?1003l\x1b[?1006l");
@@ -646,6 +647,22 @@ fn decrqm_reports_mode_state() {
     assert_eq!(t.drain_responses(), b"\x1b[?2026;2$y");
     feed(&mut t, "\x1b[?9999$p");
     assert_eq!(t.drain_responses(), b"\x1b[?9999;0$y");
+}
+
+#[test]
+fn decscusr_zero_and_ris_return_cursor_style_to_the_host_default() {
+    let mut t = term(10, 3);
+    assert_eq!((t.cursor_shape_override(), t.cursor_blink_override()), (None, None));
+    feed(&mut t, "\x1b[?12l");
+    assert_eq!(t.cursor_blink_override(), Some(false));
+    feed(&mut t, "\x1b[5 q");
+    assert_eq!((t.cursor_shape_override(), t.cursor_blink_override()), (Some(CursorShape::Bar), Some(true)));
+    feed(&mut t, "\x1b[0 q");
+    assert_eq!((t.cursor_shape_override(), t.cursor_blink_override()), (None, None));
+    feed(&mut t, "\x1b[6 q");
+    assert_eq!(t.cursor_blink_override(), Some(false));
+    feed(&mut t, "\x1bc");
+    assert_eq!((t.cursor_shape_override(), t.cursor_blink_override()), (None, None));
 }
 
 #[test]
@@ -851,13 +868,8 @@ fn osc_title_both_terminators() {
     let mut t = term(10, 3);
     feed(&mut t, "\x1b]0;hello world\x07");
     feed(&mut t, "\x1b]2;second; with semi\x1b\\");
-    assert_eq!(
-        t.drain_events(),
-        vec![
-            TermEvent::Title("hello world".into()),
-            TermEvent::Title("second; with semi".into())
-        ]
-    );
+    // Only the last title of a batch is reported.
+    assert_eq!(t.drain_events(), vec![TermEvent::Title("second; with semi".into())]);
     assert_eq!(t.title(), "second; with semi");
 }
 
@@ -957,7 +969,7 @@ fn osc_fg_bg_cursor_colors() {
     assert_eq!(t.colors().foreground, (255, 255, 255));
     assert_eq!(t.colors().background, (0, 0, 0));
     assert_eq!(t.colors().cursor, Some((255, 128, 0)));
-    assert_eq!(t.drain_events().len(), 3);
+    assert_eq!(t.drain_events(), vec![TermEvent::ColorChanged]);
     feed(&mut t, "\x1b]110\x07\x1b]111\x07\x1b]112\x07");
     assert_eq!(t.colors().foreground, (1, 2, 3));
     assert_eq!(t.colors().background, (4, 5, 6));
@@ -1285,4 +1297,21 @@ fn escape_heavy_garbage_does_not_panic() {
     }
     let (c, r) = t.size();
     assert!(t.cursor().col < c && t.cursor().row < r);
+}
+
+#[test]
+fn event_floods_are_coalesced_and_bounded() {
+    // F15: a BEL / title / clipboard flood queued one event per sequence.
+    let mut t = term(10, 3);
+    let flood: Vec<u8> = "\x07\x1b]0;t\x07\x1b]52;c;QQ==\x07".repeat(100_000).into_bytes();
+    t.advance(&flood);
+    assert!(t.events.len() < 4096, "queue grew to {}", t.events.len());
+    let ev = t.drain_events();
+    assert_eq!(ev.iter().filter(|e| matches!(e, TermEvent::Bell)).count(), 1);
+    assert_eq!(ev.iter().filter(|e| matches!(e, TermEvent::Title(_))).count(), 1);
+    assert_eq!(ev.iter().filter(|e| matches!(e, TermEvent::ClipboardSet(_))).count(), 1);
+    // Graphics commands and distinct queries are not lost.
+    let mut v = vec![TermEvent::GraphicsCommand(vec![1]), TermEvent::Bell, TermEvent::GraphicsCommand(vec![2]), TermEvent::Bell];
+    coalesce_events(&mut v);
+    assert_eq!(v, vec![TermEvent::GraphicsCommand(vec![1]), TermEvent::GraphicsCommand(vec![2]), TermEvent::Bell]);
 }

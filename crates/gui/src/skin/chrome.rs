@@ -43,6 +43,58 @@ struct GpuTex {
     _texture: wgpu::Texture,
 }
 
+/// One title cluster: a base character, the characters that combine with it
+/// (marks, variation selectors, ZWJ sequences) and the cells it spans.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TitleCluster {
+    pub base: char,
+    pub rest: Vec<char>,
+    pub cells: usize,
+}
+
+/// Split a title into clusters the way the terminal grid would: grapheme
+/// clusters, each one or two cells wide (zero-width clusters are dropped).
+pub fn title_clusters(title: &str) -> Vec<TitleCluster> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut out = Vec::new();
+    for g in title.graphemes(true) {
+        let mut chars = g.chars().filter(|c| !c.is_control());
+        let Some(base) = chars.next() else { continue };
+        let cells = UnicodeWidthStr::width(g).min(2);
+        if cells == 0 {
+            continue;
+        }
+        out.push(TitleCluster { base, rest: chars.collect(), cells });
+    }
+    out
+}
+
+/// Fit `clusters` into `max` cells, ending with "..." when something was cut.
+/// Returns the clusters to draw.
+pub fn fit_title(clusters: &[TitleCluster], max: usize) -> Vec<TitleCluster> {
+    let total: usize = clusters.iter().map(|c| c.cells).sum();
+    if total <= max {
+        return clusters.to_vec();
+    }
+    let keep = if max > 3 { max - 3 } else { max };
+    let mut out = Vec::new();
+    let mut used = 0;
+    for c in clusters {
+        if used + c.cells > keep {
+            break;
+        }
+        used += c.cells;
+        out.push(c.clone());
+    }
+    if max > 3 {
+        for _ in 0..3 {
+            out.push(TitleCluster { base: '.', rest: Vec::new(), cells: 1 });
+        }
+    }
+    out
+}
+
 /// The window title as positioned glyphs (window pixels).
 pub struct TitleDraw {
     pub quads: Vec<(f32, f32, GlyphQuad)>,
@@ -60,8 +112,13 @@ pub struct Chrome {
     // Window title.
     title: GlyphCache,
     title_bind: wgpu::BindGroup,
+    /// Bind group of the title's colour (emoji) atlas.
+    title_color_bind: wgpu::BindGroup,
     title_version: u32,
+    title_color_version: u32,
     title_px: f32,
+    /// Clusters of the title last laid out (re-split only when it changes).
+    title_cache: (String, Vec<TitleCluster>),
     bind_layout: wgpu::BindGroupLayout,
     globals: wgpu::Buffer,
     sampler: wgpu::Sampler,
@@ -228,9 +285,12 @@ impl Chrome {
             .unwrap_or(11.0);
         let title_px = font_px * scale as f32;
         let gpu = Gpu { device, queue };
-        let title = GlyphCache::new(&gpu, max_texture_dim, families, title_px, 1.0);
+        let mut title = GlyphCache::new(&gpu, max_texture_dim, families, title_px, 1.0);
+        title.fit_to_cells = true;
         let title_bind = make_bind(device, bind_layout, globals, &title.mask.view, sampler);
         let title_version = title.mask.version;
+        let title_color_bind = make_bind(device, bind_layout, globals, &title.color.view, sampler);
+        let title_color_version = title.color.version;
         let cap = 4096;
         Chrome {
             skin,
@@ -247,8 +307,11 @@ impl Chrome {
             batches: Vec::new(),
             title,
             title_bind,
+            title_color_bind,
             title_version,
+            title_color_version,
             title_px,
+            title_cache: (String::new(), Vec::new()),
             bind_layout: bind_layout.clone(),
             globals: globals.clone(),
             sampler: sampler.clone(),
@@ -262,6 +325,11 @@ impl Chrome {
     /// Bind group of the title glyph atlas (for the renderer's mask pipeline).
     pub fn title_bind(&self) -> &wgpu::BindGroup {
         &self.title_bind
+    }
+
+    /// Bind group of the title's colour glyph atlas.
+    pub fn title_color_bind(&self) -> &wgpu::BindGroup {
+        &self.title_color_bind
     }
 
     fn push_batch(&mut self, tex: TexId, start: usize) {
@@ -421,16 +489,14 @@ impl Chrome {
         }
         let m = self.title.metrics;
         let cell_w = m.cell_w.max(1) as i32;
-        let chars: Vec<char> = view.title.chars().filter(|c| !c.is_control()).collect();
         let max = (rect.w / cell_w).max(0) as usize;
-        let shown: Vec<char> = if chars.len() <= max {
-            chars
-        } else if max > 3 {
-            chars[..max - 3].iter().copied().chain("...".chars()).collect()
-        } else {
-            chars[..max].to_vec()
-        };
-        let tw = shown.len() as i32 * cell_w;
+        if self.title_cache.0 != view.title {
+            let sane: String = view.title.chars().take(1024).collect();
+            self.title_cache = (view.title.to_string(), title_clusters(&sane));
+        }
+        let shown = fit_title(&self.title_cache.1, max);
+        let cells: usize = shown.iter().map(|c| c.cells).sum();
+        let tw = cells as i32 * cell_w;
         let x0 = rect.x
             + match text.align {
                 Align::Left => 0,
@@ -440,12 +506,14 @@ impl Chrome {
         let y0 = rect.y + ((rect.h - m.cell_h as i32) / 2).max(0);
         let gpu = Gpu { device, queue };
         let mut quads = Vec::new();
-        for (i, ch) in shown.iter().enumerate() {
-            if *ch == ' ' {
+        let mut col = 0i32;
+        for c in &shown {
+            let x = (x0 + col * cell_w) as f32;
+            col += c.cells as i32;
+            if c.base == ' ' && c.rest.is_empty() {
                 continue;
             }
-            let x = (x0 + i as i32 * cell_w) as f32;
-            for q in self.title.lookup(&gpu, *ch, &[], 0, false) {
+            for q in self.title.lookup(&gpu, c.base, &c.rest, 0, c.cells == 2) {
                 quads.push((x, y0 as f32, *q));
             }
         }
@@ -455,6 +523,11 @@ impl Chrome {
         if self.title.mask.version != self.title_version {
             self.title_bind = make_bind(device, &self.bind_layout, &self.globals, &self.title.mask.view, &self.sampler);
             self.title_version = self.title.mask.version;
+        }
+        if self.title.color.version != self.title_color_version {
+            self.title_color_bind =
+                make_bind(device, &self.bind_layout, &self.globals, &self.title.color.view, &self.sampler);
+            self.title_color_version = self.title.color.version;
         }
         Some(TitleDraw {
             quads,
@@ -499,6 +572,32 @@ mod tests {
                 assert_eq!(frame, (w * h) as i64 - (vp.w * vp.h) as i64, "{name} @{scale}x");
             }
         }
+    }
+
+    #[test]
+    fn title_clusters_follow_terminal_widths() {
+        // F40: CJK took one cell, marks their own cell, emoji vanished.
+        let c = title_clusters("a\u{4e16}\u{754c} e\u{301}\u{301}\u{1f600}x");
+        let cells: Vec<usize> = c.iter().map(|c| c.cells).collect();
+        assert_eq!(cells, vec![1, 2, 2, 1, 1, 2, 1], "{c:?}");
+        let e = &c[4];
+        assert_eq!((e.base, e.rest.len()), ('e', 2), "marks attach to their base");
+        // A text symbol with the emoji selector becomes two cells, one cluster.
+        let h = title_clusters("\u{2764}\u{fe0f}");
+        assert_eq!((h.len(), h[0].cells, h[0].rest.clone()), (1, 2, vec!['\u{fe0f}']));
+        // Control characters are dropped.
+        assert_eq!(title_clusters("a\x07b").len(), 2);
+    }
+
+    #[test]
+    fn long_titles_are_cut_on_a_cluster_boundary_with_dots() {
+        let c = title_clusters("\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}");
+        let fit = fit_title(&c, 9);
+        let cells: usize = fit.iter().map(|c| c.cells).sum();
+        assert!(cells <= 9, "{cells}");
+        assert_eq!(fit.iter().filter(|c| c.base == '.').count(), 3);
+        assert!(fit.iter().all(|c| c.base == '.' || c.cells == 2), "no half characters");
+        assert_eq!(fit_title(&c, 12).len(), c.len(), "fits untouched");
     }
 
     #[test]
