@@ -8,6 +8,8 @@
 pub(crate) mod cmdline;
 #[cfg(windows)]
 mod conpty;
+#[cfg(any(windows, test))]
+pub(crate) mod flags;
 
 #[cfg(windows)]
 pub(crate) use conpty::open;

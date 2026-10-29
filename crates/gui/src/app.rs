@@ -816,10 +816,23 @@ impl Running {
                     // injects into the child's stdin.
                     // Also skip the (synchronous) clipboard read while earlier
                     // replies are still stuck in a child that is not reading.
-                    if self.cfg.clipboard.osc52_read && self.writer.pending_bytes() == 0 {
+                    let enabled = self.cfg.clipboard.osc52_read;
+                    let pending = self.writer.pending_bytes();
+                    log::debug!(
+                        "OSC 52 clipboard query: osc52_read={enabled}, pending_pty_bytes={pending}"
+                    );
+                    if enabled && pending == 0 {
                         let text =
                             self.clipboard().and_then(|cb| cb.get_text().ok()).unwrap_or_default();
+                        log::debug!(
+                            "OSC 52 clipboard query: sending reply ({} bytes of clipboard text)",
+                            text.len()
+                        );
                         self.term.respond_clipboard(&text);
+                    } else if !enabled {
+                        log::debug!("OSC 52 clipboard query: dropped (osc52_read is disabled)");
+                    } else {
+                        log::debug!("OSC 52 clipboard query: dropped (earlier replies still pending)");
                     }
                 }
                 TermEvent::CwdChanged(_) | TermEvent::SetMouseMode => {}

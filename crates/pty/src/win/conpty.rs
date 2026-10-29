@@ -10,7 +10,8 @@
 //! 1. Loads `CreatePseudoConsole` / `ResizePseudoConsole` / `ClosePseudoConsole`
 //!    dynamically, preferring `conpty.dll` in the running executable's
 //!    directory over the in-box `kernel32.dll`, and logs which one it got.
-//! 2. Creates the pseudoconsole itself, optionally in passthrough mode.
+//! 2. Creates the pseudoconsole itself, optionally in passthrough mode (0x8 is
+//!    passthrough only on the in-box ConPTY; see `flags`).
 //! 3. Starts the child with a `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` attribute.
 //!
 //! # Handle ownership
@@ -59,16 +60,7 @@ use windows_sys::Win32::System::Threading::{
 use super::cmdline::{command_line, resolve_program, EnvBlock};
 use crate::{default_env, default_shell, ChildWait, Killer, Master, SpawnConfig, Spawned};
 
-// CreatePseudoConsole flags (wincon.h). Not all are exported by windows-sys.
-const PSEUDOCONSOLE_INHERIT_CURSOR: u32 = 0x1;
-const PSEUDOCONSOLE_RESIZE_QUIRK: u32 = 0x2;
-const PSEUDOCONSOLE_WIN32_INPUT_MODE: u32 = 0x4;
-const PSEUDOCONSOLE_PASSTHROUGH_MODE: u32 = 0x8;
-
-/// The flags portable-pty used, which grimalkin shipped with before this
-/// backend existed: keep behavior identical unless passthrough is requested.
-const BASE_FLAGS: u32 =
-    PSEUDOCONSOLE_INHERIT_CURSOR | PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE;
+use super::flags::{pseudoconsole_flags, BASE_FLAGS};
 
 const ERROR_BROKEN_PIPE: i32 = 109;
 const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
@@ -193,6 +185,8 @@ struct Api {
     create: CreatePseudoConsoleFn,
     resize: ResizePseudoConsoleFn,
     close: ClosePseudoConsoleFn,
+    /// True for a sideloaded `conpty.dll`, false for the in-box kernel32 one.
+    sideloaded: bool,
 }
 
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
@@ -255,13 +249,13 @@ fn load_from(path: &Path, flags: u32) -> io::Result<Api> {
     if module.is_null() {
         return Err(io::Error::last_os_error());
     }
-    match resolve(module) {
+    let sideloaded = path
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("conpty.dll"));
+    match resolve(module, sideloaded) {
         Ok(api) => {
             let loaded = module_path(module).unwrap_or_else(|| path.to_path_buf());
-            let kind = if path
-                .file_name()
-                .is_some_and(|n| n.eq_ignore_ascii_case("conpty.dll"))
-            {
+            let kind = if sideloaded {
                 "sideloaded conpty.dll"
             } else {
                 "in-box ConPTY"
@@ -293,7 +287,7 @@ fn sym(module: HMODULE, name: &'static [u8]) -> io::Result<RawProc> {
     })
 }
 
-fn resolve(module: HMODULE) -> io::Result<Api> {
+fn resolve(module: HMODULE, sideloaded: bool) -> io::Result<Api> {
     let create = sym(module, b"CreatePseudoConsole\0")?;
     let resize = sym(module, b"ResizePseudoConsole\0")?;
     let close = sym(module, b"ClosePseudoConsole\0")?;
@@ -303,6 +297,7 @@ fn resolve(module: HMODULE) -> io::Result<Api> {
             create: mem::transmute::<RawProc, CreatePseudoConsoleFn>(create),
             resize: mem::transmute::<RawProc, ResizePseudoConsoleFn>(resize),
             close: mem::transmute::<RawProc, ClosePseudoConsoleFn>(close),
+            sideloaded,
         })
     }
 }
@@ -579,10 +574,16 @@ pub(crate) fn open(cfg: &SpawnConfig) -> io::Result<Spawned> {
     let (input_read_pty, input_write) = create_pipe()?;
     let (output_read, output_write_pty) = create_pipe()?;
 
-    let mut flags = BASE_FLAGS;
-    if cfg.passthrough {
-        flags |= PSEUDOCONSOLE_PASSTHROUGH_MODE;
+    // Bit 0x8 is passthrough only on the in-box ConPTY; on the redistributable
+    // it is GLYPH_WIDTH_GRAPHEMES, so never send it there (see `flags`).
+    let passthrough = cfg.passthrough && !api.sideloaded;
+    if cfg.passthrough && api.sideloaded {
+        log::info!(
+            "ConPTY: passthrough is not applicable to the sideloaded ConPTY (it already \
+             forwards unknown sequences); not setting flag 0x8"
+        );
     }
+    let flags = pseudoconsole_flags(api.sideloaded, cfg.passthrough);
     let con = match PseudoConsole::create(
         api,
         cols,
@@ -592,15 +593,15 @@ pub(crate) fn open(cfg: &SpawnConfig) -> io::Result<Spawned> {
         flags,
     ) {
         Ok(c) => {
-            if cfg.passthrough {
+            if passthrough {
                 log::info!("ConPTY: pseudoconsole created in passthrough mode");
             }
             c
         }
-        Err(e) if cfg.passthrough => {
+        Err(e) if passthrough => {
             log::warn!(
                 "ConPTY: CreatePseudoConsole rejected passthrough mode ({e}); retrying without \
-                 it. This ConPTY is too old: sideload conpty.dll + OpenConsole.exe."
+                 it. This in-box ConPTY is too old: sideload conpty.dll + OpenConsole.exe."
             );
             PseudoConsole::create(
                 api,

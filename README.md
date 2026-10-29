@@ -397,8 +397,9 @@ passthrough = true
 ```
 
 or set `GRIMALKIN_CONPTY_PASSTHROUGH=1` (`0` forces it off), which overrides
-the file. Passthrough needs the sideloaded ConPTY or Windows 11; if the ConPTY
-in use rejects the flag, Grimalkin logs a warning and starts without it.
+the file. Passthrough only applies to the in-box ConPTY of Windows 11 24H2 or newer;
+if it rejects the flag, Grimalkin logs a warning and starts without it. It is
+never sent to a sideloaded `conpty.dll` (see below).
 Passthrough is off by default.
 
 Tested facts (Windows 10, ConPTY package 1.25):
@@ -406,7 +407,12 @@ Tested facts (Windows 10, ConPTY package 1.25):
 - Stock Windows 10 ConPTY strips APC, so kitty graphics do not work at all.
 - Sideloading `Microsoft.Windows.Console.ConPTY` 1.25 (`conpty.dll` +
   `OpenConsole.exe` next to `grimalkin.exe`) makes kitty graphics work.
-- The passthrough flag has no observable effect on 1.25.
+- In the redistributable ConPTY (1.24+), bit 0x8 is not passthrough: it is
+  `PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES` (the glyph-width mask is 0x18:
+  GRAPHEMES 0x08, WCSWIDTH 0x10, CONSOLE 0x18; `AMBIGUOUS_IS_WIDE` is 0x20),
+  and 0x2/0x4 are unused. That is why a passthrough flag appeared to do
+  nothing there. Grimalkin therefore sets 0x8 only for the in-box ConPTY; the
+  sideloaded one already forwards unknown sequences.
 - The APC *reply* to a query (`a=q`) is stripped on the input side, so tools
   must detect support through `TERM_PROGRAM=grimalkin` / `TERM=xterm-kitty`
   rather than by querying.
