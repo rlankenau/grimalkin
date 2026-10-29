@@ -1,11 +1,11 @@
 #![cfg(unix)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use grimalkin_pty::{Pty, PtyEvent, SpawnConfig};
+use grimalkin_pty::{event_channel as channel, Pty, PtyEvent, SpawnConfig};
 
 /// Collect output until `pred(accumulated)` is true or timeout; returns the
 /// accumulated bytes and any Exited event seen.
@@ -367,4 +367,95 @@ fn shutdown_kills_child_that_ignores_hup() {
     pty.shutdown(Duration::from_millis(300));
     assert!(start.elapsed() < Duration::from_secs(2));
     assert!(!pty.is_alive());
+}
+
+/// F22: a consumer that never reads must not make the queue grow without
+/// bound; the child is throttled (its writes block) instead. Afterwards
+/// everything arrives, so backpressure loses no data.
+#[test]
+fn unread_output_is_bounded_by_backpressure() {
+    const MIB: usize = 1 << 20;
+    const ROUNDS: usize = 60;
+    let prog = std::env::temp_dir().join(format!("grimalkin-bp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&prog);
+    let (tx, rx) = channel();
+    // Writes 1 MiB per round, recording the number of completed rounds.
+    let script = format!(
+        "i=0; while [ $i -lt {ROUNDS} ]; do head -c {MIB} /dev/zero | tr '\\0' x; i=$((i+1)); echo $i > '{}'; done",
+        prog.display()
+    );
+    let args = vec!["-c".to_string(), script];
+    let _pty = Pty::spawn("/bin/sh", &args, None, &[], 80, 24, tx).unwrap();
+    // Unbounded, the child would finish all rounds well within this time.
+    std::thread::sleep(Duration::from_millis(2500));
+    let rounds: usize = std::fs::read_to_string(&prog)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let queued_max = grimalkin_pty::EVENT_QUEUE_CAP * grimalkin_pty::MAX_CHUNK / MIB;
+    assert!(
+        rounds <= queued_max + 4,
+        "child ran {rounds} MiB ahead of an idle consumer (queue holds at most {queued_max} MiB)"
+    );
+    // Now consume everything.
+    let mut got = 0usize;
+    let mut exited = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while exited.is_none() && Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(PtyEvent::Output(b)) => got += b.iter().filter(|&&c| c == b'x').count(),
+            Ok(PtyEvent::Exited(c)) => exited = Some(c),
+            Err(_) => {}
+        }
+    }
+    let _ = std::fs::remove_file(&prog);
+    assert_eq!(exited, Some(Some(0)));
+    assert_eq!(got, ROUNDS * MIB);
+}
+
+/// F22: a slow consumer still receives every byte, in order, followed by
+/// Exited, even though the child exited long before it read anything.
+#[test]
+fn slow_consumer_gets_all_output_then_exit() {
+    const TOTAL: usize = 3_000_000;
+    let (tx, rx) = channel();
+    let script = format!("head -c {TOTAL} /dev/zero | tr '\\0' 'x'; exit 3");
+    let args = vec!["-c".to_string(), script];
+    let _pty = Pty::spawn("/bin/sh", &args, None, &[], 80, 24, tx).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut got = 0usize;
+    let mut exited = None;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while exited.is_none() && Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(PtyEvent::Output(b)) => {
+                assert!(exited.is_none(), "output after Exited");
+                got += b.iter().filter(|&&c| c == b'x').count();
+            }
+            Ok(PtyEvent::Exited(c)) => exited = Some(c),
+            Err(_) => {}
+        }
+    }
+    assert_eq!(exited, Some(Some(3)));
+    assert_eq!(got, TOTAL);
+}
+
+/// F25: replies to a child that is not reading are dropped past the cap.
+#[test]
+fn replies_to_a_nonreading_child_are_bounded() {
+    let (tx, _rx) = channel();
+    let args = vec!["-c".to_string(), "sleep 30".to_string()];
+    let mut pty = Pty::spawn("/bin/sh", &args, None, &[], 80, 24, tx).unwrap();
+    let w = pty.writer();
+    let reply = vec![b'r'; 1024];
+    let mut dropped = 0usize;
+    for _ in 0..100_000 {
+        if !w.write_reply(&reply).unwrap() {
+            dropped += 1;
+        }
+        // Stay far below the cap plus what the kernel pty buffer absorbs.
+        assert!(w.pending_bytes() <= 4 * grimalkin_pty::MAX_PENDING_REPLY_BYTES + 1024 * 1024);
+    }
+    assert!(dropped > 0, "replies were never dropped");
+    let _ = pty.kill();
 }

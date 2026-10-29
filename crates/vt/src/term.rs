@@ -231,6 +231,14 @@ pub(crate) const SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 /// Base64 length corresponding to [`MAX_CLIPBOARD_BYTES`].
 pub(crate) const MAX_CLIPBOARD_B64: usize = MAX_CLIPBOARD_BYTES.div_ceil(3) * 4;
+/// Longest OSC 52 selection string (`c`, `p`, `s`, `0`-`7`, ...) kept and
+/// echoed back in a reply.
+pub(crate) const MAX_CLIP_SELECTION: usize = 8;
+/// Most bytes of terminal replies (DA, DSR, XTVERSION, graphics, ...) held
+/// between [`Terminal::drain_responses`] calls; further replies are dropped.
+/// Bounds the amplification of hostile queries (an XTVERSION query is 4 bytes
+/// and its answer 24).
+pub const MAX_PENDING_RESPONSE_BYTES: usize = 64 * 1024;
 /// Maximum combining marks stored per cell; extras are dropped (kitty: 8).
 pub const MAX_COMBINING: usize = 8;
 pub const MAX_STRING_BODY: usize = 2 * 1024 * 1024;
@@ -325,6 +333,8 @@ pub struct Terminal {
     pub(crate) hyperlink_map: HashMap<(String, String), u32>,
     pub(crate) responses: Vec<u8>,
     pub(crate) events: Vec<TermEvent>,
+    /// A `ClipboardQuery` event is queued and not yet drained.
+    pub(crate) clip_query_pending: bool,
     dirty: Vec<bool>,
     full_redraw: bool,
     pub(crate) last_cell: Option<(usize, usize)>,
@@ -393,6 +403,7 @@ impl Terminal {
             hyperlinks: Vec::new(),
             hyperlink_map: HashMap::new(),
             responses: Vec::new(),
+            clip_query_pending: false,
             events: Vec::new(),
             dirty: vec![true; rows],
             full_redraw: true,
@@ -751,23 +762,35 @@ impl Terminal {
     }
 
     /// Queue raw bytes to be sent to the pty (used by the graphics glue).
+    /// Dropped once [`MAX_PENDING_RESPONSE_BYTES`] are already queued.
     pub fn push_response(&mut self, bytes: &[u8]) {
+        if self.responses.len().saturating_add(bytes.len()) > MAX_PENDING_RESPONSE_BYTES {
+            return;
+        }
         self.responses.extend_from_slice(bytes);
     }
 
     /// Drain queued events.
     pub fn drain_events(&mut self) -> Vec<TermEvent> {
+        self.clip_query_pending = false;
         std::mem::take(&mut self.events)
     }
 
     /// Answer a [`TermEvent::ClipboardQuery`] with the clipboard contents.
+    /// Contents longer than [`MAX_CLIPBOARD_BYTES`] are reported as empty
+    /// rather than truncated (a cut-off base64 payload would be corrupt).
     pub fn respond_clipboard(&mut self, text: &str) {
+        let text = if text.len() > MAX_CLIPBOARD_BYTES { "" } else { text };
         let r = format!(
             "\x1b]52;{};{}\x1b\\",
             self.clip_selection,
             util::base64_encode(text.as_bytes())
         );
-        self.push_response(r.as_bytes());
+        // A single reply (<= ~1.4 MiB) is exempt from the small-reply cap, but
+        // only one clipboard reply may be pending at a time.
+        if self.responses.len() <= MAX_PENDING_RESPONSE_BYTES {
+            self.responses.extend_from_slice(r.as_bytes());
+        }
     }
 
     // ------------------------------------------------------------------

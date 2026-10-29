@@ -5,9 +5,12 @@
 //! * [`Pty::spawn`] / [`Pty::spawn_with`] start a shell (or any command) on a
 //!   fresh pseudo-terminal of a given size.
 //! * A reader thread forwards child output as [`PtyEvent::Output`] chunks (at
-//!   most 64 KiB each) over a [`std::sync::mpsc::Sender`], followed by exactly
-//!   one [`PtyEvent::Exited`] when the child has gone away and its output has
-//!   been drained.
+//!   most 64 KiB each) over a bounded [`std::sync::mpsc::SyncSender`] (see
+//!   [`event_channel`]), followed by exactly one [`PtyEvent::Exited`] when the
+//!   child has gone away and its output has been drained. The channel is
+//!   bounded so a consumer that falls behind makes the reader thread block,
+//!   the kernel pty buffer fill, and the child's `write` stall (the same
+//!   backpressure a real terminal applies) instead of buffering without limit.
 //! * [`PtyWriter`] is a cloneable, thread-safe handle for sending input.
 //! * [`Pty::resize`], [`Pty::kill`], [`Pty::try_wait`] do what they say.
 //! * An optional `on_wake` callback is invoked after every event is sent so a
@@ -38,7 +41,10 @@
 //!
 //! [`PtyWriter`] never blocks the caller: input is queued to a dedicated writer
 //! thread, so a GUI thread pasting a large buffer into a child that is not
-//! reading cannot freeze.
+//! reading cannot freeze. Terminal-generated replies (device attributes,
+//! clipboard answers, ...) go through [`PtyWriter::write_reply`], which drops
+//! them once [`MAX_PENDING_REPLY_BYTES`] are already waiting for a child that
+//! is not reading, so hostile output cannot amplify into unbounded memory.
 //!
 //! On Unix, [`Pty::kill`] sends `SIGHUP` and escalates to `SIGKILL` if the
 //! child is still alive 2 seconds later, so ignoring `SIGHUP` cannot leak a
@@ -60,8 +66,8 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -73,6 +79,22 @@ mod win;
 
 /// Maximum size of one [`PtyEvent::Output`] chunk.
 pub const MAX_CHUNK: usize = 64 * 1024;
+
+/// Capacity (in events) of the channel returned by [`event_channel`]. Each
+/// `Output` event is at most [`MAX_CHUNK`] bytes, so the queue holds at most
+/// `EVENT_QUEUE_CAP * MAX_CHUNK` (16 MiB) of unconsumed child output.
+pub const EVENT_QUEUE_CAP: usize = 256;
+
+/// Create the bounded channel [`Pty::spawn`] reports events on.
+pub fn event_channel() -> (SyncSender<PtyEvent>, Receiver<PtyEvent>) {
+    mpsc::sync_channel(EVENT_QUEUE_CAP)
+}
+
+/// Replies queued via [`PtyWriter::write_reply`] are dropped while more than
+/// this many bytes are already waiting to be written to the child (a single
+/// reply is always accepted when nothing is pending, so the worst-case queue
+/// is the larger of this and one reply).
+pub const MAX_PENDING_REPLY_BYTES: usize = 64 * 1024;
 
 /// How long, after the child exits, we wait for the reader thread to drain
 /// remaining output before reporting [`PtyEvent::Exited`] anyway. This covers
@@ -125,8 +147,9 @@ pub struct SpawnConfig {
     /// re-rendering them. Ignored elsewhere. Falls back to a normal
     /// pseudoconsole if the ConPTY in use rejects the flag. Default `false`.
     pub passthrough: bool,
-    /// Channel receiving [`PtyEvent`]s.
-    pub tx: Sender<PtyEvent>,
+    /// Bounded channel receiving [`PtyEvent`]s (see [`event_channel`]). When
+    /// it is full the reader thread blocks, which throttles the child.
+    pub tx: SyncSender<PtyEvent>,
     /// Called after every event is sent.
     pub on_wake: Option<WakeFn>,
 }
@@ -141,24 +164,66 @@ pub struct SpawnConfig {
 pub struct PtyWriter {
     tx: Sender<Vec<u8>>,
     failed: Arc<AtomicBool>,
+    /// Bytes queued but not yet written to the pty.
+    pending: Arc<AtomicUsize>,
 }
 
 impl PtyWriter {
     fn new(mut w: Box<dyn Write + Send>) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let failed = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicUsize::new(0));
         let flag = failed.clone();
+        let left = pending.clone();
         thread::Builder::new()
             .name("grimalkin-pty-writer".into())
             .spawn(move || {
                 for buf in rx {
-                    if w.write_all(&buf).and_then(|_| w.flush()).is_err() {
+                    let ok = w.write_all(&buf).and_then(|_| w.flush()).is_ok();
+                    left.fetch_sub(buf.len(), Ordering::SeqCst);
+                    if !ok {
                         flag.store(true, Ordering::SeqCst);
                         break;
                     }
                 }
             })?;
-        Ok(Self { tx, failed })
+        Ok(Self {
+            tx,
+            failed,
+            pending,
+        })
+    }
+
+    fn enqueue(&self, buf: &[u8]) -> io::Result<()> {
+        self.pending.fetch_add(buf.len(), Ordering::SeqCst);
+        self.tx.send(buf.to_vec()).map_err(|_| {
+            self.pending.fetch_sub(buf.len(), Ordering::SeqCst);
+            io::Error::from(io::ErrorKind::BrokenPipe)
+        })
+    }
+
+    /// Bytes handed to the writer thread that the child has not yet accepted.
+    pub fn pending_bytes(&self) -> usize {
+        self.pending.load(Ordering::SeqCst)
+    }
+
+    /// Queue a terminal-generated reply (as opposed to user input). Unlike
+    /// [`write_all`](Self::write_all) it is dropped, returning `Ok(false)`,
+    /// when [`MAX_PENDING_REPLY_BYTES`] would be exceeded by a child that is
+    /// not reading its input. A reply is always accepted when nothing else is
+    /// pending. Never blocks.
+    pub fn write_reply(&self, buf: &[u8]) -> io::Result<bool> {
+        if self.failed.load(Ordering::SeqCst) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        if buf.is_empty() {
+            return Ok(true);
+        }
+        let pending = self.pending.load(Ordering::SeqCst);
+        if pending != 0 && pending.saturating_add(buf.len()) > MAX_PENDING_REPLY_BYTES {
+            return Ok(false);
+        }
+        self.enqueue(buf).map(|()| true)
     }
 
     /// Queue all of `buf` for the child. Never blocks on the child.
@@ -169,9 +234,7 @@ impl PtyWriter {
         if buf.is_empty() {
             return Ok(());
         }
-        self.tx
-            .send(buf.to_vec())
-            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+        self.enqueue(buf)
     }
 
     /// Input is handed to the writer thread immediately, so there is nothing
@@ -257,6 +320,9 @@ struct ReaderState {
     done: bool,
     /// Number of chunks forwarded so far (progress indicator).
     reads: u64,
+    /// The reader is blocked handing a chunk to a full event queue (a slow
+    /// consumer, not a stalled child), so draining must keep waiting.
+    blocked: bool,
 }
 
 /// Wait for the reader to finish, giving up after [`DRAIN_GRACE`] without
@@ -266,12 +332,12 @@ fn wait_for_drain(state: &(Mutex<ReaderState>, Condvar)) {
     let start = Instant::now();
     let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     let mut seen = guard.reads;
-    while !guard.done && start.elapsed() < DRAIN_MAX {
+    while !guard.done && (guard.blocked || start.elapsed() < DRAIN_MAX) {
         let (g, res) = cv
             .wait_timeout(guard, DRAIN_GRACE)
             .unwrap_or_else(|p| p.into_inner());
         guard = g;
-        if res.timed_out() && guard.reads == seen {
+        if res.timed_out() && guard.reads == seen && !guard.blocked {
             break;
         }
         seen = guard.reads;
@@ -291,7 +357,7 @@ impl Pty {
         env: &[(String, String)],
         cols: u16,
         rows: u16,
-        tx: Sender<PtyEvent>,
+        tx: SyncSender<PtyEvent>,
     ) -> io::Result<Pty> {
         Self::spawn_with(SpawnConfig {
             cmd: cmd.to_string(),
@@ -498,7 +564,7 @@ impl Drop for Pty {
 
 fn read_loop(
     mut reader: Box<dyn Read + Send>,
-    tx: &Sender<PtyEvent>,
+    tx: &SyncSender<PtyEvent>,
     wake: Option<&(dyn Fn() + Send + Sync)>,
     closed: &Mutex<bool>,
     state: &(Mutex<ReaderState>, Condvar),
@@ -509,9 +575,31 @@ fn read_loop(
             Ok(0) => break,
             Ok(n) => {
                 {
+                    // Held across a possibly blocking send so `Exited` (sent
+                    // under the same lock) can never overtake this chunk.
                     let c = closed.lock().unwrap_or_else(|p| p.into_inner());
-                    if *c || tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
+                    if *c {
                         break;
+                    }
+                    match tx.try_send(PtyEvent::Output(buf[..n].to_vec())) {
+                        Ok(()) => {}
+                        Err(TrySendError::Disconnected(_)) => break,
+                        Err(TrySendError::Full(ev)) => {
+                            // Backpressure: the consumer is behind. Block
+                            // here; the kernel pty buffer fills and the child
+                            // stalls in write(2) until the consumer catches up.
+                            let (lock, cv) = state;
+                            lock.lock().unwrap_or_else(|p| p.into_inner()).blocked = true;
+                            if let Some(w) = wake {
+                                w();
+                            }
+                            let sent = tx.send(ev).is_ok();
+                            lock.lock().unwrap_or_else(|p| p.into_inner()).blocked = false;
+                            cv.notify_all();
+                            if !sent {
+                                break;
+                            }
+                        }
                     }
                 }
                 {
@@ -759,7 +847,7 @@ mod tests {
 
     #[cfg(unix)]
     fn cfg(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> SpawnConfig {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = event_channel();
         SpawnConfig {
             cmd: cmd.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
@@ -813,6 +901,49 @@ mod tests {
             PathBuf::from("definitely-not-a-program-xyz")
         );
         assert_eq!(resolve_in_path("/bin/sh", None), PathBuf::from("/bin/sh"));
+    }
+
+    /// A writer that blocks until released, standing in for a child that is
+    /// not reading its input.
+    struct Gated(Arc<(Mutex<bool>, Condvar)>);
+    impl Write for Gated {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            let (m, cv) = &*self.0;
+            let mut open = m.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn replies_are_capped_while_child_is_not_reading() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let w = PtyWriter::new(Box::new(Gated(gate.clone()))).unwrap();
+        // Nothing pending: even an oversized single reply is accepted.
+        let big = vec![0u8; MAX_PENDING_REPLY_BYTES * 4];
+        assert!(w.write_reply(&big).unwrap());
+        // Now the backlog is over the cap: further replies are dropped.
+        for _ in 0..10_000 {
+            assert!(!w.write_reply(b"\x1b[>0;0;0c").unwrap());
+        }
+        assert_eq!(w.pending_bytes(), big.len());
+        // User input is never dropped by the reply policy.
+        w.write_all(b"typed").unwrap();
+        assert_eq!(w.pending_bytes(), big.len() + 5);
+        // Once the child reads again, the backlog drains and replies flow.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.pending_bytes() != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(w.pending_bytes(), 0);
+        assert!(w.write_reply(b"ok").unwrap());
     }
 
     #[test]

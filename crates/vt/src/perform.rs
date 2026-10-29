@@ -571,7 +571,7 @@ impl Perform for Terminal {
                 // Only real selection names are ever echoed back in a reply.
                 let sel = params[1];
                 self.clip_selection = if !sel.is_empty()
-                    && sel.len() <= 8
+                    && sel.len() <= MAX_CLIP_SELECTION
                     && sel.iter().all(|b| matches!(b, b'c' | b'p' | b'q' | b's' | b'0'..=b'7'))
                 {
                     String::from_utf8_lossy(sel).into_owned()
@@ -579,7 +579,12 @@ impl Perform for Terminal {
                     "c".into()
                 };
                 if params[2] == b"?" {
-                    self.events.push(TermEvent::ClipboardQuery);
+                    // One outstanding query is enough: the answer is the same
+                    // for any number of queries queued before it is served.
+                    if !self.clip_query_pending {
+                        self.clip_query_pending = true;
+                        self.events.push(TermEvent::ClipboardQuery);
+                    }
                 } else if params[2].len() > MAX_CLIPBOARD_B64 {
                     // Refuse oversized writes without decoding them.
                 } else if let Some(bytes) = util::base64_decode_strict(params[2]) {
