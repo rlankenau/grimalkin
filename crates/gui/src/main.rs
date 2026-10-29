@@ -467,6 +467,68 @@ mod tests {
         }
     }
 
+    /// Minimal model of CommandLineToArgvW's quote/backslash rules (the
+    /// parsing the Windows C runtime applies to the context-menu command).
+    fn win_split(cmd: &str) -> Vec<String> {
+        let c: Vec<char> = cmd.chars().collect();
+        let (mut i, mut out) = (0, Vec::new());
+        while i < c.len() {
+            while i < c.len() && (c[i] == ' ' || c[i] == '\t') {
+                i += 1;
+            }
+            if i >= c.len() {
+                break;
+            }
+            let (mut arg, mut inq) = (String::new(), false);
+            while i < c.len() && (inq || (c[i] != ' ' && c[i] != '\t')) {
+                let mut bs = 0;
+                while i < c.len() && c[i] == '\\' {
+                    bs += 1;
+                    i += 1;
+                }
+                if i < c.len() && c[i] == '"' {
+                    arg.extend(std::iter::repeat_n('\\', bs / 2));
+                    if bs % 2 == 1 {
+                        arg.push('"');
+                    } else {
+                        inq = !inq;
+                    }
+                    i += 1;
+                } else {
+                    arg.extend(std::iter::repeat_n('\\', bs));
+                    if i < c.len() && (inq || (c[i] != ' ' && c[i] != '\t')) {
+                        arg.push(c[i]);
+                        i += 1;
+                    }
+                }
+            }
+            out.push(arg);
+        }
+        out
+    }
+
+    /// F51: the Explorer context-menu commands must survive paths that end in
+    /// a backslash (drive and UNC roots).
+    #[test]
+    fn installer_context_menu_survives_trailing_backslash_paths() {
+        let iss = include_str!("../../../installer/windows/grimalkin.iss");
+        let cmds: Vec<&str> = iss.lines().filter(|l| l.contains("--working-directory")).collect();
+        assert_eq!(cmds.len(), 2, "folder and background entries expected");
+        for line in cmds {
+            let v = line.split("ValueData: ").nth(1).unwrap().split("; Tasks").next().unwrap();
+            // Inno string: outer quotes, inner "" is a literal quote.
+            let v = v.trim().strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap().replace("\"\"", "\"");
+            let v = v.replace("{app}\\{#AppExe}", "C:\\app\\grimalkin.exe");
+            for dir in ["C:\\", "C:\\Users\\a b", "\\\\srv\\share\\", "D:\\x\\"] {
+                let argv = win_split(&v.replace("%V", dir));
+                assert_eq!(argv.len(), 3, "{v} with {dir:?} -> {argv:?}");
+                assert_eq!(argv[1], "--working-directory");
+                let p = argv[2].trim_end_matches('.');
+                assert_eq!(p, dir, "{v} with {dir:?} -> {argv:?}");
+            }
+        }
+    }
+
     #[test]
     fn parses_workdir_and_errors() {
         match parse_args(args(&["--working-directory=/tmp"])) {
