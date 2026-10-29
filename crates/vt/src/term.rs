@@ -237,6 +237,20 @@ pub const MAX_STRING_BODY: usize = 2 * 1024 * 1024;
 /// After a string longer than this, buffers are reallocated to free memory.
 const STRING_SHRINK_THRESHOLD: usize = 64 * 1024;
 pub(crate) const MAX_HYPERLINKS: usize = 1 << 17;
+/// Longest OSC 8 URI accepted (bytes). Longer links are ignored.
+pub(crate) const MAX_HYPERLINK_URI: usize = 8 * 1024;
+/// Longest OSC 8 `id=` accepted (bytes).
+pub(crate) const MAX_HYPERLINK_ID: usize = 256;
+/// Cap on the total bytes (ids + URIs) held by the hyperlink table.
+pub(crate) const MAX_HYPERLINK_BYTES: usize = 8 * 1024 * 1024;
+/// A hyperlink-table GC may run once this many input bytes have arrived per
+/// 8 cells the previous GC had to visit (so GC cost is amortised against
+/// input, however hostile).
+const GC_CELLS_PER_INPUT_BYTE: u64 = 8;
+/// Work credit (in cells) earned per input byte; see [`Terminal::try_spend`].
+const WORK_PER_BYTE: u64 = 8;
+/// Floor of the work-credit bucket (in cells).
+const WORK_CAP_MIN: u64 = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApcState {
@@ -253,6 +267,9 @@ enum ApcState {
 enum StrKind {
     Osc,
     Apc,
+    /// DCS: vte also ends a hooked DCS on the raw C1 byte 0x9c.
+    Dcs,
+    /// SOS / PM.
     Other,
 }
 
@@ -264,6 +281,23 @@ pub struct Terminal {
     str_kind: StrKind,
     str_len: usize,
     str_overflow: bool,
+    /// Incomplete UTF-8 sequence at the end of the previous `advance` call,
+    /// held back so vte never has to resume a split character (it mishandles
+    /// the bytes that follow one).
+    utf8_carry: Vec<u8>,
+    /// Set by `Perform::unhook`; lets the pre-scanner see vte end a DCS.
+    pub(crate) dcs_unhooked: bool,
+    /// Leaky bucket (cells) bounding whole-screen work per input byte.
+    work_credit: u64,
+    /// Input bytes since the last hyperlink-table GC, and that GC's cost.
+    gc_idle_bytes: u64,
+    gc_last_cost: u64,
+    pub(crate) gc_runs: u64,
+    /// Total bytes (ids + URIs) held in `hyperlinks`.
+    pub(crate) link_bytes: usize,
+    /// The newest hyperlink has not been given to any cell yet.
+    pub(crate) link_unused: bool,
+    reset_count: u64,
 
     pub(crate) main: Grid,
     pub(crate) alt: Grid,
@@ -326,6 +360,15 @@ impl Terminal {
             str_kind: StrKind::Other,
             str_len: 0,
             str_overflow: false,
+            utf8_carry: Vec::new(),
+            dcs_unhooked: false,
+            work_credit: Self::work_cap_for(cols, rows),
+            gc_idle_bytes: 0,
+            gc_last_cost: 0,
+            gc_runs: 0,
+            link_bytes: 0,
+            link_unused: false,
+            reset_count: 0,
             main: Grid::new(cols, rows, sb),
             alt: Grid::new(cols, rows, 0),
             active: Screen::Main,
@@ -380,6 +423,93 @@ impl Terminal {
     /// remaining bytes are swallowed up to the terminator, never printed.
     pub fn advance(&mut self, bytes: &[u8]) {
         self.check_sync_timeout(SYNC_TIMEOUT);
+        self.work_credit = self
+            .work_credit
+            .saturating_add((bytes.len() as u64).saturating_mul(WORK_PER_BYTE))
+            .min(self.work_cap());
+        self.gc_idle_bytes = self.gc_idle_bytes.saturating_add(bytes.len() as u64);
+        let mut rest = bytes;
+        if !self.utf8_carry.is_empty() {
+            rest = self.complete_utf8_carry(rest);
+        }
+        let keep = incomplete_utf8_tail(rest);
+        let (body, tail) = rest.split_at(rest.len() - keep);
+        if !body.is_empty() {
+            self.advance_scan(body);
+        }
+        self.utf8_carry.extend_from_slice(tail);
+        self.update_cursor_damage();
+    }
+
+    /// Finish the UTF-8 character held back by the previous call using the
+    /// head of `bytes`; returns the unconsumed rest. A sequence that turns out
+    /// to be invalid is replaced by U+FFFD.
+    fn complete_utf8_carry<'a>(&mut self, bytes: &'a [u8]) -> &'a [u8] {
+        let mut used = 0;
+        loop {
+            match std::str::from_utf8(&self.utf8_carry) {
+                Ok(_) => break,
+                Err(e) if e.error_len().is_none() => {
+                    // Still a valid prefix: need more input.
+                    if used == bytes.len() {
+                        return &bytes[used..];
+                    }
+                    self.utf8_carry.push(bytes[used]);
+                    used += 1;
+                }
+                Err(_) => {
+                    // The byte just added broke the sequence; leave it for
+                    // normal processing and substitute the truncated char.
+                    self.utf8_carry.clear();
+                    self.utf8_carry.extend_from_slice("\u{FFFD}".as_bytes());
+                    used -= 1;
+                    break;
+                }
+            }
+        }
+        let carry = std::mem::take(&mut self.utf8_carry);
+        self.advance_scan(&carry);
+        &bytes[used..]
+    }
+
+    /// Work-credit bucket size (cells): a few screens, at least ~1M cells.
+    fn work_cap(&self) -> u64 {
+        Self::work_cap_for(self.cols, self.rows)
+    }
+    fn work_cap_for(cols: usize, rows: usize) -> u64 {
+        (cols as u64)
+            .saturating_mul(rows as u64)
+            .saturating_mul(4)
+            .max(WORK_CAP_MIN)
+    }
+    /// Charge `cost` cells of whole-screen work (REP, SU/SD/IL/DL, ED, DECALN,
+    /// alt-screen entry). Returns false, charging nothing, when the credit
+    /// earned from recent input does not cover it, so a few input bytes can
+    /// never request unbounded work.
+    pub(crate) fn try_spend(&mut self, cost: u64) -> bool {
+        if cost <= self.work_credit {
+            self.work_credit -= cost;
+            true
+        } else {
+            false
+        }
+    }
+    /// Charge up to `rows` rows (`cols` cells each); returns how many the
+    /// credit covers.
+    pub(crate) fn spend_rows(&mut self, rows: usize) -> usize {
+        let per = self.cols.max(1) as u64;
+        let granted = rows.min((self.work_credit / per).min(usize::MAX as u64) as usize);
+        self.work_credit -= granted as u64 * per;
+        granted
+    }
+    /// Charge up to `n` single-cell operations; returns how many are allowed.
+    pub(crate) fn spend_cells(&mut self, n: usize) -> usize {
+        let granted = (n as u64).min(self.work_credit);
+        self.work_credit -= granted;
+        granted as usize
+    }
+
+    fn advance_scan(&mut self, bytes: &[u8]) {
         let mut parser = self.parser.take().unwrap_or_default();
         let mut seg = 0usize;
         let mut i = 0usize;
@@ -406,13 +536,25 @@ impl Terminal {
                         self.str_overflow = false;
                     }
                     b']' | b'P' | b'X' | b'^' => {
-                        self.str_kind = if b == b']' { StrKind::Osc } else { StrKind::Other };
+                        // Hand the introducer to vte now; only the body is
+                        // held back (so an aborted string can be dropped
+                        // without losing the text before it).
+                        parser.advance(self, &bytes[seg..=i]);
+                        i += 1;
+                        seg = i;
+                        self.str_kind = match b {
+                            b']' => StrKind::Osc,
+                            b'P' => StrKind::Dcs,
+                            _ => StrKind::Other,
+                        };
                         self.str_len = 0;
                         self.str_overflow = false;
                         self.apc = ApcState::Str;
-                        i += 1;
                     }
-                    0x1b => i += 1,
+                    // vte's Escape state executes C0 controls and ignores DEL
+                    // and 8-bit bytes without leaving it, so `ESC <ctl> ]`
+                    // still starts an OSC.
+                    0x1b | 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f | 0x80..=0xff => i += 1,
                     _ => {
                         self.apc = ApcState::Ground;
                         i += 1;
@@ -462,6 +604,40 @@ impl Terminal {
                 ApcState::Str => {
                     // Inside an OSC/DCS/SOS/PM string. Bytes reach vte
                     // untouched (via `seg`) until the bound is exceeded.
+                    if matches!(b, 0x18 | 0x1a) && self.str_kind == StrKind::Osc {
+                        // CAN / SUB cancel an OSC: it must not be dispatched
+                        // (vte would), so drop it and its parser state.
+                        parser = vte::Parser::default();
+                        seg = i + 1;
+                        self.apc = ApcState::Ground;
+                        self.str_overflow = false;
+                        self.str_len = 0;
+                        i += 1;
+                        continue;
+                    }
+                    if b == 0x9c && self.str_kind == StrKind::Dcs {
+                        // vte ends a hooked DCS on a raw 0x9c (C1 ST) but
+                        // ignores it in the other DCS states.
+                        let ended = if self.str_overflow {
+                            seg = i + 1;
+                            true
+                        } else {
+                            self.dcs_unhooked = false;
+                            parser.advance(self, &bytes[seg..=i]);
+                            seg = i + 1;
+                            self.dcs_unhooked
+                        };
+                        if ended {
+                            if !self.str_overflow {
+                                self.finish_string(&mut parser);
+                            }
+                            self.apc = ApcState::Ground;
+                            self.str_overflow = false;
+                            self.str_len = 0;
+                            i += 1;
+                            continue;
+                        }
+                    }
                     let terminates = match b {
                         0x1b => {
                             self.apc = ApcState::StrEsc;
@@ -691,6 +867,11 @@ impl Terminal {
     pub fn display_clear_count(&self) -> u64 {
         self.display_clear_count
     }
+    /// Incremented on every RIS (full reset), which also discards scrollback,
+    /// so a host can drop everything it keeps outside the grid (images).
+    pub fn reset_count(&self) -> u64 {
+        self.reset_count
+    }
     pub fn hyperlink(&self, id: u32) -> Option<&Hyperlink> {
         self.hyperlinks.get(id as usize)
     }
@@ -832,7 +1013,12 @@ impl Terminal {
         {
             return;
         }
-        row.marks.push(mark);
+        // One mark per kind per row (the latest wins) bounds the memory a
+        // flood of marks on a fixed row can take.
+        match row.marks.iter_mut().find(|m| m.kind == mark.kind) {
+            Some(m) => *m = mark,
+            None => row.marks.push(mark),
+        }
     }
     /// Marks on an absolute row.
     pub fn marks_at(&self, abs: u64) -> &[LineMark] {
@@ -1277,6 +1463,9 @@ impl Terminal {
         }
         let (r, col) = (self.cursor.row, self.cursor.col);
         let style = self.pen;
+        if style.hyperlink_id.is_some() {
+            self.link_unused = false;
+        }
         {
             let g = self.grid_mut();
             let row = g.row_mut(r);
@@ -1368,7 +1557,12 @@ impl Terminal {
     pub(crate) fn erase_rows(&mut self, from: usize, to: usize) {
         // rows [from, to)
         let bg = self.pen.bg;
-        for r in from..to.min(self.rows) {
+        let to = to.min(self.rows);
+        if from >= to {
+            return;
+        }
+        let to = from + self.spend_rows(to - from);
+        for r in from..to {
             self.grid_mut().row_mut(r).clear(bg);
             self.mark_row(r);
         }
@@ -1413,6 +1607,10 @@ impl Terminal {
         if self.active == Screen::Alt {
             return;
         }
+        // Entering clears the whole alternate screen.
+        if !self.try_spend(self.rows as u64 * self.cols as u64) {
+            return;
+        }
         if save_cursor {
             self.save_cursor();
         }
@@ -1444,14 +1642,55 @@ impl Terminal {
     }
 
     pub(crate) fn intern_hyperlink(&mut self, id: Option<String>, uri: String) -> Option<u32> {
+        if uri.len() > MAX_HYPERLINK_URI || id.as_ref().is_some_and(|i| i.len() > MAX_HYPERLINK_ID) {
+            return None;
+        }
+        let size = uri.len() + id.as_ref().map_or(0, |i| i.len());
         if let Some(id) = &id {
             if let Some(&n) = self.hyperlink_map.get(&(id.clone(), uri.clone())) {
                 return Some(n);
             }
         }
-        if self.hyperlinks.len() >= MAX_HYPERLINKS {
+        // The newest link no cell has used yet is dead weight when another
+        // OSC 8 follows: reuse or overwrite its slot instead of growing the
+        // table (a stream of unused links must not accumulate).
+        if self.link_unused {
+            if let Some(last) = self.hyperlinks.len().checked_sub(1) {
+                let pinned = self
+                    .saved
+                    .iter()
+                    .flatten()
+                    .any(|s| s.pen.hyperlink_id == Some(last as u32));
+                if !pinned {
+                    let old = &self.hyperlinks[last];
+                    if old.id == id && old.uri == uri {
+                        return Some(last as u32);
+                    }
+                    let old_size = old.uri.len() + old.id.as_ref().map_or(0, |i| i.len());
+                    if let Some(oid) = &old.id {
+                        self.hyperlink_map.remove(&(oid.clone(), old.uri.clone()));
+                    }
+                    self.link_bytes = self.link_bytes - old_size + size;
+                    if let Some(id) = &id {
+                        self.hyperlink_map.insert((id.clone(), uri.clone()), last as u32);
+                    }
+                    self.hyperlinks[last] = Hyperlink { id, uri };
+                    return Some(last as u32);
+                }
+            }
+        }
+        let full = |t: &Terminal| {
+            t.hyperlinks.len() >= MAX_HYPERLINKS || t.link_bytes + size > MAX_HYPERLINK_BYTES
+        };
+        if full(self) {
+            // GC is a full scan of the scrollback: only run it when the input
+            // since the last one pays for it, so a table kept full of live
+            // links cannot make every new OSC 8 expensive.
+            if self.gc_idle_bytes.saturating_mul(GC_CELLS_PER_INPUT_BYTE) < self.gc_last_cost {
+                return None;
+            }
             self.gc_hyperlinks();
-            if self.hyperlinks.len() >= MAX_HYPERLINKS {
+            if full(self) {
                 return None;
             }
             // Ids were renumbered; re-resolve the pair.
@@ -1466,12 +1705,20 @@ impl Terminal {
             self.hyperlink_map.insert((id.clone(), uri.clone()), n);
         }
         self.hyperlinks.push(Hyperlink { id, uri });
+        self.link_bytes += size;
+        self.link_unused = true;
         Some(n)
     }
 
     /// Drop hyperlinks no cell (or saved pen) references any more and
     /// renumber the rest. Called only when the table is full.
     fn gc_hyperlinks(&mut self) {
+        self.gc_runs += 1;
+        self.gc_idle_bytes = 0;
+        let cells = ((self.main.scrollback_len() + self.main.rows() + self.alt.rows()) as u64)
+            .saturating_mul(self.cols as u64);
+        self.gc_last_cost = cells.saturating_mul(2);
+        self.link_unused = false;
         let n = self.hyperlinks.len();
         let mut used = vec![false; n];
         let mut mark = |id: Option<u32>| {
@@ -1500,6 +1747,10 @@ impl Terminal {
                 kept.push(h);
             }
         }
+        self.link_bytes = kept
+            .iter()
+            .map(|h| h.uri.len() + h.id.as_ref().map_or(0, |i| i.len()))
+            .sum();
         self.hyperlinks = kept;
         let map = |id: Option<u32>| id.and_then(|i| remap.get(i as usize).copied().flatten());
         self.pen.hyperlink_id = map(self.pen.hyperlink_id);
@@ -1525,6 +1776,7 @@ impl Terminal {
     /// Full reset (RIS). Keeps size and scrollback.
     pub(crate) fn full_reset(&mut self) {
         self.display_clear_count += 1;
+        self.reset_count += 1;
         if self.active == Screen::Alt {
             self.leave_alt(false);
         }
@@ -1542,8 +1794,15 @@ impl Terminal {
         self.cursor_shape = CursorShape::Block;
         self.set_synchronized(false);
         self.main.clear(Color::Default);
+        self.main.clear_scrollback();
+        self.alt.clear(Color::Default);
         self.display_offset = 0;
         self.last_cell = None;
+        // No cell references a link any more.
+        self.hyperlinks = Vec::new();
+        self.hyperlink_map = HashMap::new();
+        self.link_bytes = 0;
+        self.link_unused = false;
         for i in 0..256 {
             self.reset_palette_entry(i);
         }
@@ -1571,6 +1830,20 @@ impl Terminal {
         self.saved[self.sidx()] = None;
         self.pending_wrap = false;
     }
+}
+
+/// Length of an incomplete (but so far valid) UTF-8 sequence at the end of
+/// `bytes`, 0 if it ends on a character boundary or in invalid data.
+fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
+    for k in 1..=3.min(bytes.len()) {
+        let tail = &bytes[bytes.len() - k..];
+        if let Err(e) = std::str::from_utf8(tail) {
+            if e.valid_up_to() == 0 && e.error_len().is_none() {
+                return k;
+            }
+        }
+    }
+    0
 }
 
 fn clear_overlap(row: &mut Row, c: usize, bg: Color) {

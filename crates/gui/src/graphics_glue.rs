@@ -36,6 +36,7 @@ pub struct Graphics {
     last_screen: Screen,
     last_alt_enter: u64,
     last_clear_count: u64,
+    last_reset_count: u64,
     /// Oldest retained absolute row per screen (`[main, alt]`).
     last_oldest: [u64; 2],
     /// Apply the protocol's `MoveCursor` actions (false = behave as if every
@@ -79,6 +80,7 @@ impl Graphics {
             last_screen: Screen::Main,
             last_alt_enter: 0,
             last_clear_count: 0,
+            last_reset_count: 0,
             last_oldest: [0; 2],
         }
     }
@@ -172,6 +174,16 @@ impl Graphics {
         self.last_alt_enter = enters;
         self.last_screen = screen;
 
+        let resets = term.reset_count();
+        if resets != self.last_reset_count {
+            // RIS wipes scrollback too: nothing placed earlier can be shown
+            // again, so drop every placement and the image data with it.
+            self.last_reset_count = resets;
+            self.protocol.clear_all();
+            self.last_oldest = [0; 2];
+            self.dirty = true;
+        }
+
         let clears = term.display_clear_count();
         if clears != self.last_clear_count {
             self.last_clear_count = clears;
@@ -262,6 +274,24 @@ mod tests {
         g.feed(&mut t, b"\x1b[2J");
         assert!(placements(&mut g).is_empty());
         assert!(g.protocol_mut().image(7).is_some());
+    }
+
+    #[test]
+    fn ris_drops_scrolled_back_placements_and_image_data() {
+        let (mut t, mut g) = setup();
+        g.feed(&mut t, PUT);
+        g.feed(&mut t, "\r\nx".repeat(8).as_bytes());
+        assert!(t.scrollback_len() > 0);
+        assert_eq!(placements(&mut g).len(), 1, "scrolled into history, still placed");
+        assert!(g.protocol_mut().image(7).is_some());
+        g.feed(&mut t, b"\x1bc");
+        assert_eq!(t.scrollback_len(), 0);
+        assert!(placements(&mut g).is_empty());
+        assert!(g.protocol_mut().image(7).is_none());
+        assert_eq!(g.protocol_mut().image_count(), 0);
+        // Later output still works.
+        g.feed(&mut t, PUT);
+        assert_eq!(placements(&mut g).len(), 1);
     }
 
     #[test]

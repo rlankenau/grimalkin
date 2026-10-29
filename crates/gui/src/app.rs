@@ -776,12 +776,14 @@ impl Running {
                     }
                 }
                 TermEvent::ClipboardQuery => {
-                    let text = if self.cfg.clipboard.osc52_read {
-                        self.clipboard().and_then(|cb| cb.get_text().ok()).unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    self.term.respond_clipboard(&text);
+                    // With reads disabled send nothing at all: any reply is
+                    // input the program (or whatever printed the query)
+                    // injects into the child's stdin.
+                    if self.cfg.clipboard.osc52_read {
+                        let text =
+                            self.clipboard().and_then(|cb| cb.get_text().ok()).unwrap_or_default();
+                        self.term.respond_clipboard(&text);
+                    }
                 }
                 TermEvent::CwdChanged(_) | TermEvent::SetMouseMode => {}
                 TermEvent::ColorChanged => {

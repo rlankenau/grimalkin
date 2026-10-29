@@ -16,9 +16,11 @@ mod tests;
 mod review_tests;
 #[cfg(test)]
 mod limits_tests;
+#[cfg(test)]
+mod qa_tests;
 
 pub use cell::{
-    default_palette_rgb, Cell, CellWidth, Color, Flags, LineMark, MarkKind, Row, Style, Underline,
+    default_palette_rgb, Cell, CellWidth, Color, Combining, Flags, LineMark, MarkKind, Row, Style, Underline,
 };
 pub use grid::Grid;
 pub use term::{

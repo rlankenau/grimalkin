@@ -285,6 +285,19 @@ impl Protocol {
         self.remove_where(false, |p| p.screen == screen && !p.is_virtual && p.last_row() < abs_row);
     }
 
+    /// Forget everything: all placements (both screens) and all image data
+    /// (terminal reset).
+    pub fn clear_all(&mut self) {
+        let ids: Vec<u32> = self.images.keys().copied().collect();
+        for id in ids {
+            self.remove_image(id);
+        }
+        if !self.placements.is_empty() {
+            self.placements.clear();
+            self.changed = true;
+        }
+    }
+
     /// Remove every placement on `screen` (including virtual ones).
     pub fn clear_screen(&mut self, screen: Screen) {
         self.remove_where(false, |p| p.screen == screen);
