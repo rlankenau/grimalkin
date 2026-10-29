@@ -548,10 +548,22 @@ impl Perform for Terminal {
                 if params.len() < 3 {
                     return;
                 }
-                let sel = String::from_utf8_lossy(params[1]).into_owned();
+                // The selection is echoed in every reply, so only the real
+                // selection letters/digits are kept (and at most a few of
+                // them); anything else would be attacker-sized amplification.
+                let sel: String = String::from_utf8_lossy(params[1])
+                    .chars()
+                    .filter(|c| matches!(c, 'c' | 'p' | 'q' | 's' | '0'..='7'))
+                    .take(MAX_CLIP_SELECTION)
+                    .collect();
                 self.clip_selection = if sel.is_empty() { "c".into() } else { sel };
                 if params[2] == b"?" {
-                    self.events.push(TermEvent::ClipboardQuery);
+                    // One outstanding query is enough: the answer is the same
+                    // for any number of queries queued before it is served.
+                    if !self.clip_query_pending {
+                        self.clip_query_pending = true;
+                        self.events.push(TermEvent::ClipboardQuery);
+                    }
                 } else if params[2].len() > MAX_CLIPBOARD_B64 {
                     // Refuse oversized writes without decoding them.
                 } else if let Some(bytes) = util::base64_decode(params[2]) {

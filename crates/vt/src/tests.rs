@@ -1286,3 +1286,52 @@ fn escape_heavy_garbage_does_not_panic() {
     let (c, r) = t.size();
     assert!(t.cursor().col < c && t.cursor().row < r);
 }
+
+// ------------------------------------------------- reply amplification (F25)
+
+#[test]
+fn response_queue_is_capped_between_drains() {
+    let mut t = term(10, 3);
+    // XTVERSION: a 4-byte query with a larger answer.
+    for _ in 0..100_000 {
+        feed(&mut t, "\x1b[>q");
+    }
+    let r = t.drain_responses();
+    assert!(!r.is_empty());
+    assert!(r.len() <= crate::MAX_PENDING_RESPONSE_BYTES, "{} bytes", r.len());
+    // Capacity is restored after a drain.
+    feed(&mut t, "\x1b[5n");
+    assert_eq!(t.drain_responses(), b"\x1b[0n");
+}
+
+#[test]
+fn clipboard_queries_are_deduplicated_and_reply_is_bounded() {
+    let mut t = term(10, 3);
+    let mut flood = String::new();
+    for _ in 0..1000 {
+        flood.push_str("\x1b]52;c;?\x07");
+    }
+    feed(&mut t, &flood);
+    assert_eq!(t.drain_events(), vec![TermEvent::ClipboardQuery]);
+    // After a drain a new query is reported again.
+    feed(&mut t, "\x1b]52;c;?\x07");
+    assert_eq!(t.drain_events(), vec![TermEvent::ClipboardQuery]);
+
+    // The selection echoed back is sanitised and short.
+    let sel = "c".repeat(100_000) + "\u{1b}zz";
+    feed(&mut t, &format!("\x1b]52;{sel};?\x07"));
+    t.drain_events();
+    t.respond_clipboard("x");
+    let r = String::from_utf8(t.drain_responses()).unwrap();
+    assert!(r.len() < 64, "{} bytes", r.len());
+
+    // Oversized clipboard contents are answered empty, never truncated.
+    let huge = "a".repeat(crate::MAX_CLIPBOARD_BYTES + 1);
+    t.respond_clipboard(&huge);
+    let r = String::from_utf8(t.drain_responses()).unwrap();
+    assert!(r.ends_with(";\x1b\\"), "{r:?}");
+    // A second reply while one is pending beyond the cap is not stacked.
+    t.respond_clipboard(&"a".repeat(crate::MAX_CLIPBOARD_BYTES));
+    t.respond_clipboard(&"a".repeat(crate::MAX_CLIPBOARD_BYTES));
+    assert!(t.drain_responses().len() < crate::MAX_CLIPBOARD_BYTES * 2);
+}

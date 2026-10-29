@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -371,7 +371,7 @@ impl App {
         let (cw, ch) = renderer.cell_size_px();
         term.set_cell_pixel_size(cw, ch);
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = grimalkin_pty::event_channel();
         let proxy = self.proxy.clone();
         let pending = self.wake_pending.clone();
         let (cmd, args) = match &self.launch.command {
@@ -776,7 +776,9 @@ impl Running {
                     }
                 }
                 TermEvent::ClipboardQuery => {
-                    let text = if self.cfg.clipboard.osc52_read {
+                    // Skip the (synchronous) clipboard read while earlier
+                    // replies are still stuck in a child that is not reading.
+                    let text = if self.cfg.clipboard.osc52_read && self.writer.pending_bytes() == 0 {
                         self.clipboard().and_then(|cb| cb.get_text().ok()).unwrap_or_default()
                     } else {
                         String::new()
@@ -803,7 +805,11 @@ impl Running {
         }
         let resp = self.term.drain_responses();
         if !resp.is_empty() {
-            let _ = self.writer.write_all(&resp);
+            // Replies are dropped (not queued without bound) when the child
+            // is not reading its input.
+            if let Ok(false) = self.writer.write_reply(&resp) {
+                log::debug!("dropped {} bytes of terminal replies (child not reading)", resp.len());
+            }
         }
         self.reset_blink();
         if self.term.synchronized_output() {
