@@ -26,7 +26,35 @@ placeholders, no animation frames (`a=f`).
 
 ## Installing on Windows
 
-Download `grimalkin-setup-x64.exe` from the
+### Which download do I need?
+
+Releases have one installer and one portable zip per CPU architecture:
+
+| Your Windows | Download | Runs as |
+| --- | --- | --- |
+| Windows 10 or 11, Intel/AMD 64-bit (x64) | `grimalkin-setup-x64.exe` or `grimalkin-portable-x64.zip` | native x64 |
+| Windows 11 on ARM64 (Snapdragon X, Windows Dev Kit, Parallels/VMware on Apple Silicon, ...) | `grimalkin-setup-arm64.exe` or `grimalkin-portable-arm64.zip` | native ARM64 (recommended) |
+| Windows 11 on ARM64, x64 build | `grimalkin-setup-x64.exe` | x64 emulation (the fallback; may be slower) |
+| Windows 10 on ARM64 | none | not supported (Windows 10 ARM64 has no x64 emulation, and the native build is only validated on Windows 11) |
+| 32-bit x86 Windows | none | not supported |
+
+If unsure: Settings, System, About, "System type" says `x64-based processor` or
+`ARM-based processor`. The two builds have the same features. The x64 build keeps its
+Windows 10 1809 minimum; the ARM64 minimum is Windows 11 until validated
+otherwise. Each build bundles the ConPTY (`conpty.dll` and `OpenConsole.exe`)
+of its own architecture.
+
+> **ARM64 status:** the ARM64 build is compiled, packaged and install-tested on
+> a native Windows 11 ARM64 CI runner, and the library test suite runs there.
+> Interactive validation on real ARM64 hardware (GPU rendering, Preferences,
+> DPI changes, clipboard, skins, kitty graphics and keyboard through the bundled
+> ConPTY) is still in progress, tracked in
+> [issue #1](https://github.com/rlankenau/grimalkin/issues/1). Report anything
+> odd there; the x64 build under emulation is the known-good fallback.
+
+### Installing
+
+Download the installer for your machine from the
 [Releases](https://github.com/rlankenau/grimalkin/releases) page and run it. It
 installs per user by default (into `%LOCALAPPDATA%\Programs\grimalkin`, no
 administrator prompt); the first page offers "install for all users" if you
@@ -48,19 +76,59 @@ want Program Files instead. The installer:
   is closed first); uninstall from Settings, Apps, which also removes the PATH
   entry and context-menu keys. Your config in `%APPDATA%\grimalkin` is kept
 
-Silent install, for scripts: `grimalkin-setup-x64.exe /VERYSILENT /TASKS="addtopath,contextmenu"`
+Silent install, for scripts: `grimalkin-setup-<arch>.exe /VERYSILENT /TASKS="addtopath,contextmenu"`
 (add `/ALLUSERS` for a machine-wide install).
 
-Prefer no installer? `grimalkin-portable-x64.zip` has the same files
+Prefer no installer? `grimalkin-portable-<arch>.zip` has the same files
 (including the ConPTY pair); unzip it anywhere and run `grimalkin.exe`.
 
+**Switching between x64 and ARM64 (for example from an emulated x64 install to
+the native ARM64 build).** Both architectures share one installer identity,
+install folder, `PATH` entry and context-menu keys, so only one can be installed
+at a time and the installer enforces that. Run the new installer without
+administrator rights (the default, per-user): it finds the other-architecture
+install and offers to uninstall it first (Yes continues, No cancels without
+changing anything). That uninstall removes the old files, `PATH` entry and
+context-menu keys; the new installer then installs the new ones, so tick the same
+optional tasks again. Your config and skins in `%APPDATA%\grimalkin` are kept.
+For scripted installs, the installer refuses to replace an install of the other
+architecture unless you pass `/REPLACEARCH=1` (exit code 1 otherwise).
+
+For safety, an installer that is running **elevated** (as administrator, for
+example `/ALLUSERS` or "install for all users") never runs the uninstaller of a
+*per-user* copy, because that command comes from your own user registry and
+could otherwise be used to run something as administrator. It only replaces an
+*all-users* install whose uninstaller is in `Program Files`. If an elevated
+installer finds a per-user install of the other architecture, it stops without
+changing anything (even with `/REPLACEARCH=1`): uninstall that copy from
+Settings, Apps first, or run the installer again without administrator rights.
+Limitation: if a standard user elevates with a *different* administrator's
+credentials, the installer cannot see the standard user's per-user install, so
+remove a per-user install of the other architecture yourself before installing
+for all users that way.
+
+Installs made before ARM64
+existed are x64 by definition. Portable zips never interfere with the installer
+or each other; keep them in different folders. To go back, run the x64
+installer the same way.
+
 **Releases.** Pushing a tag matching `v*` (for example `v0.2.0`) runs CI, which
-publishes everything to the GitHub release: the installer
-(`grimalkin-setup-x64.exe`, versioned from the tag), the portable zip, and the
-plain `grimalkin.exe` / `grimalkin.com`. The same files are available as
-workflow artifacts on every trunk build. The installer is built from
-`installer/windows/grimalkin.iss` with Inno Setup; the ConPTY package version
-and SHA256 are pinned in `.github/workflows/ci.yml`.
+publishes everything to the GitHub release: per architecture the installer
+(`grimalkin-setup-x64.exe`, `grimalkin-setup-arm64.exe`, versioned from the tag)
+and the portable zip (`grimalkin-portable-x64.zip`,
+`grimalkin-portable-arm64.zip`). The bare `grimalkin.exe` / `grimalkin.com` are
+no longer separate release assets (the names would collide between
+architectures); they are inside the zips, and available per architecture as the
+`grimalkin-windows-x64` / `grimalkin-windows-arm64` workflow artifacts on every
+trunk build, together with the installers and zips. x64 is built on
+`windows-latest`, ARM64 natively on the `windows-11-arm` runner (target
+`aarch64-pc-windows-msvc`), where the tests and the installer smoke test also
+run. The installers are built from `installer/windows/grimalkin.iss`
+(`/DArch=x64|arm64`) with Inno Setup 6.3 or newer; the ConPTY package version
+and SHA256 are pinned in `.github/workflows/ci.yml`, which packages the
+architecture-matching DLL/OpenConsole pair, fails if it is missing, and checks
+the PE machine type of every shipped binary
+(`scripts/windows/check-pe-machine.ps1`).
 
 ## Requirements
 
