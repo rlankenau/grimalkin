@@ -1,0 +1,203 @@
+name: Windows distribution
+
+on:
+  workflow_call:
+    inputs:
+      signed:
+        type: boolean
+        default: false
+    outputs:
+      binary-artifact:
+        value: ${{ jobs.package.outputs.binary-artifact }}
+
+jobs:
+  package:
+    runs-on: windows-latest
+    # Configure tag-only deployment rules and required reviewers on windows-release.
+    # The unsigned environment has no credentials and the caller grants no OIDC.
+    environment: ${{ inputs.signed && 'windows-release' || 'windows-unsigned' }}
+    outputs:
+      binary-artifact: ${{ steps.artifact-name.outputs.name }}
+    env:
+      CARGO_TERM_COLOR: always
+      SIGNED_RELEASE: ${{ inputs.signed }}
+      BUILD_KIND: ${{ inputs.signed && 'signed' || 'unsigned' }}
+      # Microsoft.Windows.Console.ConPTY (Windows Terminal project, MIT).
+      CONPTY_VERSION: 1.25.260930003
+      CONPTY_SHA256: 02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee
+      WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+      WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+      WINDOWS_SIGNING_ACCOUNT: ${{ vars.WINDOWS_SIGNING_ACCOUNT }}
+      WINDOWS_SIGNING_PROFILE: ${{ vars.WINDOWS_SIGNING_PROFILE }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate release authorization and configuration
+        if: inputs.signed
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          WINDOWS_SIGNING_ACCOUNT: ${{ vars.WINDOWS_SIGNING_ACCOUNT }}
+          WINDOWS_SIGNING_PROFILE: ${{ vars.WINDOWS_SIGNING_PROFILE }}
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'rlankenau/grimalkin' -or $env:GITHUB_EVENT_NAME -ne 'push' -or $env:GITHUB_REF -notlike 'refs/tags/v*') {
+            throw 'Signing is restricted to upstream release tag pushes'
+          }
+          foreach ($name in 'AZURE_CLIENT_ID','AZURE_TENANT_ID','AZURE_SUBSCRIPTION_ID','WINDOWS_SIGNING_ENDPOINT','WINDOWS_SIGNING_ACCOUNT','WINDOWS_SIGNING_PROFILE','WINDOWS_SIGNING_SUBJECT') {
+            if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Required release configuration missing: $name" }
+          }
+          # Only reviewed commits on trunk may be released. Never sign PR artifacts.
+          git fetch --no-tags origin trunk --unshallow
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch release ancestry' }
+          git merge-base --is-ancestor HEAD FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Release commit is not on trunk' }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !inputs.signed }}
+      - run: |
+          cargo build --release --locked -p grimalkin -p grimalkin-launcher
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed' }
+      - name: Stage dist
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/grimalkin.exe dist/grimalkin.exe
+          Copy-Item target/release/grimalkin-launcher.exe dist/grimalkin.com
+          if ($env:SIGNED_RELEASE -ne 'true') {
+            'UNSIGNED contributor build. No verified publisher or timestamp. Not a signed release.' | Set-Content dist/UNSIGNED.txt
+          }
+          "Windows distribution: **$env:BUILD_KIND**" >> $env:GITHUB_STEP_SUMMARY
+      - name: Determine version
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF_NAME.Substring(1)
+          } else {
+            $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.+-]+)?$') { throw "Unexpected version: $version" }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Fetch ConPTY redistributable
+        run: |
+          $v = $env:CONPTY_VERSION
+          $pkg = "microsoft.windows.console.conpty.$v.nupkg"
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/$v/$pkg" -OutFile $pkg
+          if ((Get-FileHash -Algorithm SHA256 $pkg).Hash.ToLowerInvariant() -ne $env:CONPTY_SHA256) {
+            throw "SHA256 mismatch for $pkg"
+          }
+          $wanted = @{
+            'runtimes/win-x64/native/conpty.dll'        = 'conpty.dll'
+            'build/native/runtimes/x64/OpenConsole.exe' = 'OpenConsole.exe'
+          }
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $pkg).Path)
+          try {
+            foreach ($name in $wanted.Keys) {
+              $entry = $zip.GetEntry($name)
+              if ($null -eq $entry) { throw "$name not found in $pkg" }
+              [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path (Resolve-Path dist).Path $wanted[$name]), $true)
+            }
+          } finally { $zip.Dispose() }
+          Get-FileHash dist/conpty.dll, dist/OpenConsole.exe | Select-Object Path, Hash |
+            ConvertTo-Json | Set-Content "$env:RUNNER_TEMP/conpty-hashes.json"
+          Copy-Item installer/windows/LICENSE-ConPTY.txt dist/
+          Copy-Item README.md, LICENSE, LICENSE-MIT, LICENSE-APACHE dist/
+      - name: Locate SignTool
+        run: |
+          $tool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $tool) { throw 'Windows SDK SignTool is required' }
+          "WINDOWS_SIGNTOOL=$($tool.FullName)" >> $env:GITHUB_ENV
+      - name: Install signing module
+        if: inputs.signed
+        run: Install-Module -Name ArtifactSigning -RequiredVersion 0.1.20 -Repository PSGallery -Scope CurrentUser -Force
+      - name: Authenticate to Azure with release-only OIDC
+        if: inputs.signed
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign first-party binaries after launcher rename
+        if: inputs.signed
+        run: |
+          ./scripts/sign-windows.ps1 -Path dist/grimalkin.exe
+          ./scripts/sign-windows.ps1 -Path dist/grimalkin.com
+      - name: Portable zip
+        run: Compress-Archive -Path dist/* -DestinationPath grimalkin-portable-x64.zip
+      - name: Build installer
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'choco install innosetup failed' }
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          $numeric = ($env:APP_VERSION -split '[-+]')[0] + '.0'
+          $options = @("/DAppVersion=$env:APP_VERSION", "/DAppVersionNumeric=$numeric")
+          if ($env:SIGNED_RELEASE -eq 'true') {
+            $certificate = (Get-AuthenticodeSignature dist/grimalkin.exe).SignerCertificate
+            $publisher = $certificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            $options += @('/DSignedRelease', "/DAppPublisher=$publisher")
+            # $f is quoted by Inno; $q quotes the callback's path (including spaces).
+            $options += '/Sgrimalkin=pwsh.exe -NoLogo -NoProfile -NonInteractive -File $q' + "$env:GITHUB_WORKSPACE\scripts\sign-windows.ps1" + '$q -Path $f'
+          }
+          & $iscc @options installer/windows/grimalkin.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+      - name: Clear Azure login before exercising outputs
+        if: ${{ always() && inputs.signed }}
+        run: |
+          az logout
+          if ($LASTEXITCODE -ne 0) { throw 'Azure logout failed' }
+      - name: Check upstream ConPTY bytes were preserved
+        run: |
+          foreach ($original in (Get-Content "$env:RUNNER_TEMP/conpty-hashes.json" | ConvertFrom-Json)) {
+            if ((Get-FileHash -LiteralPath $original.Path).Hash -ne $original.Hash) {
+              throw "Upstream redistributable was modified: $($original.Path)"
+            }
+          }
+      - name: Signature rejection tests
+        run: |
+          $options = @{ UnsignedPath = 'target/release/grimalkin.exe' }
+          if ($env:SIGNED_RELEASE -eq 'true') { $options.SignedPath = @('dist/grimalkin.exe', 'dist/grimalkin.com') }
+          ./scripts/test-windows-signature.ps1 @options
+      - name: Verify standalone, extracted, installed, setup and uninstaller outputs
+        run: ./scripts/test-windows-distribution.ps1 -Signed:($env:SIGNED_RELEASE -eq 'true')
+      # No uploads (including the original plain pair) occur before verification.
+      - name: Upload plain exe and com
+        uses: actions/upload-artifact@v4
+        with:
+          name: grimalkin-windows-x64-${{ env.BUILD_KIND }}
+          if-no-files-found: error
+          path: |
+            dist/grimalkin.exe
+            dist/grimalkin.com
+            dist/UNSIGNED.txt
+      - name: Set artifact name
+        id: artifact-name
+        run: echo "name=grimalkin-windows-x64-$env:BUILD_KIND" >> $env:GITHUB_OUTPUT
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: grimalkin-setup-x64-${{ env.BUILD_KIND }}
+          if-no-files-found: error
+          path: installer-out/grimalkin-setup-x64.exe
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: grimalkin-portable-x64-${{ env.BUILD_KIND }}
+          if-no-files-found: error
+          path: grimalkin-portable-x64.zip
+      - name: Attach verified signed outputs to release
+        if: inputs.signed
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            installer-out/grimalkin-setup-x64.exe
+            grimalkin-portable-x64.zip
+            dist/grimalkin.exe
+            dist/grimalkin.com
