@@ -210,8 +210,13 @@ jobs:
           $userPath = [Environment]::GetEnvironmentVariable('Path','User')
           if ((($userPath -split ';') | Where-Object { $_ -eq $dir }).Count -ne 1) { throw "install dir must be on user PATH exactly once: $userPath" }
 
-          # Uninstall (_?= runs it in place so -Wait really waits).
-          $u = Start-Process (Join-Path $dir 'unins000.exe') -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"_?=$dir"
+          # Uninstall via the registered uninstaller (after a replace its file
+          # name need not be unins000.exe). _?= runs it in place so -Wait really waits.
+          Get-ChildItem $dir -Filter 'unins*' | Format-Table Name, Length
+          $uninst = ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{5E56C746-3735-4FF7-96B9-E90F7D4C5AA7}_is1').UninstallString).Trim('"')
+          Write-Host "registered uninstaller: $uninst"
+          if (-not (Test-Path $uninst)) { throw "registered uninstaller missing: $uninst" }
+          $u = Start-Process $uninst -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"_?=$dir"
           if ($u.ExitCode -ne 0) { throw "uninstaller exit code $($u.ExitCode)" }
           $userPath = [Environment]::GetEnvironmentVariable('Path','User')
           if (($userPath -split ';') -contains $dir) { throw 'install dir still on user PATH after uninstall' }
