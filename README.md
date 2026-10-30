@@ -54,13 +54,14 @@ Silent install, for scripts: `grimalkin-setup-x64.exe /VERYSILENT /TASKS="addtop
 Prefer no installer? `grimalkin-portable-x64.zip` has the same files
 (including the ConPTY pair); unzip it anywhere and run `grimalkin.exe`.
 
-**Releases.** Pushing a tag matching `v*` (for example `v0.2.0`) runs CI, which
-publishes everything to the GitHub release: the installer
+**Releases.** Pushing an upstream tag matching `v*` (for example `v0.2.0`) runs CI,
+which requires Windows signing configuration before publishing the installer
 (`grimalkin-setup-x64.exe`, versioned from the tag), the portable zip, and the
-plain `grimalkin.exe` / `grimalkin.com`. The same files are available as
-workflow artifacts on every trunk build. The installer is built from
-`installer/windows/grimalkin.iss` with Inno Setup; the ConPTY package version
-and SHA256 are pinned in `.github/workflows/ci.yml`.
+plain `grimalkin.exe` / `grimalkin.com`. Trunk, PR, and fork builds instead produce
+explicitly **unsigned** workflow artifacts, never Windows release attachments.
+Older releases may also be unsigned. See [Windows release signing setup](#windows-release-signing-setup).
+The installer is built from `installer/windows/grimalkin.iss` with Inno Setup;
+the ConPTY package version and SHA256 are pinned in `.github/workflows/windows.yml`.
 
 ## Requirements
 
@@ -117,6 +118,144 @@ folder, next to both files, as before.
 When building yourself: `cargo build --release -p grimalkin -p grimalkin-launcher`,
 then copy `target/release/grimalkin-launcher.exe` to `grimalkin.com` beside
 `grimalkin.exe`.
+
+### Windows release signing setup
+
+**Rollout status:** the signing path is implemented, but provisioning a provider,
+confirming its publisher identity, approving CI, and completing the Windows 10/11
+checks below are maintainer tasks. This is not a claim that existing downloads
+are signed or that client-OS validation has already passed. New upstream `v*`
+builds fail closed until setup is complete; there is no unsigned release fallback.
+
+#### Provider decision
+
+Evaluation as of October 2026 (confirm eligibility and current pricing before
+purchase; no subscription or sponsorship has been obtained by this change):
+
+| Option | Cost and prerequisites | Custody and renewal | Decision |
+| --- | --- | --- | --- |
+| [Microsoft Artifact Signing](https://azure.microsoft.com/en-us/pricing/details/artifact-signing/) (formerly Trusted Signing) | Basic: US$9.99/month, 5,000 signatures included; Azure subscription, Entra app, approved identity validation in a supported geography, and a **Public Trust** certificate profile. Organization and individual eligibility differ; check the [setup requirements](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart). | Microsoft holds non-exportable HSM keys; GitHub uses short-lived OIDC authorization, not a PFX or client secret. Certificates rotate daily and last 72 hours; timestamping is essential. Maintain subscription billing and revalidate identity before the portal's expiry date. | Implemented provider, conditional on maintainer eligibility and budget approval. Supports synchronous Inno signing without storing a private key on the runner. |
+| [SignPath Foundation](https://signpath.org/) | Free sponsorship for qualifying open-source projects, subject to application and policy review; being a public repository alone does not establish eligibility. Review the [terms](https://signpath.org/terms), licensing, project governance, and build-integrity requirements. | Foundation/provider controls certificate and signing service; project maintainers authorize approved builds. Continued eligibility and provider-managed certificate renewal must be maintained. | Worth applying for if eligible. Not assumed approved, and not interchangeable with the implemented Azure callback: integrating its artifact approval/return flow needs a separate change. |
+| [DigiCert code signing](https://www.digicert.com/signing/code-signing-certificates) or another CA | Paid certificate plus hardware token or managed HSM/service fees; identity validation and compatible automated signing access required. A current all-in quote has not been obtained; do not budget certificate-only pricing as the total. | Owner must safeguard hardware/service access, renew the subscription/certificate, repeat validation as required, and plan certificate rollover. An ordinary exportable PFX is not the default public code-signing solution. | Not selected: more procurement and key-management work for this release path. |
+
+The publisher is the provider-validated identity, not an arbitrary “Grimalkin”
+label. Confirm that the name users will see is acceptable before paying or enabling
+releases. Microsoft documents [certificate lifecycle and timestamping](https://learn.microsoft.com/en-us/azure/artifact-signing/concept-certificate-management).
+
+#### Provisioning and authorization
+
+1. Create an Artifact Signing account, complete identity validation, and create a
+   **Public Trust** profile. Private Trust/test certificates are not suitable for
+   public downloads. Obtain the profile's regional endpoint and vetted certificate
+   **full Subject string** from the Azure portal.
+2. Create a dedicated Entra application/service principal. Grant only
+   **Artifact Signing Certificate Profile Signer** at that certificate profile's
+   resource scope (not subscription Contributor/Owner). The human provisioning
+   identity, not CI, manages accounts, validation, and role assignments.
+3. Create the GitHub environment **`windows-release`**. Require release reviewers,
+   prevent self-review and administrator bypass where available, and restrict
+   deployment to **tags** matching `v*` (no branch deployments). Protect `trunk`
+   with reviewed changes and restrict creation/update/deletion of release tags
+   with repository rulesets. Approve only tags pointing to reviewed trunk commits;
+   the workflow also checks ancestry before building.
+4. Add an Entra federated credential with issuer
+   `https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`,
+   and exact subject `repo:rlankenau/grimalkin:environment:windows-release`.
+   Do **not** add a PR, branch-wide, wildcard, or fork federation. See
+   [Microsoft's OIDC integration guide](https://github.com/Azure/artifact-signing-action/blob/main/docs/OIDC.md).
+5. Set these **environment variables** in `windows-release` (Settings >
+   Environments > windows-release > Environment variables):
+
+   | Variable | Value |
+   | --- | --- |
+   | `AZURE_CLIENT_ID` | Dedicated application ID |
+   | `AZURE_TENANT_ID` | Entra tenant ID |
+   | `AZURE_SUBSCRIPTION_ID` | Signing account subscription |
+   | `WINDOWS_SIGNING_ENDPOINT` | Account's regional HTTPS endpoint |
+   | `WINDOWS_SIGNING_ACCOUNT` | Account name |
+   | `WINDOWS_SIGNING_PROFILE` | Public Trust certificate profile name |
+   | `WINDOWS_SIGNING_SUBJECT` | Exact, case-sensitive full Subject of the approved publisher certificate |
+
+   These identifiers are not signing secrets. Never upload a private key, PFX,
+   Azure client secret, or personal Azure credential to this workflow. Do not
+   populate `windows-unsigned` with credentials. Do not derive the expected Subject
+   from the artifact being verified; independently review the profile certificate.
+6. Approve and test a reviewed release tag. Inspect signer names and timestamps,
+   retain CI verification logs, and perform the client-OS checks below before
+   announcing the release. Missing configuration, provider/timestamp outages,
+   rejected signatures, or test failures block Windows uploads and attachments.
+
+Only the upstream tag caller in `.github/workflows/ci.yml` grants `id-token: write`
+and release upload permission. The shared `.github/workflows/windows.yml` uses a
+fresh hosted runner, avoids build caches for signed releases, signs explicit
+first-party paths after the launcher is renamed, and logs out of Azure before
+executing outputs. PRs use neither the release environment nor its authorization.
+Keep signing/workflow dependencies reviewed and pinned when updating them.
+
+`scripts/sign-windows.ps1` uses Microsoft's pinned `ArtifactSigning` PowerShell
+module and SHA-256 with its RFC 3161 timestamp service. Inno's
+[`SignTool` and `SignedUninstaller`](https://jrsoftware.org/ishelp/topic_setup_signtool.htm)
+sign both the final installer and generated uninstaller; a signature added only
+after compiling Setup would not sign the embedded uninstaller. ConPTY binaries
+are never signed as Grimalkin: CI checks their original bytes, including any
+upstream signatures, against the pinned package and packaged/installed copies.
+
+All uploads, including the standalone executable pair, happen **after**
+verification. The verifier requires embedded Authenticode signatures, trusted
+timestamps, and the exact configured Subject, and treats SignTool warnings as
+failures. It checks the actual `.com` filename, extracted portable files, installed
+files, Setup, and the installed uninstaller. Packaged payload hashes must equal
+the staged outputs. Negative tests reject unsigned/tampered files and the wrong
+publisher. Artifacts end in `-signed` or `-unsigned`; unsigned portable/standalone
+artifacts include `UNSIGNED.txt`, and unsigned Setup identifies itself accordingly.
+Local `cargo` and ordinary ISCC builds remain unsigned and need no signing tools.
+
+For maintenance, monitor billing, signing quotas, identity-validation expiry,
+profile access/audit logs, and trust-chain changes. Daily certificate rotation
+does not require updating `WINDOWS_SIGNING_SUBJECT` or pinning leaf thumbprints.
+A publisher/profile change requires explicit review of the expected identity
+and a fresh validation run. On suspected compromise, revoke signing authorization
+and affected certificates through Azure, investigate, and reissue verified outputs;
+do not disable verification to get a release out.
+
+#### Windows 10/11 release validation
+
+`windows-latest` is a Windows **Server** image, not proof of Windows 10 or 11
+behavior. On disposable, fully updated x64 Windows 10 and Windows 11 machines,
+install PowerShell 7 and the Windows SDK SignTool, check out the release's source,
+and download **that release's** ZIP, installer, and standalone executable pair.
+Extract the ZIP into `dist`, then overwrite `dist/grimalkin.exe` and
+`dist/grimalkin.com` with the standalone downloads. With no existing Grimalkin
+installation in the test account, run from the checkout:
+
+```powershell
+$env:WINDOWS_SIGNTOOL = 'C:\path\to\Windows SDK\x64\signtool.exe'
+$env:WINDOWS_SIGNING_SUBJECT = 'the independently approved full certificate Subject'
+./scripts/test-windows-distribution.ps1 -Signed `
+  -Installer ./grimalkin-setup-x64.exe -Archive ./grimalkin-portable-x64.zip
+```
+
+This verifies all distribution forms and exercises silent per-user installation,
+PATH/context-menu integration, launcher help/version/error exit propagation, and
+uninstall cleanup. Also interactively launch the GUI, open a shell via the launcher,
+exercise Explorer integration, and test the all-users install/uninstall path.
+The script is destructive to its test installation; use a clean account/VM.
+
+Separately, download Setup through a browser (preserve Mark-of-the-Web; do not
+unblock the file first), run the interactive installer, and record the exact
+browser/SmartScreen/UAC/enterprise-policy messages and displayed publisher.
+Record results in the release notes or linked issue:
+
+| System | Authenticode + install/launcher/uninstall | Browser download observations |
+| --- | --- | --- |
+| Windows 10 x64 (record build, updates, policy) | Pending maintainer validation | Pending; record browser/version, warnings, publisher |
+| Windows 11 x64 (record build, updates, policy) | Pending maintainer validation | Pending; record browser/version, warnings, publisher |
+
+Include release tag, SHA-256 hashes, certificate Subject, timestamp, date, and
+test logs. Signing establishes identity and integrity, **not** guaranteed
+SmartScreen reputation or exemption from antivirus, Smart App Control, WDAC, or
+enterprise policy. A warning is not by itself a signature failure, and no
+Windows 11-specific regression has been established.
 
 ## Installing on macOS
 
