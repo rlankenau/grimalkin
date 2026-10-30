@@ -313,7 +313,39 @@ end;
   Policy: an existing install of the OTHER architecture is removed first, via
   its own uninstaller. Interactive setup asks; silent setup refuses unless
   /REPLACEARCH=1 is passed. User settings (%APPDATA%\grimalkin) are never
-  touched. Same-architecture installs are plain in-place upgrades. }
+  touched. Same-architecture installs are plain in-place upgrades.
+
+  Security rule: setup never runs an uninstall command that came from a
+  user-writable location (HKCU, or a per-user folder) while it is elevated.
+  An unelevated process can write HKCU, so doing that would let it run any
+  program as administrator. Therefore:
+    - Not elevated: either kind of install may be replaced. A per-user
+      uninstaller runs at the same privilege as the setup; an all-users one
+      shows its own UAC prompt.
+    - Elevated (setup is an administrator, e.g. /ALLUSERS): only an all-users
+      install (HKLM, writable by administrators only) whose uninstaller sits in
+      Program Files is replaced. A per-user install of the other architecture is
+      DETECTED but never executed: setup stops and asks for it to be removed
+      first (Settings, Apps) or for setup to be run again without
+      administrator rights.
+    - Known limitation: when a standard user elevates with a DIFFERENT
+      administrator's credentials, HKCU is that administrator's hive, so the
+      initiating user's own per-user install is not seen. Such an install of the
+      other architecture must be removed by that user beforehand.
+  Every uninstaller is validated before it runs (see CheckUninstaller). }
+
+{ True when setup runs with administrator rights. The CITestUnelevated define
+  makes a CI-ONLY build (never shipped) that reports False: the CI runner is an
+  administrator, so this lets the smoke test exercise the unelevated per-user
+  replacement flow. The release installer is built without it. }
+function RunningElevated: Boolean;
+begin
+#ifdef CITestUnelevated
+  Result := False;
+#else
+  Result := IsAdmin;
+#endif
+end;
 
 { Architecture recorded by an install under Root ('' = no install there). The
   uninstall key proves an install exists; the Arch value (missing on installs
@@ -328,19 +360,75 @@ begin
   end;
 end;
 
-{ Runs the uninstaller of the install under Root to completion (UAC-elevating
-  for an all-users install). _?= makes it run in place so we really wait. }
-function UninstallExisting(Root: Integer; Silent: Boolean): Boolean;
+{ True if Path is inside Parent (a folder), compared case-insensitively. }
+function IsUnderDir(Path, Parent: String): Boolean;
+begin
+  Path := Lowercase(Path);
+  Parent := Lowercase(TrimBackslash(Parent)) + '\';
+  Result := (Length(Path) > Length(Parent)) and (Copy(Path, 1, Length(Parent)) = Parent);
+end;
+
+{ Reads and validates the uninstaller of the install under Root. On success Cmd
+  is the full path of the uninstaller and Dir its folder. Requirements:
+    - UninstallString is exactly one quoted path (no extra arguments);
+    - the path has no ".." part, exists, and is named unins*.exe;
+    - it lies directly in the recorded InstallLocation;
+    - when Elevated, it also lies inside Program Files. }
+function CheckUninstaller(Root: Integer; Elevated: Boolean; var Cmd, Dir, Why: String): Boolean;
 var
-  Cmd, Dir, Params: String;
+  Raw, Loc: String;
+begin
+  Result := False;
+  Why := '';
+  if not RegQueryStringValue(Root, AppUninstallKey, 'UninstallString', Raw) then
+  begin
+    Why := 'no UninstallString is recorded';
+    Exit;
+  end;
+  Raw := Trim(Raw);
+  if (Length(Raw) < 3) or (Raw[1] <> '"') or (Raw[Length(Raw)] <> '"') then
+  begin
+    Why := 'the UninstallString is not a single quoted path';
+    Exit;
+  end;
+  Cmd := Copy(Raw, 2, Length(Raw) - 2);
+  if (Pos('"', Cmd) > 0) or (Pos('..', Cmd) > 0) then
+  begin
+    Why := 'the UninstallString contains unexpected characters';
+    Exit;
+  end;
+  Dir := ExtractFileDir(Cmd);
+  if (Copy(Lowercase(ExtractFileName(Cmd)), 1, 5) <> 'unins') or
+     (Lowercase(ExtractFileExt(Cmd)) <> '.exe') or not FileExists(Cmd) then
+  begin
+    Why := 'the uninstaller is not an existing unins*.exe file';
+    Exit;
+  end;
+  if not RegQueryStringValue(Root, AppUninstallKey, 'InstallLocation', Loc) or
+     (Lowercase(TrimBackslash(Loc)) <> Lowercase(TrimBackslash(Dir))) then
+  begin
+    Why := 'the uninstaller is not in the recorded install folder';
+    Exit;
+  end;
+  if Elevated and not (IsUnderDir(Cmd, ExpandConstant('{commonpf64}')) or
+                       IsUnderDir(Cmd, ExpandConstant('{commonpf32}'))) then
+  begin
+    Why := 'the uninstaller is not inside Program Files';
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ Runs the (already validated) uninstaller to completion; an all-users one
+  shows its own UAC prompt when this setup is not elevated. _?= makes it run in
+  place so we really wait. }
+function UninstallExisting(Cmd, Dir: String; Silent: Boolean): Boolean;
+var
+  Params: String;
   Rc: Integer;
 begin
   Result := False;
-  if not RegQueryStringValue(Root, AppUninstallKey, 'UninstallString', Cmd) then
-    Exit;
-  Cmd := RemoveQuotes(Trim(Cmd));
-  Dir := ExtractFileDir(Cmd);
-  Params := '/NORESTART /SUPPRESSMSGBOXES _?=' + Dir;
+  Params := '/NORESTART /SUPPRESSMSGBOXES "_?=' + Dir + '"';
   if Silent then
     Params := '/VERYSILENT ' + Params
   else
@@ -355,18 +443,45 @@ begin
     files are harmless and have no registration left. }
 end;
 
-{ Returns True when it is fine to continue. }
-function ResolveOtherArch(Root: Integer; Where: String): Boolean;
+{ Returns True when it is fine to continue. PerUser says Root is HKCU. }
+function ResolveOtherArch(Root: Integer; PerUser: Boolean; Where: String): Boolean;
 var
-  Found, Msg: String;
+  Found, Msg, Cmd, Dir, Why: String;
+  Elevated: Boolean;
 begin
   Result := True;
   Found := InstalledArch(Root);
   if (Found = '') or (Found = ThisArch) then
     Exit;
+  Elevated := RunningElevated;
   Log(Format('Found an other-architecture install (%s) %s', [Found, Where]));
   Msg := Format('grimalkin (%s) is already installed %s. This installer is for ' +
     '%s, and the two cannot be installed together.', [Found, Where, ThisArch]);
+
+  { Elevated and per-user: never execute it (the command comes from HKCU, which
+    an unelevated process can write). Stop and say what to do. }
+  if Elevated and PerUser then
+  begin
+    Log('Refusing to run a per-user uninstaller from an elevated setup: ' + Msg);
+    if not WizardSilent then
+      MsgBox(Msg + #13#10#13#10 + 'This setup is running with administrator rights, so it will ' +
+        'not run the uninstaller of a per-user copy. Uninstall grimalkin from Settings, Apps, ' +
+        'or run this installer again without administrator rights (choose "Install for me ' +
+        'only"), then repeat.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+
+  if not CheckUninstaller(Root, Elevated, Cmd, Dir, Why) then
+  begin
+    Log('Not running the uninstaller of the ' + Found + ' install: ' + Why);
+    if not WizardSilent then
+      MsgBox(Msg + #13#10#13#10 + 'Its uninstaller could not be used automatically (' + Why +
+        '). Remove it from Settings, Apps, then run this installer again.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+
   if WizardSilent then
   begin
     if ExpandConstant('{param:REPLACEARCH|0}') <> '1' then
@@ -382,7 +497,7 @@ begin
     Result := False;
     Exit;
   end;
-  Result := UninstallExisting(Root, WizardSilent);
+  Result := UninstallExisting(Cmd, Dir, WizardSilent);
   if not Result then
   begin
     Log('Uninstalling the ' + Found + ' install failed');
@@ -394,7 +509,7 @@ end;
 
 function InitializeSetup: Boolean;
 begin
-  Result := ResolveOtherArch(HKCU64, 'for the current user');
+  Result := ResolveOtherArch(HKCU64, True, 'for the current user');
   if Result then
-    Result := ResolveOtherArch(HKLM64, 'for all users');
+    Result := ResolveOtherArch(HKLM64, False, 'for all users');
 end;

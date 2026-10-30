@@ -85,14 +85,29 @@ Prefer no installer? `grimalkin-portable-<arch>.zip` has the same files
 **Switching between x64 and ARM64 (for example from an emulated x64 install to
 the native ARM64 build).** Both architectures share one installer identity,
 install folder, `PATH` entry and context-menu keys, so only one can be installed
-at a time and the installer enforces that. Run the new installer: it finds the
-other-architecture install (per-user or all-users) and offers to uninstall it
-first (Yes continues, No cancels without changing anything). That uninstall
-removes the old files, `PATH` entry and context-menu keys; the new installer
-then installs the new ones, so tick the same optional tasks again. Your config
-and skins in `%APPDATA%\grimalkin` are kept. For scripted installs, the
-installer refuses to replace an install of the other architecture unless you
-pass `/REPLACEARCH=1` (exit code 1 otherwise). Installs made before ARM64
+at a time and the installer enforces that. Run the new installer without
+administrator rights (the default, per-user): it finds the other-architecture
+install and offers to uninstall it first (Yes continues, No cancels without
+changing anything). That uninstall removes the old files, `PATH` entry and
+context-menu keys; the new installer then installs the new ones, so tick the same
+optional tasks again. Your config and skins in `%APPDATA%\grimalkin` are kept.
+For scripted installs, the installer refuses to replace an install of the other
+architecture unless you pass `/REPLACEARCH=1` (exit code 1 otherwise).
+
+For safety, an installer that is running **elevated** (as administrator, for
+example `/ALLUSERS` or "install for all users") never runs the uninstaller of a
+*per-user* copy, because that command comes from your own user registry and
+could otherwise be used to run something as administrator. It only replaces an
+*all-users* install whose uninstaller is in `Program Files`. If an elevated
+installer finds a per-user install of the other architecture, it stops without
+changing anything (even with `/REPLACEARCH=1`): uninstall that copy from
+Settings, Apps first, or run the installer again without administrator rights.
+Limitation: if a standard user elevates with a *different* administrator's
+credentials, the installer cannot see the standard user's per-user install, so
+remove a per-user install of the other architecture yourself before installing
+for all users that way.
+
+Installs made before ARM64
 existed are x64 by definition. Portable zips never interfere with the installer
 or each other; keep them in different folders. To go back, run the x64
 installer the same way.

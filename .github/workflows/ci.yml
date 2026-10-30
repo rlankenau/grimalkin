@@ -163,6 +163,12 @@ jobs:
           & $iscc "/DAppVersion=$full" "/DAppVersionNumeric=$numeric" "/DArch=${{ matrix.arch }}" installer/windows/grimalkin.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
           Get-Item installer-out/grimalkin-setup-${{ matrix.arch }}.exe
+          # CI-only twin that behaves as an unelevated setup even on this
+          # administrator runner, to exercise the per-user replace flow. Not
+          # uploaded or released; the shipped installer is the one above.
+          & $iscc "/DAppVersion=$full" "/DAppVersionNumeric=$numeric" "/DArch=${{ matrix.arch }}" /DCITestUnelevated /Oinstaller-test "/Fgrimalkin-setup-citest-${{ matrix.arch }}" installer/windows/grimalkin.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC (CI test build) failed with exit code $LASTEXITCODE" }
+          Get-Item installer-test/grimalkin-setup-citest-${{ matrix.arch }}.exe
       # The installer is built for ${{ matrix.arch }}; it can only run on a
       # machine of that architecture. x64 builds run on windows-latest (x64);
       # arm64 builds run on windows-11-arm (native ARM64), so both get smoked.
@@ -193,14 +199,31 @@ jobs:
 
           # Coexistence: pretend the install on disk is the OTHER architecture.
           # Re-running this installer must then refuse (silent mode, no
-          # /REPLACEARCH), leave the install untouched, and with /REPLACEARCH=1
-          # uninstall the old install first and end with a single consistent one.
+          # /REPLACEARCH) and leave the install untouched.
           $other = if ($arch -eq 'x64') { 'arm64' } else { 'x64' }
           Set-ItemProperty 'HKCU:\Software\grimalkin\Install' -Name Arch -Value $other
           $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=addtopath,contextmenu','/LOG=refuse.log'
           Write-Host "installer exit code with $other install present and no /REPLACEARCH: $($p.ExitCode)"
           if ($p.ExitCode -eq 0) { throw "installer must refuse to install over a $other install without /REPLACEARCH=1" }
           if (-not (Test-Path (Join-Path $dir 'grimalkin.exe'))) { throw 'refused install must leave the existing install untouched' }
+          # Security rule (review finding): an ELEVATED setup must never run a
+          # per-user (HKCU) uninstaller, even with /REPLACEARCH=1. This runner is
+          # an administrator, so the shipped installer is elevated here.
+          $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "runner is elevated: $isAdmin"
+          if ($isAdmin) {
+            $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/REPLACEARCH=1','/TASKS=addtopath,contextmenu','/LOG=elevated-refuse.log'
+            Write-Host "elevated installer exit code with a per-user $other install and /REPLACEARCH=1: $($p.ExitCode)"
+            if ($p.ExitCode -eq 0) { throw 'an elevated installer must not replace a per-user install of the other architecture' }
+            if ((Get-Content elevated-refuse.log -Raw) -notmatch 'Refusing to run a per-user uninstaller') { Get-Content elevated-refuse.log; throw 'elevated refusal not logged' }
+            if ((Get-Content elevated-refuse.log -Raw) -match 'Removing other-architecture install') { throw 'elevated installer ran the per-user uninstaller' }
+            $recorded = (Get-ItemProperty 'HKCU:\Software\grimalkin\Install').Arch
+            if ($recorded -ne $other) { throw "elevated refusal changed the Arch value to '$recorded'" }
+            if (-not (Test-Path (Join-Path $dir 'grimalkin.exe'))) { throw 'elevated refusal must leave the existing install untouched' }
+          }
+          # Unelevated per-user flow (CI-only twin build): with /REPLACEARCH=1 it
+          # uninstalls the old install first and ends with one consistent install.
+          $setup = (Resolve-Path installer-test/grimalkin-setup-citest-$arch.exe).Path
           $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/REPLACEARCH=1','/TASKS=addtopath,contextmenu','/LOG=replace.log'
           if ($p.ExitCode -ne 0) { Get-Content replace.log; throw "installer with /REPLACEARCH=1 exit code $($p.ExitCode)" }
           $recorded = (Get-ItemProperty 'HKCU:\Software\grimalkin\Install').Arch
