@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-latest, windows-11-arm, macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,13 +31,33 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # Builds the Windows release binaries, bundles the ConPTY redistributable and
-  # produces the Inno Setup installer and the portable zip. Also uploads the
-  # plain exe+com pair as grimalkin-windows-x64 (the original artifact).
+  # Builds the Windows release binaries for each architecture, bundles the
+  # architecture-matching ConPTY redistributable and produces the Inno Setup
+  # installer and the portable zip. Also uploads the plain exe+com pair as
+  # grimalkin-windows-<arch>.
+  #
+  # x64 builds on windows-latest. ARM64 builds natively on windows-11-arm (a
+  # free hosted runner for public repositories), so the ARM64 test suite and the
+  # installer smoke test run on real ARM64 Windows instead of cross-compiling.
   windows-installer:
-    name: windows installer
-    runs-on: windows-latest
+    name: windows installer (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            # Paths inside the ConPTY .nupkg for this architecture.
+            conpty_dll: runtimes/win-x64/native/conpty.dll
+            conpty_openconsole: build/native/runtimes/x64/OpenConsole.exe
+          - arch: arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            conpty_dll: runtimes/win-arm64/native/conpty.dll
+            conpty_openconsole: build/native/runtimes/arm64/OpenConsole.exe
     env:
       # Microsoft.Windows.Console.ConPTY (Windows Terminal project, MIT). The
       # hash pins the exact .nupkg downloaded from api.nuget.org.
@@ -46,18 +66,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked -p grimalkin -p grimalkin-launcher
+        with:
+          key: ${{ matrix.target }}
+      # Always pass --target so the output lands in target/<triple>/release,
+      # separate per architecture.
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p grimalkin -p grimalkin-launcher
       - name: Stage dist
         shell: bash
         run: |
           mkdir dist
-          cp target/release/grimalkin.exe dist/grimalkin.exe
-          cp target/release/grimalkin-launcher.exe dist/grimalkin.com
+          cp target/${{ matrix.target }}/release/grimalkin.exe dist/grimalkin.exe
+          cp target/${{ matrix.target }}/release/grimalkin-launcher.exe dist/grimalkin.com
       - name: Upload plain exe and com
         uses: actions/upload-artifact@v4
         with:
-          name: grimalkin-windows-x64
+          name: grimalkin-windows-${{ matrix.arch }}
           path: |
             dist/grimalkin.exe
             dist/grimalkin.com
@@ -75,6 +101,9 @@ jobs:
           echo "Version: $version"
       - name: Fetch ConPTY redistributable
         shell: pwsh
+        env:
+          CONPTY_DLL_ENTRY: ${{ matrix.conpty_dll }}
+          CONPTY_OPENCONSOLE_ENTRY: ${{ matrix.conpty_openconsole }}
         run: |
           $ErrorActionPreference = 'Stop'
           $v = $env:CONPTY_VERSION
@@ -85,17 +114,20 @@ jobs:
           if ($actual -ne $env:CONPTY_SHA256) {
             throw "SHA256 mismatch for ${pkg}: expected $($env:CONPTY_SHA256), got $actual"
           }
-          # A .nupkg is a zip. Extract the x64 pair next to grimalkin.exe.
+          # A .nupkg is a zip. Extract the pair for THIS architecture next to
+          # grimalkin.exe. A missing entry fails the job: never fall back to
+          # another architecture's files.
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $wanted = @{
-            'runtimes/win-x64/native/conpty.dll'        = 'conpty.dll'
-            'build/native/runtimes/x64/OpenConsole.exe' = 'OpenConsole.exe'
+          $wanted = [ordered]@{
+            $env:CONPTY_DLL_ENTRY         = 'conpty.dll'
+            $env:CONPTY_OPENCONSOLE_ENTRY = 'OpenConsole.exe'
           }
           $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $pkg).Path)
           try {
             foreach ($name in $wanted.Keys) {
               $entry = $zip.GetEntry($name)
-              if ($null -eq $entry) { throw "$name not found in $pkg" }
+              if ($null -eq $entry) { throw "${{ matrix.arch }} asset $name not found in $pkg; refusing to ship another architecture under the ${{ matrix.arch }} label" }
+              if ($entry.Length -eq 0) { throw "$name is empty in $pkg" }
               $dest = Join-Path (Resolve-Path dist).Path $wanted[$name]
               [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
             }
@@ -103,14 +135,18 @@ jobs:
           Copy-Item installer/windows/LICENSE-ConPTY.txt dist/
           Copy-Item README.md, LICENSE, LICENSE-MIT, LICENSE-APACHE dist/
           Get-ChildItem dist | Format-Table Name, Length
+      - name: Check machine types (grimalkin.exe, grimalkin.com, conpty.dll, OpenConsole.exe)
+        shell: pwsh
+        run: scripts/windows/check-pe-machine.ps1 -Dir dist -Arch ${{ matrix.arch }}
       - name: Portable zip
         shell: pwsh
-        run: Compress-Archive -Path dist/* -DestinationPath grimalkin-portable-x64.zip
+        run: Compress-Archive -Path dist/* -DestinationPath grimalkin-portable-${{ matrix.arch }}.zip
       - name: Build installer
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Inno Setup 6 is preinstalled on the windows runner images.
+          # Inno Setup 6 is preinstalled on the windows runner images (6.7.x on
+          # windows-latest and windows-11-arm; ARM64 installers need 6.3+).
           $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) {
             Write-Host 'Inno Setup 6 not preinstalled; installing with choco'
@@ -123,15 +159,19 @@ jobs:
           $core = ($full -split '[-+]')[0]
           if ($core -notmatch '^\d+\.\d+\.\d+$') { throw "unexpected version format: $full" }
           $numeric = "$core.0"
-          Write-Host "AppVersion=$full AppVersionNumeric=$numeric"
-          & $iscc "/DAppVersion=$full" "/DAppVersionNumeric=$numeric" installer/windows/grimalkin.iss
+          Write-Host "AppVersion=$full AppVersionNumeric=$numeric Arch=${{ matrix.arch }}"
+          & $iscc "/DAppVersion=$full" "/DAppVersionNumeric=$numeric" "/DArch=${{ matrix.arch }}" installer/windows/grimalkin.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
-          Get-Item installer-out/grimalkin-setup-x64.exe
+          Get-Item installer-out/grimalkin-setup-${{ matrix.arch }}.exe
+      # The installer is built for ${{ matrix.arch }}; it can only run on a
+      # machine of that architecture. x64 builds run on windows-latest (x64);
+      # arm64 builds run on windows-11-arm (native ARM64), so both get smoked.
       - name: Smoke-test installer (silent install, check, uninstall)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $setup = (Resolve-Path installer-out/grimalkin-setup-x64.exe).Path
+          $arch = '${{ matrix.arch }}'
+          $setup = (Resolve-Path installer-out/grimalkin-setup-$arch.exe).Path
           # Per-user silent install with the optional tasks turned on.
           $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=addtopath,contextmenu','/LOG=install.log'
           if ($p.ExitCode -ne 0) { Get-Content install.log; throw "installer exit code $($p.ExitCode)" }
@@ -139,6 +179,10 @@ jobs:
           foreach ($f in 'grimalkin.exe','grimalkin.com','conpty.dll','OpenConsole.exe','LICENSE-ConPTY.txt','README.md','unins000.exe') {
             if (-not (Test-Path (Join-Path $dir $f))) { throw "missing after install: $f" }
           }
+          # The installed binaries are the right architecture too.
+          scripts/windows/check-pe-machine.ps1 -Dir $dir -Arch $arch
+          $recorded = (Get-ItemProperty 'HKCU:\Software\grimalkin\Install').Arch
+          if ($recorded -ne $arch) { throw "installed Arch value is '$recorded', expected '$arch'" }
           $userPath = [Environment]::GetEnvironmentVariable('Path','User')
           if (-not (($userPath -split ';') -contains $dir)) { throw "install dir not on user PATH: $userPath" }
           $cmd = (Get-ItemProperty 'HKCU:\Software\Classes\Directory\Background\shell\grimalkin\command').'(default)'
@@ -146,6 +190,26 @@ jobs:
           if ($cmd -notlike '*--working-directory*') { throw 'context menu command missing' }
           & (Join-Path $dir 'grimalkin.com') --version
           if ($LASTEXITCODE -ne 0) { throw "grimalkin.com --version failed: $LASTEXITCODE" }
+
+          # Coexistence: pretend the install on disk is the OTHER architecture.
+          # Re-running this installer must then refuse (silent mode, no
+          # /REPLACEARCH), leave the install untouched, and with /REPLACEARCH=1
+          # uninstall the old install first and end with a single consistent one.
+          $other = if ($arch -eq 'x64') { 'arm64' } else { 'x64' }
+          Set-ItemProperty 'HKCU:\Software\grimalkin\Install' -Name Arch -Value $other
+          $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=addtopath,contextmenu','/LOG=refuse.log'
+          Write-Host "installer exit code with $other install present and no /REPLACEARCH: $($p.ExitCode)"
+          if ($p.ExitCode -eq 0) { throw "installer must refuse to install over a $other install without /REPLACEARCH=1" }
+          if (-not (Test-Path (Join-Path $dir 'grimalkin.exe'))) { throw 'refused install must leave the existing install untouched' }
+          $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/REPLACEARCH=1','/TASKS=addtopath,contextmenu','/LOG=replace.log'
+          if ($p.ExitCode -ne 0) { Get-Content replace.log; throw "installer with /REPLACEARCH=1 exit code $($p.ExitCode)" }
+          $recorded = (Get-ItemProperty 'HKCU:\Software\grimalkin\Install').Arch
+          if ($recorded -ne $arch) { throw "after replacing, Arch is '$recorded', expected '$arch'" }
+          if ((Get-Content replace.log -Raw) -notmatch 'other-architecture install') { Get-Content replace.log; throw 'replace log does not show the old install being removed' }
+          scripts/windows/check-pe-machine.ps1 -Dir $dir -Arch $arch
+          $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+          if ((($userPath -split ';') | Where-Object { $_ -eq $dir }).Count -ne 1) { throw "install dir must be on user PATH exactly once: $userPath" }
+
           # Uninstall (_?= runs it in place so -Wait really waits).
           $u = Start-Process (Join-Path $dir 'unins000.exe') -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"_?=$dir"
           if ($u.ExitCode -ne 0) { throw "uninstaller exit code $($u.ExitCode)" }
@@ -153,38 +217,52 @@ jobs:
           if (($userPath -split ';') -contains $dir) { throw 'install dir still on user PATH after uninstall' }
           if (Test-Path 'HKCU:\Software\Classes\Directory\shell\grimalkin') { throw 'context menu key left behind' }
           if (Test-Path 'HKCU:\Software\Classes\Directory\Background\shell\grimalkin') { throw 'background context menu key left behind' }
+          if (Test-Path 'HKCU:\Software\grimalkin\Install') { throw 'Arch marker key left behind' }
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: grimalkin-setup-x64
-          path: installer-out/grimalkin-setup-x64.exe
+          name: grimalkin-setup-${{ matrix.arch }}
+          path: installer-out/grimalkin-setup-${{ matrix.arch }}.exe
       - name: Upload portable zip
         uses: actions/upload-artifact@v4
         with:
-          name: grimalkin-portable-x64
-          path: grimalkin-portable-x64.zip
+          name: grimalkin-portable-${{ matrix.arch }}
+          path: grimalkin-portable-${{ matrix.arch }}.zip
+      # Release assets: installer and portable zip per architecture. The bare
+      # grimalkin.exe / grimalkin.com are NOT attached any more (the x64 and
+      # ARM64 names would collide); they are inside the portable zips and the
+      # grimalkin-windows-<arch> workflow artifacts.
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            installer-out/grimalkin-setup-x64.exe
-            grimalkin-portable-x64.zip
-            dist/grimalkin.exe
-            dist/grimalkin.com
+            installer-out/grimalkin-setup-${{ matrix.arch }}.exe
+            grimalkin-portable-${{ matrix.arch }}.zip
 
   # Verifies the exe resources (build.rs / winresource): the icon group and the
-  # version info must actually be in the shipped binaries.
+  # version info must actually be in the shipped binaries, for each architecture.
   windows-exe-resources:
-    name: windows exe icon and version info
-    runs-on: windows-latest
+    name: windows exe icon and version info (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
     needs: windows-installer
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-latest
+          - arch: arm64
+            os: windows-11-arm
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: grimalkin-windows-x64
+          name: grimalkin-windows-${{ matrix.arch }}
           path: dist
+      - name: Check machine types
+        shell: pwsh
+        run: scripts/windows/check-pe-machine.ps1 -Dir dist -Arch ${{ matrix.arch }} -Files grimalkin.exe,grimalkin.com
       - name: Check icon and version resources
         shell: pwsh
         run: |
