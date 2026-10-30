@@ -23,6 +23,10 @@
   #define AppVersionNumeric "0.0.0.0"
 #endif
 
+#ifndef AppPublisher
+  #define AppPublisher "grimalkin contributors (unsigned build)"
+#endif
+
 #define AppName "grimalkin"
 #define AppExe "grimalkin.exe"
 #define IconPath "..\..\assets\icon\grimalkin.ico"
@@ -39,7 +43,7 @@ AppVersion={#AppVersion}
 VersionInfoVersion={#AppVersionNumeric}
 VersionInfoProductTextVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=grimalkin contributors
+AppPublisher={#AppPublisher}
 AppPublisherURL=https://github.com/rlankenau/grimalkin
 AppSupportURL=https://github.com/rlankenau/grimalkin/issues
 AppUpdatesURL=https://github.com/rlankenau/grimalkin/releases
@@ -61,6 +65,15 @@ ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 Compression=lzma2/ultra
 SolidCompression=yes
+
+; CI supplies /Sgrimalkin=... only in the protected release job. Inno signs
+; both Setup and the generated uninstaller before embedding it into Setup.
+#ifdef SignedRelease
+SignTool=grimalkin
+SignedUninstaller=yes
+#else
+SignedUninstaller=no
+#endif
 
 OutputDir=..\..\installer-out
 OutputBaseFilename=grimalkin-setup-x64
@@ -86,8 +99,13 @@ Name: "addtopath"; Description: "Add grimalkin to PATH (so you can run ""grimalk
 Name: "contextmenu"; Description: "Add ""Open grimalkin here"" to the Explorer folder context menu"; GroupDescription: "Integration:"; Flags: unchecked
 
 [Files]
+#ifdef SignedRelease
+Source: "..\..\dist\grimalkin.exe"; DestDir: "{app}"; Flags: ignoreversion signcheck
+Source: "..\..\dist\grimalkin.com"; DestDir: "{app}"; Flags: ignoreversion signcheck
+#else
 Source: "..\..\dist\grimalkin.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\grimalkin.com"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 ; ConPTY redistributable: conpty.dll must sit next to grimalkin.exe with
 ; OpenConsole.exe beside it (see crates/pty/src/win/conpty.rs).
 Source: "..\..\dist\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
