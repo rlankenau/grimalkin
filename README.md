@@ -134,8 +134,8 @@ purchase; no subscription or sponsorship has been obtained by this change):
 
 | Option | Cost and prerequisites | Custody and renewal | Decision |
 | --- | --- | --- | --- |
-| [Microsoft Artifact Signing](https://azure.microsoft.com/en-us/pricing/details/artifact-signing/) (formerly Trusted Signing) | Basic: US$9.99/month, 5,000 signatures included; Azure subscription, Entra app, approved identity validation in a supported geography, and a **Public Trust** certificate profile. Organization and individual eligibility differ; check the [setup requirements](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart). | Microsoft holds non-exportable HSM keys; GitHub uses short-lived OIDC authorization, not a PFX or client secret. Certificates rotate daily and last 72 hours; timestamping is essential. Maintain subscription billing and revalidate identity before the portal's expiry date. | Implemented provider, conditional on maintainer eligibility and budget approval. Supports synchronous Inno signing without storing a private key on the runner. |
-| [SignPath Foundation](https://signpath.org/) | Free sponsorship for qualifying open-source projects, subject to application and policy review; being a public repository alone does not establish eligibility. Review the [terms](https://signpath.org/terms), licensing, project governance, and build-integrity requirements. | Foundation/provider controls certificate and signing service; project maintainers authorize approved builds. Continued eligibility and provider-managed certificate renewal must be maintained. | Worth applying for if eligible. Not assumed approved, and not interchangeable with the implemented Azure callback: integrating its artifact approval/return flow needs a separate change. |
+| [Microsoft Artifact Signing](https://azure.microsoft.com/en-us/pricing/details/artifact-signing/) (formerly Trusted Signing) | Basic: US$9.99/month, 5,000 signatures included; **paid** Azure subscription (not free/trial/sponsored), Entra app, approved identity validation in a supported geography, and a **Public Trust** certificate profile. Individual eligibility is currently US/Canada only; organization eligibility is broader. Check the [setup requirements](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart) and [billing FAQ](https://learn.microsoft.com/en-us/azure/artifact-signing/faq). | Microsoft holds non-exportable HSM keys; GitHub uses short-lived OIDC authorization, not a PFX or client secret. Certificates rotate daily and last 72 hours; timestamping is essential. Maintain subscription billing and revalidate identity before the portal's expiry date. | Implemented provider, conditional on maintainer eligibility and budget approval. Supports synchronous Inno signing without storing a private key on the runner. |
+| [SignPath Foundation](https://signpath.org/) | Free sponsorship for qualifying open-source projects, subject to application and policy review; being a public repository alone does not establish eligibility. Review the [terms](https://signpath.org/terms), OSI licensing, MFA/governance, manual release approval, and build-integrity requirements. | Foundation/provider controls the HSM certificate and signs under its own name; project maintainers approve builds. Maintain sponsorship eligibility; no public renewal SLA was established in this evaluation. | Worth applying for if eligible. Not assumed approved, and not interchangeable with the implemented Azure callback: integrating its artifact approval/return flow needs a separate change. |
 | [DigiCert code signing](https://www.digicert.com/signing/code-signing-certificates) or another CA | Paid certificate plus hardware token or managed HSM/service fees; identity validation and compatible automated signing access required. A current all-in quote has not been obtained; do not budget certificate-only pricing as the total. | Owner must safeguard hardware/service access, renew the subscription/certificate, repeat validation as required, and plan certificate rollover. An ordinary exportable PFX is not the default public code-signing solution. | Not selected: more procurement and key-management work for this release path. |
 
 The publisher is the provider-validated identity, not an arbitrary “Grimalkin”
@@ -160,8 +160,17 @@ releases. Microsoft documents [certificate lifecycle and timestamping](https://l
    the workflow also checks ancestry before building.
 4. Add an Entra federated credential with issuer
    `https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`,
-   and exact subject `repo:rlankenau/grimalkin:environment:windows-release`.
-   Do **not** add a PR, branch-wide, wildcard, or fork federation. See
+   and the **exact subject emitted for this repository's `windows-release`
+   environment**. Check the repository's OIDC settings first:
+   - Immutable format: `repo:rlankenau@OWNER-ID/grimalkin@REPO-ID:environment:windows-release`
+     (replace IDs with the actual immutable IDs).
+   - Legacy format: `repo:rlankenau/grimalkin:environment:windows-release`.
+
+   Repositories created after July 15, 2026, or renamed/transferred since then,
+   use [immutable subjects](https://docs.github.com/en/actions/reference/security/oidc#immutable-subject-claims);
+   custom subject templates may add claims. Match the actual format, not a
+   guessed example, and never log the full OIDC token. Do **not** add a PR,
+   branch-wide, wildcard, or fork federation. See
    [Microsoft's OIDC integration guide](https://github.com/Azure/artifact-signing-action/blob/main/docs/OIDC.md).
 5. Set these **environment variables** in `windows-release` (Settings >
    Environments > windows-release > Environment variables):
@@ -211,7 +220,10 @@ artifacts include `UNSIGNED.txt`, and unsigned Setup identifies itself according
 Local `cargo` and ordinary ISCC builds remain unsigned and need no signing tools.
 
 For maintenance, monitor billing, signing quotas, identity-validation expiry,
-profile access/audit logs, and trust-chain changes. Daily certificate rotation
+profile access/audit logs, and trust-chain changes. Start
+[identity revalidation](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-renew-identity-validation)
+when the 60-day renewal window opens; review can take 1–20 business days.
+Daily certificate rotation
 does not require updating `WINDOWS_SIGNING_SUBJECT` or pinning leaf thumbprints.
 A publisher/profile change requires explicit review of the expected identity
 and a fresh validation run. On suspected compromise, revoke signing authorization
