@@ -44,3 +44,13 @@ function Find-SignTool {
     }
     return $null
 }
+
+# True when the RSA public key of $Certificate is byte-identical to the DER
+# SubjectPublicKeyInfo $KmsSpki. GetRSAPublicKey is a .NET extension method, which
+# PowerShell cannot call as an instance method: go through the static class.
+function Test-CertificateMatchesPublicKey($Certificate, [byte[]]$KmsSpki) {
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($Certificate)
+    if ($null -eq $rsa) { throw 'the leaf certificate does not have an RSA public key' }
+    try { $leafSpki = $rsa.ExportSubjectPublicKeyInfo() } finally { $rsa.Dispose() }
+    return [Convert]::ToBase64String($KmsSpki) -eq [Convert]::ToBase64String($leafSpki)
+}

@@ -54,12 +54,17 @@ aws cloudformation deploy --stack-name grimalkin-codesign --template-file infra/
 python3 -m venv .venv && . .venv/bin/activate && pip install boto3 cryptography
 scripts/aws/make-csr.py --region us-east-1 --key alias/grimalkin-codesign \
     --common-name "Your Name or Organisation" --country US > grimalkin-codesign.csr
-# remove the temporary permission again
+# remove the temporary permission again: pass the parameter EXPLICITLY as empty, because
+# `deploy` keeps the previous value of any parameter you leave out
 aws cloudformation deploy --stack-name grimalkin-codesign --template-file infra/aws/codesign.yaml \
-    --capabilities CAPABILITY_NAMED_IAM --region us-east-1
+    --capabilities CAPABILITY_NAMED_IAM --region us-east-1 \
+    --parameter-overrides "CsrSignerPrincipalArn="
+# verify: the value must be empty or absent
+aws cloudformation describe-stacks --stack-name grimalkin-codesign --region us-east-1 \
+    --query 'Stacks[0].Parameters[?ParameterKey==`CsrSignerPrincipalArn`]'
 ```
 
-(Use the same `--parameter-overrides` as in step 1 if you changed any parameter. If your ARN is an
+(Pass any other `--parameter-overrides` from step 1 again if you changed them. If your ARN is an
 assumed-role session, give the role ARN instead of the session ARN.) The script signs the
 request with KMS (RSASSA_PKCS1_V1_5_SHA_256); the private key is never exported. Check it:
 `openssl req -in grimalkin-codesign.csr -verify -noout -text`.
@@ -126,7 +131,21 @@ Then do the Windows 10/11 acceptance checklist in the README.
   for the same CSR), replace `codesign-chain.pem` in a PR, update `WINDOWS_SIGNING_PUBLISHER` if the
   subject changed. No workflow change. Releases signed with the old certificate stay valid
   because they carry a timestamp.
-- Key rotation: deploy a second stack (or change `KeyAliasName`), new CSR and certificate,
-  then repoint `AWS_KMS_KEY_ALIAS`.
+- Key rotation: changing `KeyAliasName` does NOT rotate anything, it only re-points an alias
+  at the same key. A new private key needs new resources:
+  1. Deploy a second stack from the same template with a different `--stack-name` and
+     distinct `RoleName` and `KeyAliasName` (for example `grimalkin-release-signer-2`,
+     `alias/grimalkin-codesign-2`), and set `ExistingOidcProviderArn` to the provider the
+     first stack created (an account can have only one for that URL; the second stack
+     must not create it). Add `CsrSignerPrincipalArn` for the CSR as in step 2.
+  2. Make a CSR from the new alias, get the certificate (steps 2 to 4), replace
+     `codesign-chain.pem` and update `WINDOWS_SIGNING_PUBLISHER` if the subject changed.
+  3. Update the repository variables `AWS_KMS_KEY_ALIAS` and `AWS_SIGNING_ROLE_ARN` to the
+     new stack's outputs, then cut a release; the preflight proves chain and key match.
+  4. After that release is signed and timestamped, clear `CsrSignerPrincipalArn` (step 2),
+     delete the old stack's role if unused, and schedule the old key for deletion
+     (`aws kms schedule-key-deletion --pending-window-in-days 30`; the template retains the
+     key, so deleting the stack does not delete it). Signatures that carry a timestamp stay
+     valid after the key and its certificate are gone.
 - Incident (key or role suspected abused): set `WINDOWS_SIGNING_ENABLED` to `false`,
   disable the key (`aws kms disable-key`), ask the CA to revoke the certificate, review CloudTrail.

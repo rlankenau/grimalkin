@@ -53,8 +53,7 @@ if ($key.KeyUsage -ne 'SIGN_VERIFY') { throw "the KMS key usage is $($key.KeyUsa
 if ($key.KeySpec -notin 'RSA_3072', 'RSA_4096') { throw "the KMS key spec is $($key.KeySpec); expected RSA_3072 or RSA_4096" }
 if ('RSASSA_PKCS1_V1_5_SHA_256' -notin $key.SigningAlgorithms) { throw 'the KMS key does not support RSASSA_PKCS1_V1_5_SHA_256' }
 $kmsSpki = [Convert]::FromBase64String($key.PublicKey)
-$leafSpki = $leaf.GetRSAPublicKey().ExportSubjectPublicKeyInfo()
-if ([Convert]::ToBase64String($kmsSpki) -ne [Convert]::ToBase64String($leafSpki)) {
+if (-not (Test-CertificateMatchesPublicKey $leaf $kmsSpki)) {
     throw 'the public key of the leaf certificate is not the public key of the KMS key'
 }
 Write-Host 'signing configuration is consistent: the certificate belongs to the KMS key'

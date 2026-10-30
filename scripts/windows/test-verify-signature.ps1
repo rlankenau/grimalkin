@@ -126,6 +126,15 @@ try {
     }
     Remove-Item Function:\Test-SignTool, Function:\Get-AuthenticodeSignature
 
+    # ---- preflight public-key comparison (real certificates, no AWS) ---------------
+    . (Join-Path $PSScriptRoot 'signing-common.ps1')
+    $ownSpki = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($leaf).ExportSubjectPublicKeyInfo()
+    if (-not (Test-CertificateMatchesPublicKey $leaf $ownSpki)) { throw 'a certificate must match its own public key' }
+    Write-Host 'ok: certificate matches its own public key'
+    $otherSpki = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($ca).ExportSubjectPublicKeyInfo()
+    if (Test-CertificateMatchesPublicKey $leaf $otherSpki) { throw 'a certificate must not match another key' }
+    Write-Host 'ok: certificate does not match a different key'
+
     # ---- real files (Windows) -----------------------------------------------------
     if ($UnsignedPath) {
         if (-not $ExpectedSubject) { $ExpectedSubject = $subject }
