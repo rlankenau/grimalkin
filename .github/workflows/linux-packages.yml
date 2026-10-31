@@ -131,7 +131,7 @@ jobs:
           # Errors fail; the warning for a non-rDNS id stays (the id has to match
           # the desktop file name and the window's app id, "grimalkin").
           appstreamcli validate --no-net /usr/share/metainfo/grimalkin.metainfo.xml | tee /tmp/appstream.txt || true
-          ! grep -q '^E:' /tmp/appstream.txt
+          if grep -q '^E:' /tmp/appstream.txt; then exit 1; fi
           dpkg -s grimalkin | grep -E '^(Version|Depends|Recommends):'
           dpkg -s kitty-terminfo | grep -E '^Status:'
       - name: Smoke test, no display
