@@ -137,7 +137,7 @@ assets = [
 vulkan-loader = "*"
 libxkbcommon = "*"
 libxkbcommon-x11 = "*"
-libwayland-client = "*"
+wayland-libs-client = "*"
 fontconfig = "*"
 
 [package.metadata.generate-rpm.recommends]

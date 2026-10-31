@@ -40,7 +40,8 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            os: ubuntu-latest
+            # Pinned (not ubuntu-latest) so the glibc baseline in the README holds.
+            os: ubuntu-24.04
           - arch: arm64
             os: ubuntu-24.04-arm
     steps:
@@ -144,14 +145,15 @@ jobs:
       - name: Smoke test, headless render (Xvfb + lavapipe)
         env:
           RUST_LOG: info
-          # Make wgpu fall back to the software Vulkan device if no GPU exists.
           WGPU_BACKEND: vulkan
         run: |
           set -euo pipefail
           vulkaninfo --summary || true
           rm -f /tmp/f.png
+          # The child outlives the first frame (a child that exits at once can
+          # close the window before a frame is dumped); EXIT_AFTER_FRAME ends it.
           GRIMALKIN_DUMP_FRAME=/tmp/f.png GRIMALKIN_EXIT_AFTER_FRAME=1 \
-            timeout 120 xvfb-run -a -s '-screen 0 1280x800x24' grimalkin -e true
+            timeout 120 xvfb-run -a -s '-screen 0 1280x800x24' grimalkin -e sleep 100
           ls -l /tmp/f.png
           file /tmp/f.png | grep -q 'PNG image data'
           test "$(stat -c %s /tmp/f.png)" -gt 1000
@@ -281,12 +283,20 @@ jobs:
         if: steps.mode.outputs.mode == 'publish'
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code --heads "https://github.com/$GITHUB_REPOSITORY.git" gh-pages >/dev/null; then
+          # Exit status 2 means "no such branch"; any other failure (network,
+          # server) must stop the job, or an empty tree would replace the
+          # published repository.
+          rc=0
+          git ls-remote --exit-code --heads "https://github.com/$GITHUB_REPOSITORY.git" gh-pages >/dev/null || rc=$?
+          if [[ $rc -eq 0 ]]; then
             git clone --depth 1 --branch gh-pages "https://github.com/$GITHUB_REPOSITORY.git" repo
             rm -rf repo/.git
-          else
+          elif [[ $rc -eq 2 ]]; then
             echo "no gh-pages branch yet: starting an empty repository"
             mkdir repo
+          else
+            echo "::error::could not look up the gh-pages branch (git ls-remote exit $rc); refusing to publish"
+            exit 1
           fi
       - name: Build the repositories
         env:
@@ -302,15 +312,18 @@ jobs:
           set -euo pipefail
           suite=${{ steps.mode.outputs.suite }}
           sudo rm -rf /tmp/aptrepo && sudo cp -r repo /tmp/aptrepo && sudo chmod -R a+rX /tmp/aptrepo
-          echo "deb [signed-by=/tmp/aptrepo/grimalkin.gpg] file:///tmp/aptrepo/apt $suite main" | sudo tee /tmp/grimalkin.list
-          # Only this source list; the system ones are left alone.
-          opts=(-o Dir::Etc::sourcelist=/tmp/grimalkin.list -o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0)
-          sudo apt-get "${opts[@]}" update
-          apt-cache "${opts[@]}" policy grimalkin | tee /tmp/policy
+          echo "deb [signed-by=/tmp/aptrepo/grimalkin.gpg] file:///tmp/aptrepo/apt $suite main" | sudo tee /etc/apt/sources.list.d/grimalkin.list
+          # Install from the generated repository (dependencies come from the
+          # system sources) and run the result.
+          sudo apt-get update
+          apt-cache policy grimalkin | tee /tmp/policy
           grep -q 'file:/tmp/aptrepo/apt' /tmp/policy
-          # A tampered Release must be refused.
+          sudo apt-get install -y grimalkin
+          grimalkin --version
+          # A tampered Release must be refused. Only this source list is used.
           sudo sed -i 's/^Suite: .*/Suite: tampered/' /tmp/aptrepo/apt/dists/$suite/InRelease
-          # apt exits 0 here but reports the bad signature and keeps the old lists.
+          opts=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/grimalkin.list -o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 -o APT::Update::Error-Mode=any)
+          # With Error-Mode=any apt exits non-zero; the output names the bad signature.
           out=$(sudo apt-get "${opts[@]}" update 2>&1 || true)
           echo "$out"
           if ! grep -q 'BADSIG' <<<"$out"; then echo "::error::apt did not reject a tampered InRelease"; exit 1; fi
