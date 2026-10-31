@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use grimalkin_pty::{Pty, PtyEvent, PtyWriter, SpawnConfig};
 use grimalkin_vt::{CursorShape, Screen, TermEvent, Terminal};
+use egui_winit::accesskit_winit;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -43,7 +44,7 @@ use crate::skin::{self, Action, Skin, SkinRuntime};
 use crate::LaunchOptions;
 
 /// Events delivered to the loop through its `EventLoopProxy`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UserEvent {
     /// The pty produced output or exited.
     PtyWake,
@@ -58,6 +59,16 @@ pub enum UserEvent {
     OpenPreferences,
     /// A menu item (menu bar or context menu) was chosen.
     MenuAction(MenuAction),
+    /// An assistive technology (screen reader) attached to, detached from or
+    /// acted on a window that exposes an accessibility tree (see
+    /// `SecondaryWindow::accessibility_event`).
+    Access(WindowId, accesskit_winit::WindowEvent),
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(e: accesskit_winit::Event) -> UserEvent {
+        UserEvent::Access(e.window_id, e.window_event)
+    }
 }
 
 /// What a secondary window wants after handling an event.
@@ -86,6 +97,9 @@ pub trait SecondaryWindow {
     /// After a config reload: what the app could not apply live (a change
     /// that needs a restart), or `None` when nothing is pending.
     fn restart_notice(&mut self, text: Option<&str>);
+    /// A screen reader (or other assistive technology) connected to this
+    /// window, disconnected, or asked for an action.
+    fn accessibility_event(&mut self, _event: accesskit_winit::WindowEvent) {}
     fn window(&self) -> &Window;
 }
 
@@ -494,6 +508,12 @@ impl ApplicationHandler<UserEvent> for App {
             return self.open_preferences(event_loop);
         }
         let event = match event {
+            UserEvent::Access(id, e) => {
+                if let Some(w) = self.secondary.get_mut(&id) {
+                    w.accessibility_event(e);
+                }
+                return;
+            }
             UserEvent::OpenPreferences => return self.open_preferences(event_loop),
             UserEvent::MenuAction(action) => return self.menu_action(event_loop, action),
             e => e,
@@ -527,7 +547,7 @@ impl ApplicationHandler<UserEvent> for App {
                     w.restart_notice(notice.as_deref());
                 }
             }
-            UserEvent::OpenPreferences | UserEvent::MenuAction(_) => {}
+            UserEvent::OpenPreferences | UserEvent::MenuAction(_) | UserEvent::Access(..) => {}
         }
         if r.exit_requested {
             event_loop.exit();
