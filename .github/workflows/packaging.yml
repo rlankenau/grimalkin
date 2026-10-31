@@ -143,35 +143,36 @@ jobs:
           path: out/manifests
           if-no-files-found: error
           retention-days: 30
-      - name: Submit to microsoft/winget-pkgs (wingetcreate update)
+      - name: Submit to microsoft/winget-pkgs (wingetcreate submit)
         shell: pwsh
         run: |
           $version = $env:TAG.Substring(1)
-          $urls = @(Get-Content out/urls.txt | Where-Object { $_ })
-          $cmd = "wingetcreate update rlankenau.grimalkin --urls $($urls -join ' ') --version $version --submit --token <PAT>"
+          $dir = 'out/manifests'
+          $cmd = "wingetcreate submit --token <PAT> $dir"
           if ($env:SUBMIT -ne 'true') {
             Write-Host "Not submitting for this run (dry run, pre-release tag, or submit=false)."
-            Write-Host "To submit by hand:  $cmd"
+            Write-Host "To submit by hand, from the 'winget-manifests-$($env:TAG)' artifact:  $cmd"
             exit 0
           }
           if (-not $env:WINGET_GITHUB_TOKEN) {
             Write-Host "::notice::WINGET_GITHUB_TOKEN is not set; not submitting."
-            Write-Host "To submit by hand:  $cmd"
+            Write-Host "To submit by hand, from the 'winget-manifests-$($env:TAG)' artifact:  $cmd"
             exit 0
           }
-          # `wingetcreate update` only updates an existing package; the first submission
-          # of a new package is manual (`wingetcreate new`, see README "Packaging").
-          $exists = $true
+          # The first submission of a new package is manual (`wingetcreate new`, see
+          # README 'Packaging'); automation only adds versions to a package that is
+          # already in microsoft/winget-pkgs.
           gh api repos/microsoft/winget-pkgs/contents/manifests/r/rlankenau/grimalkin --silent 2>$null
-          if ($LASTEXITCODE -ne 0) { $exists = $false }
-          if (-not $exists) {
+          if ($LASTEXITCODE -ne 0) {
             Write-Host "::notice::rlankenau.grimalkin is not in microsoft/winget-pkgs yet: the first submission is manual (wingetcreate new). See README 'Packaging'."
             exit 0
           }
           Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-          $wcArgs = @('update', 'rlankenau.grimalkin', '--urls') + $urls + @('--version', $version, '--submit', '--token', $env:WINGET_GITHUB_TOKEN)
-          ./wingetcreate.exe @wcArgs
-          if ($LASTEXITCODE -ne 0) { throw "wingetcreate update failed ($LASTEXITCODE)" }
+          # Submit the manifests that were just generated and validated (not
+          # `wingetcreate update`, which needs the installer count to match the
+          # previous version and would break when an architecture is added or dropped).
+          ./wingetcreate.exe submit --prtitle "New version: rlankenau.grimalkin version $version" --token $env:WINGET_GITHUB_TOKEN $dir
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed ($LASTEXITCODE)" }
 
   homebrew:
     name: homebrew cask

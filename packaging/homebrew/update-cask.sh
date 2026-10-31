@@ -6,7 +6,7 @@
 #
 # Downloads grimalkin-<version>-macos-{arm64,x86_64}.dmg from the GitHub release
 # (or takes them from $DMG_DIR), computes their sha256 and updates `version` and
-# both `sha256` values. Needs curl (or DMG_DIR), shasum/sha256sum, sed.
+# both `sha256` values (and the repository in the download URL when REPO is set). Needs curl (or DMG_DIR), shasum/sha256sum, sed.
 # REPO overrides the GitHub repository (default rlankenau/grimalkin).
 set -euo pipefail
 
@@ -53,6 +53,7 @@ sed -E \
     -e "s/^(  version \")[^\"]*(\")/\1${version}\2/" \
     -e "s/^(  sha256 arm: +\")[0-9a-f]*(\",)/\1${arm}\2/" \
     -e "s/^(         intel: \")[0-9a-f]*(\")/\1${intel}\2/" \
+    -e "s#github\.com/[^/]+/[^/]+/releases/download/#github.com/${repo}/releases/download/#" \
     "$cask" > "$tmp"
 cat "$tmp" > "$cask"
 rm -f "$tmp"

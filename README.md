@@ -710,7 +710,7 @@ pre-release channel.
 
 | Channel | Files | Automated per release | First time, manual |
 | --- | --- | --- | --- |
-| winget | `packaging/winget/` (templates, `update-manifest.py`) | manifests from the release installers, `winget validate`, artifact, `wingetcreate update --submit` if `WINGET_GITHUB_TOKEN` is set | submit the package to `microsoft/winget-pkgs` |
+| winget | `packaging/winget/` (templates, `update-manifest.py`) | manifests from the release installers, `winget validate`, artifact, `wingetcreate submit` if `WINGET_GITHUB_TOKEN` is set | submit the package to `microsoft/winget-pkgs` |
 | Homebrew tap | `packaging/homebrew/` (`grimalkin.rb`, `update-cask.sh`) | cask version and sha256 from the release dmgs, pushed to the tap if `HOMEBREW_TAP_TOKEN` is set, else artifact | create the tap repository |
 | MacPorts | `packaging/macports/` (`Portfile`, `gen-crates.py`) | checks the crate list against `Cargo.lock`, Portfile artifact with the version bumped | PR to `macports/macports-ports` |
 
@@ -724,7 +724,7 @@ Repository secrets (Settings, Secrets and variables, Actions), all optional:
 Without a secret the job still builds and validates the files, uploads them as an
 artifact and prints the manual command.
 
-**winget, first submission (manual).** `wingetcreate update` can only update a
+**winget, first submission (manual).** The workflow only adds versions to a
 package that already exists in `microsoft/winget-pkgs`, so the first version is
 submitted by hand from a Windows machine, with a stable (non pre-release) tag:
 
@@ -746,7 +746,7 @@ on the installer URL) and users get SmartScreen warnings, so get the
 submit a signed release. The package identifier is `rlankenau.grimalkin`; the
 `ProductCode` in the installer manifest is the Inno Setup `AppId` plus `_is1`
 and must not change. After the package is merged, set `WINGET_GITHUB_TOKEN` and
-later releases are submitted by the workflow. `update-manifest.py` leaves an
+later releases are submitted by the workflow (`wingetcreate submit` of the generated manifests). `update-manifest.py` leaves an
 architecture out of the manifest when the release has no installer for it
 (`v1.0.0-rc3` predates the ARM64 installer).
 

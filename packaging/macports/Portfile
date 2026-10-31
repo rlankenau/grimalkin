@@ -36,6 +36,10 @@ pre-fetch {
     }
 }
 
+# The cargo group enables +universal by default; the post-build bundling below
+# uses one target directory, so build for the native architecture only.
+universal_variant   no
+
 # Only the GUI crate; grimalkin-launcher (the Windows console launcher) is not
 # needed on macOS. --locked makes cargo fail instead of touching Cargo.lock.
 build.args          -p grimalkin --locked
