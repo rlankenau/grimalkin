@@ -490,6 +490,18 @@ and a normal window needs a restart). A file with a syntax error is reported
 in the log and the running settings are kept. (`--theme` and `--skin` keep
 winning over the file.)
 
+## Accessibility
+
+grimalkin is meant to be usable by everybody. These are commitments, not a wishlist, and an issue titled "Accessibility: ..." is treated as a bug.
+
+- **Keyboard first.** Everything reachable with a mouse must be reachable from the keyboard: menus (Menu key or Shift+F10), Preferences (Tab, arrow keys, Ctrl+Tab between sections, Esc), zoom, skin and theme switching.
+- **Screen readers get real information.** Preferences controls carry names, roles and values; the terminal's text and cursor are to be exposed the same way (tracked in #10).
+- **Never colour alone.** Focus is always visibly marked, cursor shape and blink are configurable, the visual bell is an alternative to sound, and every built-in theme must stay readable at its contrast.
+- **Motion and flashing are optional.** Blink can be off and the bell flash duration is a setting; nothing flashes without a way to turn it off.
+- **Scale with the person.** Font zoom, DPI changes while running, and the integer-scaled skins all have to keep text crisp and controls reachable.
+
+Status: menus and Preferences are keyboard-driven today; screen-reader exposure of Preferences is in progress and the terminal grid is next (#10). Keyboard-driven text selection is not implemented yet.
+
 ## Menus
 
 macOS has a menu bar: Settings... (Cmd+,) and Quit (Cmd+Q) in the app menu, Edit (Copy, Paste), View (zoom,
