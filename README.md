@@ -44,6 +44,8 @@ Windows 10 1809 minimum; the ARM64 minimum is Windows 11 until validated
 otherwise. Each build bundles the ConPTY (`conpty.dll` and `OpenConsole.exe`)
 of its own architecture.
 
+Testers: CI runs also upload `grimalkin-tools-x64` / `grimalkin-tools-arm64` artifacts (unsigned `gcat.exe`, a kitty-graphics test tool, plus a README) for trying graphics without a Rust toolchain.
+
 > **ARM64 status:** the ARM64 build is compiled, packaged and install-tested on
 > a native Windows 11 ARM64 CI runner, and the library test suite runs there.
 > Interactive validation on real ARM64 hardware (GPU rendering, Preferences,
