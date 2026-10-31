@@ -36,6 +36,8 @@ pub enum KeyAction {
     OpenPreferences,
     /// Scroll the scrollback by this many pages (positive = older).
     ScrollPages(i32),
+    /// Menu key / Shift+F10: open the context menu at the text cursor.
+    ContextMenu,
 }
 
 /// Terminal state that affects encoding.
@@ -178,6 +180,21 @@ fn is_prefs_key(code: KeyCode, mods: ModifiersState) -> bool {
         }
 }
 
+/// The Menu key (any modifiers) or Shift+F10.
+/// Linux has no menus, so the key is left for the program there.
+fn is_context_menu_key(logical: &Key, code: KeyCode, mods: ModifiersState) -> bool {
+    if !cfg!(any(windows, target_os = "macos")) {
+        return false;
+    }
+    matches!(logical, Key::Named(NamedKey::ContextMenu))
+        || code == KeyCode::ContextMenu
+        || (code == KeyCode::F10
+            && mods.shift_key()
+            && !mods.control_key()
+            && !mods.alt_key()
+            && !mods.super_key())
+}
+
 /// Ctrl held with no other modifier.
 fn is_plain_ctrl(mods: ModifiersState) -> bool {
     mods.control_key() && !mods.shift_key() && !mods.alt_key() && !mods.super_key()
@@ -185,6 +202,10 @@ fn is_plain_ctrl(mods: ModifiersState) -> bool {
 
 fn shortcut(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> Option<KeyAction> {
     let PhysicalKey::Code(code) = input.physical else { return None };
+    if is_context_menu_key(input.logical, code, mods) {
+        // Press opens the menu; the release is swallowed with it.
+        return Some(if input.pressed { KeyAction::ContextMenu } else { KeyAction::None });
+    }
     if !input.pressed {
         // Releases of shortcut keys are swallowed so the kitty protocol hook
         // never sees half of a shortcut.
@@ -901,6 +922,66 @@ fn text_bytes(text: Option<&str>, alt: bool) -> Option<Vec<u8>> {
     Some(v)
 }
 
+/// Does this paste need the user's confirmation first? A newline outside
+/// bracketed paste would run commands as it lands; in bracketed mode the
+/// application receives it as one paste and decides itself, so bracketed
+/// mode skips the prompt entirely (size included).
+pub fn paste_needs_confirm(text: &str, bracketed: bool, confirm_multiline: bool, large_bytes: usize) -> bool {
+    if bracketed {
+        return false;
+    }
+    (confirm_multiline && text.contains(['\n', '\r'])) || (large_bytes > 0 && text.len() > large_bytes)
+}
+
+/// Lines in a paste, counting CR, LF and CRLF alike (all are Enter once sent).
+fn count_lines(text: &str) -> usize {
+    let mut n = 0;
+    let mut open = false; // text since the last break
+    let mut prev_cr = false;
+    for c in text.chars() {
+        match c {
+            '\n' if prev_cr => {}
+            '\n' | '\r' => {
+                n += 1;
+                open = false;
+            }
+            _ => open = true,
+        }
+        prev_cr = c == '\r';
+    }
+    (n + usize::from(open)).max(1)
+}
+
+/// The prompt text for a pending paste.
+pub fn paste_prompt_message(text: &str) -> String {
+    let lines = count_lines(text);
+    if text.contains(['\n', '\r']) {
+        format!("Paste {lines} {}? [Enter] paste  [Esc] cancel", if lines == 1 { "line" } else { "lines" })
+    } else {
+        format!("Paste {} KiB? [Enter] paste  [Esc] cancel", text.len().div_ceil(1024))
+    }
+}
+
+/// What a key press does while the paste prompt is up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptKey {
+    Confirm,
+    Cancel,
+    /// Any other key: swallowed, so nothing reaches the shell mid-prompt.
+    Ignore,
+}
+
+pub fn prompt_key(logical: &Key, pressed: bool) -> PromptKey {
+    if !pressed {
+        return PromptKey::Ignore;
+    }
+    match logical {
+        Key::Named(NamedKey::Enter) => PromptKey::Confirm,
+        Key::Named(NamedKey::Escape) => PromptKey::Cancel,
+        _ => PromptKey::Ignore,
+    }
+}
+
 /// Bytes to send for a paste. Newlines (`\r\n`, `\n`, `\r`) become CR, what
 /// Enter sends.
 ///
@@ -1126,6 +1207,65 @@ mod tests {
             translate(&key(KeyCode::PageUp), ModifiersState::SHIFT, &alt),
             KeyAction::None // Unidentified logical key sends nothing
         );
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn context_menu_keys() {
+        let menu = Key::Named(NamedKey::ContextMenu);
+        let ki = |logical: &'static Key, code: KeyCode, pressed: bool| KeyInput {
+            logical,
+            physical: PhysicalKey::Code(code),
+            text: None,
+            pressed,
+            repeat: false,
+            location: KeyLocation::Standard,
+            unmodified: None,
+            caps_lock: false,
+            num_lock: false,
+        };
+        let menu: &'static Key = Box::leak(Box::new(menu));
+        let other: &'static Key = Box::leak(Box::new(Key::Named(NamedKey::F10)));
+        let s = EncodeState::default();
+        let none = ModifiersState::empty();
+        assert_eq!(translate(&ki(menu, KeyCode::ContextMenu, true), none, &s), KeyAction::ContextMenu);
+        assert_eq!(translate(&ki(menu, KeyCode::ContextMenu, false), none, &s), KeyAction::None);
+        assert_eq!(translate(&ki(other, KeyCode::F10, true), ModifiersState::SHIFT, &s), KeyAction::ContextMenu);
+        assert_eq!(translate(&ki(other, KeyCode::F10, false), ModifiersState::SHIFT, &s), KeyAction::None);
+        assert_ne!(translate(&ki(other, KeyCode::F10, true), none, &s), KeyAction::ContextMenu);
+        assert_ne!(translate(&ki(other, KeyCode::F10, true), ModifiersState::CONTROL | ModifiersState::SHIFT, &s), KeyAction::ContextMenu);
+    }
+
+    #[test]
+    fn paste_confirmation_decision() {
+        // Newlines: asked unless bracketed or switched off.
+        assert!(paste_needs_confirm("a\nb", false, true, 0));
+        assert!(paste_needs_confirm("a\rb", false, true, 0));
+        assert!(paste_needs_confirm("ls\n", false, true, 0));
+        assert!(!paste_needs_confirm("single line", false, true, 0));
+        assert!(!paste_needs_confirm("a\nb", true, true, 1));
+        assert!(!paste_needs_confirm("a\nb", false, false, 0));
+        // Size: strictly above the threshold; 0 disables.
+        assert!(!paste_needs_confirm(&"x".repeat(10), false, true, 10));
+        assert!(paste_needs_confirm(&"x".repeat(11), false, true, 10));
+        assert!(!paste_needs_confirm(&"x".repeat(1 << 20), false, true, 0));
+        assert!(!paste_needs_confirm(&"x".repeat(100), true, true, 10));
+        assert_eq!(paste_prompt_message("a\nb\nc"), "Paste 3 lines? [Enter] paste  [Esc] cancel");
+        assert_eq!(paste_prompt_message("a\rb\rc"), "Paste 3 lines? [Enter] paste  [Esc] cancel");
+        assert_eq!(paste_prompt_message("a\r\nb\r\n\r\nc"), "Paste 4 lines? [Enter] paste  [Esc] cancel");
+        assert_eq!(paste_prompt_message("ls\n"), "Paste 1 line? [Enter] paste  [Esc] cancel");
+    }
+
+    #[test]
+    fn paste_prompt_keys() {
+        let enter = Key::Named(NamedKey::Enter);
+        let esc = Key::Named(NamedKey::Escape);
+        let a = Key::Character("a".into());
+        assert_eq!(prompt_key(&enter, true), PromptKey::Confirm);
+        assert_eq!(prompt_key(&esc, true), PromptKey::Cancel);
+        assert_eq!(prompt_key(&a, true), PromptKey::Ignore);
+        assert_eq!(prompt_key(&enter, false), PromptKey::Ignore, "releases do nothing");
+        assert_eq!(prompt_key(&esc, false), PromptKey::Ignore);
     }
 
     #[test]

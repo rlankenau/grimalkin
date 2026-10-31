@@ -147,3 +147,11 @@ osc52_write = true
 # Allow programs to read the clipboard with OSC 52. Off by default because any
 # program running in the terminal (including over ssh) could read it.
 osc52_read = false
+
+[paste]
+# Ask before pasting text that contains a newline (a bar over the window:
+# Enter pastes, Esc cancels). Not asked when the program has bracketed paste
+# on, because it handles multi-line text itself.
+confirm_multiline = true
+# Also ask before pasting more than this many bytes. 0 turns the size check off.
+confirm_large_bytes = 1048576

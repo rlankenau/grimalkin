@@ -453,7 +453,9 @@ impl App {
             wake_pending: self.wake_pending.clone(),
             exit_requested: false,
             menu_accels: false,
-            context_menu_requested: false,
+            context_menu_requested: None,
+            pending_paste: None,
+            prompt_swallow: None,
             notice: None,
         };
         running.update_skin_min_size();
@@ -502,9 +504,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(c) = cmd {
                     r.debug_command(&c);
                 }
-                if std::mem::take(&mut r.context_menu_requested) {
+                if let Some(at) = r.context_menu_requested.take() {
                     if let Some(m) = self.menus.as_ref() {
-                        m.show_context_menu(&r.window);
+                        m.show_context_menu(&r.window, at);
                     }
                 }
             }
@@ -588,9 +590,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::DroppedFile(path) => r.on_dropped_file(path),
             _ => {}
         }
-        if std::mem::take(&mut r.context_menu_requested) {
+        if let Some(at) = r.context_menu_requested.take() {
             if let Some(m) = self.menus.as_ref() {
-                m.show_context_menu(&r.window);
+                m.show_context_menu(&r.window, at);
             }
         }
         if r.exit_requested {
@@ -631,6 +633,12 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 /// Everything that exists once the window is up.
+/// A paste held back by the confirmation prompt.
+struct PendingPaste {
+    text: String,
+    message: String,
+}
+
 struct Running {
     /// Skin pointer state; `None` for a normal OS-decorated window.
     skin: Option<SkinRuntime>,
@@ -694,9 +702,15 @@ struct Running {
     /// The menu bar owns the Cmd+C/V/+/-/0/, accelerators (macOS): ignore
     /// those key events here so an action never runs twice.
     menu_accels: bool,
-    /// A right click asked for the context menu (at the pointer); the
-    /// app shows it (it owns the menus) once the event is handled.
-    context_menu_requested: bool,
+    /// The context menu was asked for (right click: `Some(None)`, at the
+    /// pointer; Menu key: at the given window pixel); the app shows it (it
+    /// owns the menus) once the event is handled.
+    context_menu_requested: Option<Option<(f64, f64)>>,
+    /// A paste waiting for Enter/Esc (see `input::paste_needs_confirm`).
+    pending_paste: Option<PendingPaste>,
+    /// The key that answered the paste prompt: its repeats and release are
+    /// consumed too, so they never reach the shell.
+    prompt_swallow: Option<winit::keyboard::Key>,
     /// Something the last config reload could not do live; the app passes it
     /// to the open secondary windows.
     notice: Option<String>,
@@ -1114,6 +1128,7 @@ impl Running {
             selection: &self.selection,
             hover: hover.as_ref(),
             flash,
+            prompt: self.pending_paste.as_ref().map(|p| p.message.as_str()),
             chrome: self.skin.as_ref().map(|s| s.view(&self.title)),
         };
         let status = self.renderer.render(&mut self.term, &view, self.gfx.protocol_mut());
@@ -1226,6 +1241,25 @@ impl Running {
     // -- keyboard ----------------------------------------------------------
 
     fn on_key(&mut self, ev: &winit::event::KeyEvent) {
+        if self.pending_paste.is_some() {
+            // The paste prompt takes every key until it is answered.
+            let key = input::prompt_key(&ev.logical_key, ev.state.is_pressed());
+            if key != input::PromptKey::Ignore {
+                self.prompt_swallow = Some(ev.logical_key.clone());
+            }
+            self.answer_prompt(key);
+            return;
+        }
+        if let Some(k) = self.prompt_swallow.take() {
+            if k == ev.logical_key {
+                // Repeats and the release of the answering key; the
+                // release ends it.
+                if ev.state.is_pressed() {
+                    self.prompt_swallow = Some(k);
+                }
+                return;
+            }
+        }
         let st = EncodeState {
             app_cursor: self.term.app_cursor_keys(),
             kitty_flags: self.term.keyboard_flags(),
@@ -1249,6 +1283,9 @@ impl Running {
             KeyAction::Copy => self.copy(),
             KeyAction::Paste => self.paste(),
             KeyAction::Zoom(op) => self.zoom(op),
+            KeyAction::ContextMenu => {
+                self.context_menu_requested = Some(Some(self.cursor_menu_anchor()));
+            }
             KeyAction::OpenPreferences => {
                 let _ = self.proxy.send_event(UserEvent::OpenPreferences);
             }
@@ -1258,6 +1295,31 @@ impl Running {
                     self.window.request_redraw();
                 }
             }
+        }
+    }
+
+    /// Where the keyboard-opened context menu goes: the bottom-left of the
+    /// text cursor's cell, in window pixels.
+    fn cursor_menu_anchor(&self) -> (f64, f64) {
+        let (cw, ch) = self.renderer.cell_size_px();
+        let (ox, oy) = self.renderer.grid_origin_px();
+        let cur = self.term.cursor();
+        (ox as f64 + cur.col as f64 * cw as f64, oy as f64 + (cur.row + 1) as f64 * ch as f64)
+    }
+
+    fn answer_prompt(&mut self, key: input::PromptKey) {
+        match key {
+            input::PromptKey::Confirm => {
+                if let Some(p) = self.pending_paste.take() {
+                    self.send_paste(&p.text);
+                }
+                self.window.request_redraw();
+            }
+            input::PromptKey::Cancel => {
+                self.pending_paste = None;
+                self.window.request_redraw();
+            }
+            input::PromptKey::Ignore => {}
         }
     }
 
@@ -1368,6 +1430,28 @@ impl Running {
         if text.is_empty() {
             return;
         }
+        if self.pending_paste.is_some() {
+            // One paste at a time: the prompt is about the text it shows.
+            return;
+        }
+        if input::paste_needs_confirm(
+            text,
+            self.term.bracketed_paste(),
+            self.cfg.paste.confirm_multiline,
+            self.cfg.paste.confirm_large_bytes,
+        ) {
+            if self.win_state.is_shaded() {
+                // The prompt is not drawn in a shaded window.
+                self.toggle_shade();
+            }
+            self.pending_paste = Some(PendingPaste { text: text.to_string(), message: input::paste_prompt_message(text) });
+            self.window.request_redraw();
+            return;
+        }
+        self.send_paste(text);
+    }
+
+    fn send_paste(&mut self, text: &str) {
         let bytes = input::paste_bytes(text, self.term.bracketed_paste());
         if self.term.scroll_display_to_bottom() {
             self.window.request_redraw();
@@ -1455,6 +1539,14 @@ impl Running {
                     let _ = self.proxy.send_event(UserEvent::MenuAction(action));
                 }
             }
+            // `paste:TEXT` goes through the paste path (`\n` in TEXT is a newline
+            // and `;` cannot appear: the script splits on it); `key:enter` /
+            // `key:esc` answer the paste prompt; `menukey` is the Menu key.
+            "paste" => self.paste_text(&arg.replace("\\n", "\n")),
+            "key" if self.pending_paste.is_some() => {
+                self.answer_prompt(if arg == "esc" { input::PromptKey::Cancel } else { input::PromptKey::Confirm })
+            }
+            "menukey" => self.context_menu_requested = Some(Some(self.cursor_menu_anchor())),
             "rightclick" => self.on_mouse_button(ElementState::Pressed, MouseButton::Right),
             "shade" => self.run_skin_action(Action::ToggleShade),
             "size" => {
@@ -1704,6 +1796,10 @@ impl Running {
         if self.skin.is_none() {
             return;
         }
+        if !self.win_state.is_shaded() {
+            // The paste prompt cannot be shown in a shaded window.
+            self.pending_paste = None;
+        }
         let plan = self.win_state.toggle_shade(self.window_rect(), self.shade_bar(), skin::work_area(&self.window));
         self.apply_plan(plan);
     }
@@ -1838,7 +1934,7 @@ impl Running {
         // mouse (Shift always bypasses reporting, so Shift+right click opens it).
         if button == MouseButton::Right && (self.term.mouse_mode() == grimalkin_vt::MouseMode::None || self.mods.shift_key()) {
             if pressed {
-                self.context_menu_requested = true;
+                self.context_menu_requested = Some(None);
             }
             return;
         }
