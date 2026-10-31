@@ -1349,11 +1349,11 @@ impl Terminal {
             if self.active == Screen::Main {
                 track[0] = Track { row: self.cursor.row, col: self.cursor.col, pending: self.pending_wrap };
                 if let Some(s) = self.saved[0] {
-                    track[1] = Track { row: s.row, col: s.col, pending: false };
+                    track[1] = Track { row: s.row, col: s.col, pending: s.pending_wrap };
                     n = 2;
                 }
             } else if let Some(s) = self.saved[0] {
-                track[0] = Track { row: s.row, col: s.col, pending: false };
+                track[0] = Track { row: s.row, col: s.col, pending: s.pending_wrap };
             }
             self.main.reflow(cols, rows, &mut track[..n]);
             if self.active == Screen::Main {
@@ -1364,11 +1364,13 @@ impl Terminal {
                     if let Some(s) = &mut self.saved[0] {
                         s.row = track[1].row;
                         s.col = track[1].col;
+                        s.pending_wrap = track[1].pending && self.modes.wrap;
                     }
                 }
             } else if let Some(s) = &mut self.saved[0] {
                 s.row = track[0].row;
                 s.col = track[0].col;
+                s.pending_wrap = track[0].pending && self.modes.wrap;
             }
             shift_main = 0;
             self.push_event(TermEvent::Reflowed);

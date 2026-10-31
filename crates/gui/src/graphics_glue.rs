@@ -124,6 +124,14 @@ impl Graphics {
         ev
     }
 
+    /// Handle the terminal's queued events now (graphics commands, and
+    /// `Reflowed`, which drops placements); the rest wait for `drain_events`.
+    /// Call after resizing the terminal, so no frame is drawn with placements
+    /// at row anchors the reflow invalidated.
+    pub fn process_events(&mut self, term: &mut Terminal) {
+        self.pump(term);
+    }
+
     fn pump(&mut self, term: &mut Terminal) {
         for ev in term.drain_events() {
             match ev {
@@ -272,6 +280,8 @@ mod tests {
         g.feed(&mut t, &bytes);
         assert_eq!(placements(&mut g).len(), 1);
         t.resize(10, 5);
+        g.process_events(&mut t);
+        assert!(placements(&mut g).is_empty(), "dropped before any later output");
         let ev = g.drain_events(&mut t);
         assert!(ev.contains(&TermEvent::Reflowed));
         assert!(placements(&mut g).is_empty());

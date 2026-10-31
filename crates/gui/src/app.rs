@@ -925,6 +925,9 @@ impl Running {
         self.term.set_cell_pixel_size(cw, ch);
         if self.term.size() != (cols, rows) {
             self.term.resize(cols, rows);
+            // A reflow invalidates image placements: drop them now rather
+            // than when the next pty output happens to arrive.
+            self.gfx.process_events(&mut self.term);
             self.selection.clear();
             self.renderer.invalidate();
         }

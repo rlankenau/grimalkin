@@ -333,3 +333,34 @@ fn reflow_bench() {
         eprintln!("reflow 10k x 200: narrow {narrow} ms, widen {wide} ms");
     }
 }
+
+#[test]
+fn cursor_on_a_wide_spacer_stays_on_it() {
+    let mut t = Terminal::new(8, 3, 100);
+    feed(&mut t, "abcde\u{65e5}\x1b[1;7H");
+    assert!(t.grid().cell(0, 6).is_wide() || t.grid().cell(0, 5).is_wide());
+    let col = t.cursor().col;
+    assert!(t.grid().cell(0, col).is_spacer());
+    t.resize(4, 3);
+    // a b c d | e 日 -> the wide char lands on row 1 cols 1-2.
+    let c = t.cursor();
+    assert!(t.grid().cell(c.row, c.col).is_spacer(), "{c:?}");
+    assert_eq!(snap(&t)[0], "abcd");
+    feed(&mut t, "Z");
+    assert_eq!(snap(&t)[0], "abcd");
+}
+
+#[test]
+fn saved_cursor_keeps_its_deferred_wrap() {
+    let mut t = Terminal::new(4, 3, 100);
+    feed(&mut t, "abcd\x1b7"); // DECSC with a pending wrap
+    t.resize(8, 3);
+    feed(&mut t, "\x1b8X");
+    assert_eq!(snap(&t)[0], "abcdX");
+    // Same through the alternate screen (DECSC saved by 1049h).
+    let mut t = Terminal::new(4, 3, 100);
+    feed(&mut t, "abcd\x1b[?1049h");
+    t.resize(8, 3);
+    feed(&mut t, "\x1b[?1049lX");
+    assert_eq!(snap(&t)[0], "abcdX");
+}

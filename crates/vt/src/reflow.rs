@@ -106,8 +106,9 @@ fn layout(
         }
         let row_ix = out.len();
         for p in pend {
-            if !p.after && p.off == src {
-                pos[p.track] = (row_ix, col, false);
+            // A position on a wide character's spacer stays on the spacer.
+            if !p.after && p.off >= src && p.off < src + consumed {
+                pos[p.track] = (row_ix, col + (p.off - src).min(w - 1), false);
             }
         }
         cur.push(cell);
