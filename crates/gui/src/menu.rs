@@ -114,7 +114,7 @@ mod none {
         pub fn new(_proxy: EventLoopProxy<UserEvent>, _theme: &str, _skin: &str, _ctrl_v_paste: bool) -> Option<AppMenus> {
             None
         }
-        pub fn sync(&mut self, _theme: &str, _skin: &str) {}
+        pub fn sync(&mut self, _theme: &str, _skin: &str, _ctrl_v_paste: bool) {}
         pub fn has_menu_bar(&self) -> bool {
             false
         }
@@ -213,6 +213,8 @@ mod native {
         bar: Option<(Menu, Choices)>,
         context: Menu,
         context_choices: Choices,
+        /// The context menu's Paste item, whose label follows `input.ctrl_v_paste`.
+        paste: MenuItem,
     }
 
     impl AppMenus {
@@ -225,12 +227,13 @@ mod native {
                     let _ = proxy.send_event(UserEvent::MenuAction(action));
                 }
             }));
-            let mut m = AppMenus { bar: build_bar(), context: Menu::new(), context_choices: Choices::new() };
-            if let Err(e) = build_context(&m.context, &m.context_choices, ctrl_v_paste) {
+            let paste = item("Paste", &MenuAction::Paste, paste_shortcut(ctrl_v_paste));
+            let mut m = AppMenus { bar: build_bar(), context: Menu::new(), context_choices: Choices::new(), paste };
+            if let Err(e) = build_context(&m.context, &m.context_choices, &m.paste) {
                 log::warn!("cannot build the context menu: {e}");
                 return None;
             }
-            m.sync(active_theme, active_skin);
+            m.sync(active_theme, active_skin, ctrl_v_paste);
             Some(m)
         }
 
@@ -240,7 +243,8 @@ mod native {
         }
 
         /// Refresh the lists and check marks after a config reload.
-        pub fn sync(&mut self, theme: &str, skin: &str) {
+        pub fn sync(&mut self, theme: &str, skin: &str, ctrl_v_paste: bool) {
+            let _ = self.paste.set_accelerator(paste_shortcut(ctrl_v_paste));
             if let Some((_, c)) = self.bar.as_mut() {
                 c.sync(theme, skin);
             }
@@ -299,12 +303,17 @@ mod native {
         Some(Accelerator::new(mods, code))
     }
 
+    /// Paste shows Ctrl+V on Windows while `input.ctrl_v_paste` is on.
+    fn paste_shortcut(ctrl_v_paste: bool) -> Option<muda::accelerator::Accelerator> {
+        shortcut(muda::accelerator::Code::KeyV, !(cfg!(windows) && ctrl_v_paste))
+    }
+
     /// Items shared by the context menu (and, in part, the menu bar).
-    fn build_context(menu: &Menu, choices: &Choices, ctrl_v_paste: bool) -> muda::Result<()> {
+    fn build_context(menu: &Menu, choices: &Choices, paste: &MenuItem) -> muda::Result<()> {
         use muda::accelerator::Code;
         menu.append_items(&[
             &item("Copy", &MenuAction::Copy, shortcut(Code::KeyC, true)),
-            &item("Paste", &MenuAction::Paste, shortcut(Code::KeyV, !(cfg!(windows) && ctrl_v_paste))),
+            paste,
             &PredefinedMenuItem::separator(),
             &item("Zoom In", &MenuAction::ZoomIn, shortcut(Code::Equal, true)),
             &item("Zoom Out", &MenuAction::ZoomOut, shortcut(Code::Minus, true)),

@@ -519,7 +519,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ConfigChanged => {
                 r.reload_config();
                 if let Some(m) = self.menus.as_mut() {
-                    m.sync(&r.cfg.theme, &r.cfg.skin);
+                    m.sync(&r.cfg.theme, &r.cfg.skin, r.cfg.input.ctrl_v_paste);
                 }
                 let notice = r.notice.take();
                 for w in self.secondary.values_mut() {

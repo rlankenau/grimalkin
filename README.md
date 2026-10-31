@@ -443,7 +443,7 @@ grimalkin --list-skins
 ```
 
 Skin names are lower case by design (`Winamp3_Classified` installs as
-`winamp3-classified`). A museum page URL that ends in the file name keeps that
+`winamp3_classified`). A museum page URL that ends in the file name keeps that
 name, but a raw archive link (`https://r2.webampskins.org/skins/<md5>.wsz`)
 installs under its hash. In Preferences > Advanced > "Install a WinAMP skin"
 the optional Name field overrides the derived name (it is sanitised and
