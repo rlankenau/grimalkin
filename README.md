@@ -77,7 +77,7 @@ want Program Files instead. The installer:
 - can launch grimalkin when it finishes
 - upgrades in place: run a newer installer over an old one (a running grimalkin
   is closed first); uninstall from Settings, Apps, which also removes the PATH
-  entry and context-menu keys. Your config in `%APPDATA%\grimalkin` is kept
+  entry and context-menu keys, and the font cache (`%LOCALAPPDATA%\grimalkin\fonts.cache`). Your config and skins in `%APPDATA%\grimalkin` are kept
 
 Silent install, for scripts: `grimalkin-setup-<arch>.exe /VERYSILENT /TASKS="addtopath,contextmenu"`
 (add `/ALLUSERS` for a machine-wide install).

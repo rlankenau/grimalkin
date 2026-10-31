@@ -102,6 +102,34 @@ pub enum CursorShapeCfg {
     Bar,
 }
 
+impl FontConfig {
+    /// `family` followed by `fallback`, without case-insensitive duplicates:
+    /// the order glyph lookup tries families in.
+    pub fn effective_families(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for n in self.family.iter().chain(self.fallback.iter()) {
+            if !out.iter().any(|o| o.eq_ignore_ascii_case(n)) {
+                out.push(n.clone());
+            }
+        }
+        out
+    }
+}
+
+/// Default CJK fallback, one family per script group where possible so kanji
+/// and kana come from the same font (Yu Gothic UI, PingFang SC and Noto Sans
+/// CJK all cover both).
+fn default_fallback() -> Vec<String> {
+    let v: &[&str] = if cfg!(target_os = "macos") {
+        &["PingFang SC", "Hiragino Sans"]
+    } else if cfg!(windows) {
+        &["Yu Gothic UI", "Microsoft YaHei", "Malgun Gothic"]
+    } else {
+        &["Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK KR"]
+    };
+    v.iter().map(|s| s.to_string()).collect()
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct FontConfig {
@@ -110,6 +138,10 @@ pub struct FontConfig {
     /// the earlier ones lack, before the system fallback kicks in.
     #[serde(deserialize_with = "family_list")]
     pub family: Vec<String>,
+    /// CJK / symbol fallback families, tried in order after `family` and
+    /// before the system fallback. Empty uses the per-OS default.
+    #[serde(deserialize_with = "family_list")]
+    pub fallback: Vec<String>,
     /// Size in points (logical pixels at 1x scale).
     pub size: f32,
     /// Multiplier applied to the natural line height (ascent + descent).
@@ -120,6 +152,7 @@ impl Default for FontConfig {
     fn default() -> Self {
         FontConfig {
             family: default_families(),
+            fallback: default_fallback(),
             size: 13.0,
             line_height: 1.0,
         }
@@ -494,6 +527,9 @@ impl Config {
         if self.font.family.is_empty() {
             self.font.family = default_families();
         }
+        if self.font.fallback.is_empty() {
+            self.font.fallback = default_fallback();
+        }
     }
 }
 
@@ -530,6 +566,15 @@ mod tests {
         assert_eq!(c.scrollback_lines, 10_000);
         assert_eq!(c.theme, "default");
         assert_eq!(c.colors, ColorsConfig::default());
+    }
+
+    #[test]
+    fn effective_families_order_and_dedupe() {
+        let c = Config::from_toml("[font]\nfamily = [\"A\", \"b\"]\nfallback = [\"B\", \"C\"]").unwrap();
+        assert_eq!(c.font.effective_families(), vec!["A", "b", "C"]);
+        let d = Config::default();
+        assert!(!d.font.fallback.is_empty());
+        assert_eq!(d.font.effective_families()[..d.font.family.len()], d.font.family[..]);
     }
 
     #[test]

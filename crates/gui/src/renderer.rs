@@ -352,7 +352,7 @@ impl Renderer {
             GlyphCache::new(
                 &gpu,
                 device.limits().max_texture_dimension_2d,
-                &cfg.font.family,
+                &cfg.font.effective_families(),
                 px_size,
                 cfg.font.line_height,
             )
@@ -519,7 +519,7 @@ impl Renderer {
             images,
             scale,
             font_pt,
-            families: cfg.font.family.clone(),
+            families: cfg.font.effective_families(),
             line_height: cfg.font.line_height,
             pad: 0,
             cols: 1,
