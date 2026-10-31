@@ -40,6 +40,13 @@ impl Section {
         }
     }
 
+    /// The section `step` places after this one, wrapping around.
+    pub fn cycle(self, step: i32) -> Section {
+        let n = Section::ALL.len() as i32;
+        let i = Section::ALL.iter().position(|s| *s == self).unwrap_or(0) as i32;
+        Section::ALL[(i + step).rem_euclid(n) as usize]
+    }
+
     /// The config keys "Reset section to defaults" removes.
     pub fn keys(self) -> &'static [&'static str] {
         match self {
