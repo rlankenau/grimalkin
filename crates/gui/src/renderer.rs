@@ -152,6 +152,8 @@ pub struct ViewState<'a> {
     pub hover: Option<&'a crate::links::LinkSpan>,
     /// Visual bell strength, 0.0 (off) to 1.0.
     pub flash: f32,
+    /// Paste confirmation message, drawn as a centred box over the grid.
+    pub prompt: Option<&'a str>,
     /// Skin chrome state; `None` when no skin is active.
     pub chrome: Option<ChromeView<'a>>,
 }
@@ -1007,6 +1009,30 @@ impl Renderer {
                 let y = self.oy() + r as f32 * chh + m.underline_y as f32;
                 self.cur_rect
                     .push(rect(x, y, (c1 - c0 + 1) as f32 * cw, t, c, 255, KIND_SOLID));
+            }
+        }
+
+        if let Some(msg) = view.prompt {
+            // A centred box in the selection colours, over the whole window
+            // (skin or not; it uses the surface size, not the grid).
+            let n = msg.chars().count() as f32;
+            let pad_x = cw;
+            let (w, h) = ((n * cw + 2.0 * pad_x).min(vw), chh * 3.0);
+            let (x, y) = (((vw - w) / 2.0).max(0.0), ((vh - h) / 2.0).max(0.0));
+            let (sb, sf) = (self.sel_bg, self.sel_fg);
+            let t = (self.scale.round() as f32).max(1.0);
+            self.cur_rect.push(rect(x, y, w, h, sf, 255, KIND_SOLID));
+            self.cur_rect.push(rect(x + t, y + t, w - 2.0 * t, h - 2.0 * t, sb, 255, KIND_SOLID));
+            let gpu = Gpu {
+                device: &self.device,
+                queue: &self.queue,
+            };
+            for (i, ch) in msg.chars().enumerate() {
+                if ch == ' ' || (i as f32 + 1.0) * cw > w - pad_x {
+                    continue;
+                }
+                let quads = self.glyphs.lookup(&gpu, ch, &[], 0, false);
+                push_glyphs(quads, x + pad_x + i as f32 * cw, y + chh, sf, &mut self.cur_mask, &mut self.cur_color);
             }
         }
 

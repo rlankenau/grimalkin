@@ -118,7 +118,7 @@ mod none {
         pub fn has_menu_bar(&self) -> bool {
             false
         }
-        pub fn show_context_menu(&self, _window: &Window) {}
+        pub fn show_context_menu(&self, _window: &Window, _at: Option<(f64, f64)>) {}
     }
 }
 
@@ -247,42 +247,72 @@ mod native {
             self.context_choices.sync(theme, skin);
         }
 
-        /// Pop the context menu up at the mouse pointer. Blocks in the
-        /// platform's menu loop until it is dismissed. (No explicit position:
-        /// winit's NSView is flipped, which muda's view-relative anchoring
-        /// does not expect, so the menu would mirror vertically.)
-        pub fn show_context_menu(&self, window: &Window) {
+        /// Pop the context menu up at `at` (window pixels, top-left origin;
+        /// the keyboard path passes the text cursor) or at the mouse pointer.
+        /// Blocks in the platform's menu loop until it is dismissed.
+        pub fn show_context_menu(&self, window: &Window, at: Option<(f64, f64)>) {
             let Ok(handle) = window.window_handle() else { return };
+            let size = window.inner_size();
+            let scale = window.scale_factor();
+            // winit's NSView is flipped, but muda anchors as if it were not
+            // (y measured up from the bottom), so flip y back for macOS.
+            #[cfg(target_os = "macos")]
+            let pos = at.map(|(x, y)| {
+                muda::dpi::Position::Logical(muda::dpi::LogicalPosition::new(x / scale, (size.height as f64 - y) / scale))
+            });
+            #[cfg(windows)]
+            let pos = at.map(|(x, y)| muda::dpi::Position::Physical(muda::dpi::PhysicalPosition::new(x as i32, y as i32)));
+            let _ = (size, scale);
             match handle.as_raw() {
                 #[cfg(target_os = "macos")]
                 RawWindowHandle::AppKit(h) => {
                     // SAFETY: the view belongs to `window`, which is alive for this call.
-                    unsafe { self.context.show_context_menu_for_nsview(h.ns_view.as_ptr(), None) };
+                    unsafe { self.context.show_context_menu_for_nsview(h.ns_view.as_ptr(), pos) };
                 }
                 #[cfg(windows)]
                 RawWindowHandle::Win32(h) => {
                     // SAFETY: the HWND belongs to `window`, which is alive for this call.
-                    unsafe { self.context.show_context_menu_for_hwnd(h.hwnd.get(), None) };
+                    unsafe { self.context.show_context_menu_for_hwnd(h.hwnd.get(), pos) };
                 }
                 _ => {}
             }
         }
     }
 
+    /// The accelerator shown next to a context-menu item, matching the key
+    /// bindings in `input.rs`: Cmd+key on macOS, Ctrl+Shift+key elsewhere
+    /// (`shifted` false: Ctrl+key, for Settings). The popup is never attached
+    /// to a window's accelerator table, and winit's loop does not call
+    /// `TranslateAcceleratorW`, so on Windows these are labels only; on macOS
+    /// a key equivalent only acts while the popup is open, and the key event
+    /// itself still goes through the dedupe in `Running::on_key`.
+    fn shortcut(code: muda::accelerator::Code, shifted: bool) -> Option<muda::accelerator::Accelerator> {
+        use muda::accelerator::{Accelerator, Modifiers};
+        let mods = if cfg!(target_os = "macos") {
+            Modifiers::META
+        } else if shifted {
+            Modifiers::CONTROL | Modifiers::SHIFT
+        } else {
+            Modifiers::CONTROL
+        };
+        Some(Accelerator::new(mods, code))
+    }
+
     /// Items shared by the context menu (and, in part, the menu bar).
     fn build_context(menu: &Menu, choices: &Choices) -> muda::Result<()> {
+        use muda::accelerator::Code;
         menu.append_items(&[
-            &item("Copy", &MenuAction::Copy, None),
-            &item("Paste", &MenuAction::Paste, None),
+            &item("Copy", &MenuAction::Copy, shortcut(Code::KeyC, true)),
+            &item("Paste", &MenuAction::Paste, shortcut(Code::KeyV, true)),
             &PredefinedMenuItem::separator(),
-            &item("Zoom In", &MenuAction::ZoomIn, None),
-            &item("Zoom Out", &MenuAction::ZoomOut, None),
-            &item("Actual Size", &MenuAction::ZoomReset, None),
+            &item("Zoom In", &MenuAction::ZoomIn, shortcut(Code::Equal, true)),
+            &item("Zoom Out", &MenuAction::ZoomOut, shortcut(Code::Minus, true)),
+            &item("Actual Size", &MenuAction::ZoomReset, shortcut(Code::Digit0, true)),
             &PredefinedMenuItem::separator(),
             &choices.themes,
             &choices.skins,
             &PredefinedMenuItem::separator(),
-            &item("Settings\u{2026}", &MenuAction::OpenPreferences, None),
+            &item("Settings\u{2026}", &MenuAction::OpenPreferences, shortcut(Code::Comma, false)),
             &item("Open Config File", &MenuAction::OpenConfigFile, None),
             &item("Reveal Themes Folder", &MenuAction::RevealThemesFolder, None),
             &item("Reveal Skins Folder", &MenuAction::RevealSkinsFolder, None),

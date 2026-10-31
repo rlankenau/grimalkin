@@ -522,8 +522,16 @@ between two skins is live).
 | Mod++ / Mod+- | Zoom in / out |
 | Mod+0 | Reset zoom |
 | Cmd+, (macOS) / Ctrl+, | Preferences |
+| Menu key, Shift+F10 (macOS and Windows) | Open the context menu at the text cursor |
+| Enter / Esc (while a paste prompt is shown) | Paste / cancel (see below) |
 | Shift+PageUp / Shift+PageDown | Scroll a page (main screen) |
 | Mouse wheel | Scroll scrollback (or sent to the app in mouse mode) |
+
+Pasting text with a newline (when the program has not turned on bracketed paste) or more than
+1 MiB shows "Paste N lines? [Enter] paste  [Esc] cancel" over the window. Turn it off, or change the
+size limit, in the `[paste]` section (`confirm_multiline`, `confirm_large_bytes`; 0 disables the size check).
+The menus show these shortcuts next to Copy, Paste, Zoom and Settings. On Windows they are labels
+only; the key handling is the one in the table.
 
 ## Testing kitty graphics
 

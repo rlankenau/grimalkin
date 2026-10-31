@@ -272,6 +272,26 @@ impl Default for ClipboardConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct PasteConfig {
+    /// Ask before pasting text that contains a newline (not asked when the
+    /// program has bracketed paste on: it handles multi-line text itself).
+    pub confirm_multiline: bool,
+    /// Ask before pasting more than this many bytes (0 = never ask).
+    #[serde(deserialize_with = "lenient_usize")]
+    pub confirm_large_bytes: usize,
+}
+
+impl Default for PasteConfig {
+    fn default() -> Self {
+        PasteConfig {
+            confirm_multiline: true,
+            confirm_large_bytes: 1_048_576,
+        }
+    }
+}
+
 /// Environment variable that overrides `[pty] passthrough` (`1`/`true`/`yes`/
 /// `on` force it on, `0`/`false`/`no`/`off` force it off).
 pub const CONPTY_PASSTHROUGH_ENV: &str = "GRIMALKIN_CONPTY_PASSTHROUGH";
@@ -355,6 +375,7 @@ pub struct Config {
     pub input: InputConfig,
     pub bell: BellConfig,
     pub clipboard: ClipboardConfig,
+    pub paste: PasteConfig,
     pub pty: PtyConfig,
     #[serde(deserialize_with = "lenient_usize")]
     pub scrollback_lines: usize,
@@ -382,6 +403,7 @@ impl Default for Config {
             input: InputConfig::default(),
             bell: BellConfig::default(),
             clipboard: ClipboardConfig::default(),
+            paste: PasteConfig::default(),
             pty: PtyConfig::default(),
             scrollback_lines: 10_000,
             skin: "none".to_string(),
