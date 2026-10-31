@@ -91,7 +91,7 @@ pub fn slider_name(name: &str) -> egui::RichText {
 pub fn take_section_keys(events: &mut Vec<Event>) -> i32 {
     let mut step = 0;
     events.retain(|e| {
-        let Event::Key { key, pressed, modifiers, repeat: _, .. } = e else { return true };
+        let Event::Key { key, pressed, modifiers, .. } = e else { return true };
         // `ctrl` is the Control key on every OS (`command` is Cmd on macOS).
         if !modifiers.ctrl || modifiers.alt {
             return true;
