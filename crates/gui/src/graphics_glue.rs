@@ -128,6 +128,17 @@ impl Graphics {
         for ev in term.drain_events() {
             match ev {
                 TermEvent::GraphicsCommand(payload) => self.handle(term, &payload),
+                TermEvent::Reflowed => {
+                    // A column change rewrapped the primary screen, so the
+                    // absolute rows placements were anchored to now name other
+                    // lines. Like kitty, drop the main screen's placements
+                    // (image data stays, so a later `a=p` still works). The
+                    // alternate screen is not reflowed and keeps its own.
+                    self.protocol.clear_screen(GScreen::Main);
+                    self.last_oldest[0] = 0;
+                    self.dirty = true;
+                    self.deferred.push(TermEvent::Reflowed);
+                }
                 other => self.deferred.push(other),
             }
         }
@@ -251,6 +262,27 @@ mod tests {
         bytes.extend_from_slice(b"\r\nlater text");
         g.feed(&mut t, &bytes);
         assert_eq!(placements(&mut g), vec![(3, 0)]);
+    }
+
+    #[test]
+    fn column_reflow_drops_main_placements_but_keeps_image_data() {
+        let (mut t, mut g) = setup();
+        let mut bytes = b"abc".to_vec();
+        bytes.extend_from_slice(PUT);
+        g.feed(&mut t, &bytes);
+        assert_eq!(placements(&mut g).len(), 1);
+        t.resize(10, 5);
+        let ev = g.drain_events(&mut t);
+        assert!(ev.contains(&TermEvent::Reflowed));
+        assert!(placements(&mut g).is_empty());
+        assert!(g.take_dirty());
+        // The image is still stored: put it again by id.
+        g.feed(&mut t, b"\x1b_Ga=p,i=7,q=2\x1b\\");
+        assert_eq!(placements(&mut g).len(), 1);
+        // Row-only resizes leave placements alone.
+        t.resize(10, 8);
+        g.drain_events(&mut t);
+        assert_eq!(placements(&mut g).len(), 1);
     }
 
     #[test]

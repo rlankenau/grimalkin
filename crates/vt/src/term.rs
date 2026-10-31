@@ -3,6 +3,7 @@
 
 use crate::cell::*;
 use crate::grid::Grid;
+use crate::reflow::Track;
 use crate::util;
 use std::collections::HashMap;
 use std::fmt;
@@ -134,6 +135,11 @@ pub enum TermEvent {
     SetMouseMode,
     /// APC `G` payload (bytes between `ESC _ G` and `ESC \`, exclusive of `G`).
     GraphicsCommand(Vec<u8>),
+    /// The primary screen was rewrapped by a column-count change. Absolute
+    /// row numbers handed out before this event no longer mean the same
+    /// lines: hosts must drop anything anchored to them (selections, image
+    /// placements). `cursor_abs_row` stays monotonic across a reflow.
+    Reflowed,
 }
 
 const EVENTS_COMPACT_MIN: usize = 1024;
@@ -151,7 +157,7 @@ pub fn coalesce_events(events: &mut Vec<TermEvent>) {
     if events.len() < 2 {
         return;
     }
-    let mut seen = [false; 7];
+    let mut seen = [false; 8];
     let mut queries = 0usize;
     let mut keep = vec![true; events.len()];
     for (i, ev) in events.iter().enumerate().rev() {
@@ -163,6 +169,7 @@ pub fn coalesce_events(events: &mut Vec<TermEvent>) {
             TermEvent::ColorChanged => 4,
             TermEvent::CursorShape(_) => 5,
             TermEvent::SetMouseMode => 6,
+            TermEvent::Reflowed => 7,
             TermEvent::ClipboardQuery => {
                 queries += 1;
                 keep[i] = queries <= MAX_QUERIES_PER_BATCH;
@@ -889,6 +896,10 @@ impl Terminal {
             Screen::Alt => &self.alt,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn main_grid(&self) -> &Grid {
+        &self.main
+    }
     pub(crate) fn grid_mut(&mut self) -> &mut Grid {
         match self.active {
             Screen::Main => &mut self.main,
@@ -1314,21 +1325,61 @@ impl Terminal {
     // Resize
     // ------------------------------------------------------------------
 
-    /// Resize the terminal without reflow: columns truncate/extend; rows
-    /// truncate (pushing top lines into scrollback if the cursor would fall
-    /// off) or extend (pulling lines back from scrollback if any).
+    /// Resize the terminal. A column change rewraps the primary screen
+    /// (scrollback and visible rows, see `reflow.rs`) and queues
+    /// [`TermEvent::Reflowed`]; the alternate screen just truncates or
+    /// extends rows, as kitty does. Row-only changes truncate (pushing top
+    /// lines into scrollback if the cursor would fall off) or extend
+    /// (pulling lines back from scrollback if any).
     pub fn resize<C: TryInto<usize>, R: TryInto<usize>>(&mut self, cols: C, rows: R) {
         let cols = to_usize(cols).max(1);
         let rows = to_usize(rows).max(1);
         if cols == self.cols && rows == self.rows {
             return;
         }
-        let main_cursor_row = if self.active == Screen::Main {
-            self.cursor.row
+        let reflow = cols != self.cols;
+        let mut reflow_pending = false;
+        let shift_main;
+        if reflow {
+            // Main-screen positions that must follow their characters: the
+            // cursor (or, with the alt screen up, the cursor saved on entry)
+            // and DECSC's saved cursor.
+            let mut track = [Track { row: 0, col: 0, pending: false }; 2];
+            let mut n = 1;
+            if self.active == Screen::Main {
+                track[0] = Track { row: self.cursor.row, col: self.cursor.col, pending: self.pending_wrap };
+                if let Some(s) = self.saved[0] {
+                    track[1] = Track { row: s.row, col: s.col, pending: false };
+                    n = 2;
+                }
+            } else if let Some(s) = self.saved[0] {
+                track[0] = Track { row: s.row, col: s.col, pending: false };
+            }
+            self.main.reflow(cols, rows, &mut track[..n]);
+            if self.active == Screen::Main {
+                self.cursor.row = track[0].row;
+                self.cursor.col = track[0].col;
+                reflow_pending = track[0].pending && self.modes.wrap;
+                if n == 2 {
+                    if let Some(s) = &mut self.saved[0] {
+                        s.row = track[1].row;
+                        s.col = track[1].col;
+                    }
+                }
+            } else if let Some(s) = &mut self.saved[0] {
+                s.row = track[0].row;
+                s.col = track[0].col;
+            }
+            shift_main = 0;
+            self.push_event(TermEvent::Reflowed);
         } else {
-            self.saved[0].map(|s| s.row).unwrap_or(0)
-        };
-        let shift_main = self.main.resize(cols, rows, main_cursor_row);
+            let main_cursor_row = if self.active == Screen::Main {
+                self.cursor.row
+            } else {
+                self.saved[0].map(|s| s.row).unwrap_or(0)
+            };
+            shift_main = self.main.resize(cols, rows, main_cursor_row);
+        }
         let alt_cursor_row = if self.active == Screen::Alt {
             self.cursor.row
         } else {
@@ -1356,7 +1407,7 @@ impl Terminal {
         }
         self.region_top = 0;
         self.region_bottom = rows - 1;
-        self.pending_wrap = false;
+        self.pending_wrap = reflow_pending;
         self.last_cell = None;
         let old_tabs = std::mem::take(&mut self.tabs);
         self.tabs = (0..cols)

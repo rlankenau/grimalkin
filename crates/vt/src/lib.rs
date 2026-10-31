@@ -7,6 +7,7 @@
 mod cell;
 mod grid;
 mod perform;
+mod reflow;
 mod term;
 mod util;
 
@@ -18,6 +19,8 @@ mod review_tests;
 mod limits_tests;
 #[cfg(test)]
 mod qa_tests;
+#[cfg(test)]
+mod reflow_tests;
 
 pub use cell::{
     default_palette_rgb, Cell, CellWidth, Color, Combining, Flags, LineMark, MarkKind, Row, Style, Underline,

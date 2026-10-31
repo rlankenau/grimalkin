@@ -7,13 +7,13 @@ use std::collections::VecDeque;
 /// screen is created with a scrollback limit of 0.
 #[derive(Debug, Clone)]
 pub struct Grid {
-    cols: usize,
-    lines: Vec<Row>,
-    scrollback: VecDeque<Row>,
-    scrollback_limit: usize,
+    pub(crate) cols: usize,
+    pub(crate) lines: Vec<Row>,
+    pub(crate) scrollback: VecDeque<Row>,
+    pub(crate) scrollback_limit: usize,
     /// Number of lines that have ever scrolled off the top of the screen
     /// (whether or not they were kept in scrollback).
-    scrolled_total: u64,
+    pub(crate) scrolled_total: u64,
 }
 
 impl Grid {

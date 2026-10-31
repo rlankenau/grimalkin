@@ -75,6 +75,16 @@ and tested independently. The gui crate glues vt and graphics together (see
   increasing line space: `scrolled_lines_total + cursor.row`; separate counter
   for alt screen that resets when alt is entered), `display_offset() -> usize`
   (scrollback view offset), `abs_row_of_visible_row(r) -> u64`, `size()`.
+* **Reflow** (`reflow.rs`): a column change on the primary screen joins each
+  soft-wrapped logical line (`Row::wrapped`) across scrollback + visible rows,
+  trims trailing default blanks, and re-splits it at the new width (wide chars
+  are never split: a `WRAP_PAD` blank is left at the row end, like the writer).
+  The cursor and DECSC position follow their character; the scrollback limit is
+  honoured; cost is O(cells). The alternate screen only truncates/extends.
+  Absolute rows are *not* stable across a reflow (`cursor_abs_row` stays
+  monotonic), so vt queues `TermEvent::Reflowed`: the gui clears the selection
+  and graphics_glue drops the main screen's image placements (image data is
+  kept, as kitty does). Row-only resizes keep the old top-anchored behaviour.
 * Unit tests: a test helper feeds bytes and snapshot-compares the grid as text.
   Test every CSI listed above, alt screen, scrollback, wrapping of wide chars at
   the right edge, SGR 38;2, kitty keyboard stack push/pop, OSC 8.
