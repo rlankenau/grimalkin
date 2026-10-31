@@ -309,6 +309,23 @@ through a browser** (so Mark of the Web is set):
 - [ ] Smart App Control or an enterprise WDAC policy, if available, runs the signed build.
 - [ ] Record release tag, SHA-256 hashes, certificate subject and expiry, date and the results.
 
+### Install with winget
+
+> **Pending first submission.** The package is not in the winget repository yet;
+> until it is, the command below fails with "No package found". Use the
+> installer from [Releases](https://github.com/rlankenau/grimalkin/releases).
+
+```
+winget install rlankenau.grimalkin
+```
+
+winget runs the installer silently (`/VERYSILENT /NORESTART /SUPPRESSMSGBOXES`),
+per user by default, and picks the x64 or the native ARM64 build for your
+machine. The optional PATH and Explorer context-menu tasks are off in a silent
+install; pass them with `winget install rlankenau.grimalkin --custom '/TASKS="addtopath,contextmenu"'`.
+`winget upgrade rlankenau.grimalkin` upgrades in place. The manifests are
+generated from the release assets, see [Packaging](#packaging).
+
 ## Installing on macOS
 
 Download `grimalkin-<version>-macos-arm64.dmg` (Apple Silicon) or
@@ -341,6 +358,37 @@ xcrun notarytool store-credentials grimalkin --apple-id you@example.com \
     --team-id TEAMID --password <app-specific-password>
 GRIMALKIN_NOTARY_PROFILE=grimalkin scripts/make-app-bundle.sh
 ```
+
+### Install with Homebrew
+
+> **Pending first submission.** The tap `rlankenau/homebrew-grimalkin` has to be
+> created and filled once by the maintainer (see [Packaging](#packaging)); until
+> then use the dmg above.
+
+```
+brew tap rlankenau/grimalkin
+brew install --cask grimalkin
+```
+
+This installs the same signed and notarized `grimalkin.app` as the dmg into
+`/Applications` and links the command-line entry point as `grimalkin` into
+Homebrew's `bin`. `brew upgrade --cask grimalkin` updates it and
+`brew uninstall --cask --zap grimalkin` also removes its config, cache and data.
+
+### Install with MacPorts
+
+> **Pending first submission, and the Portfile is unverified.** It has not been
+> built with MacPorts yet and is not in macports-ports; see
+> [Packaging](#packaging).
+
+```
+sudo port install grimalkin
+```
+
+This builds from source with the `cargo` port group, installs
+`grimalkin.app` into `/Applications/MacPorts` and a `grimalkin` command into
+`${prefix}/bin`. The app is ad-hoc signed (a MacPorts build is not Developer ID
+signed or notarized, and is not quarantined).
 
 ### Release signing setup
 
@@ -647,6 +695,93 @@ and Linux the window icon is also set at runtime from the 64 px PNG
 - `crates/gui` (`grimalkin`): the binary: winit + wgpu renderer, input, config
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for details. Tests: `cargo test --workspace`.
+
+## Packaging
+
+For maintainers. Package-manager metadata lives in `packaging/`; the
+`Packaging` workflow (`.github/workflows/packaging.yml`) regenerates it for every
+release. It runs after the CI workflow finishes for a pushed `v*` tag (not on
+`release: published`: the release is created by CI's own token, which cannot
+trigger other workflows, and it would fire before the installers are attached),
+on demand (Actions, Packaging, Run workflow, with a tag), and as a dry run on pull
+requests that touch `packaging/`. Pre-release tags (`v1.0.0-rc3`) are built and
+validated but never submitted automatically: winget and Homebrew have no
+pre-release channel.
+
+| Channel | Files | Automated per release | First time, manual |
+| --- | --- | --- | --- |
+| winget | `packaging/winget/` (templates, `update-manifest.py`) | manifests from the release installers, `winget validate`, artifact, `wingetcreate update --submit` if `WINGET_GITHUB_TOKEN` is set | submit the package to `microsoft/winget-pkgs` |
+| Homebrew tap | `packaging/homebrew/` (`grimalkin.rb`, `update-cask.sh`) | cask version and sha256 from the release dmgs, pushed to the tap if `HOMEBREW_TAP_TOKEN` is set, else artifact | create the tap repository |
+| MacPorts | `packaging/macports/` (`Portfile`, `gen-crates.py`) | checks the crate list against `Cargo.lock`, Portfile artifact with the version bumped | PR to `macports/macports-ports` |
+
+Repository secrets (Settings, Secrets and variables, Actions), all optional:
+
+| Secret | What it is |
+| --- | --- |
+| `WINGET_GITHUB_TOKEN` | A personal access token (classic, `public_repo`) of the account that owns your fork of `microsoft/winget-pkgs`. `wingetcreate` pushes a branch to that fork and opens the pull request. |
+| `HOMEBREW_TAP_TOKEN` | A token with write access to `rlankenau/homebrew-grimalkin` (fine-grained PAT, Contents: read and write on that one repository). |
+
+Without a secret the job still builds and validates the files, uploads them as an
+artifact and prints the manual command.
+
+**winget, first submission (manual).** `wingetcreate update` can only update a
+package that already exists in `microsoft/winget-pkgs`, so the first version is
+submitted by hand from a Windows machine, with a stable (non pre-release) tag:
+
+```
+wingetcreate new https://github.com/rlankenau/grimalkin/releases/download/vX.Y.Z/grimalkin-setup-x64.exe `
+                 https://github.com/rlankenau/grimalkin/releases/download/vX.Y.Z/grimalkin-setup-arm64.exe
+```
+
+It prompts for the missing fields and offers to open the pull request. You can
+instead generate the manifests with
+`python3 packaging/winget/update-manifest.py vX.Y.Z`, check them with
+`winget validate --manifest packaging/winget/manifests/X.Y.Z`, and copy them into
+a fork of `microsoft/winget-pkgs` under `manifests/r/rlankenau/grimalkin/X.Y.Z/`.
+`winget install --manifest <dir>` tests them locally (once, in an administrator
+shell: `winget settings --enable LocalManifestFiles`). Unsigned installers are
+accepted, but they get more scrutiny in review (SmartScreen and antivirus checks
+on the installer URL) and users get SmartScreen warnings, so get the
+[Windows release signing](#windows-release-signing) pipeline working first and
+submit a signed release. The package identifier is `rlankenau.grimalkin`; the
+`ProductCode` in the installer manifest is the Inno Setup `AppId` plus `_is1`
+and must not change. After the package is merged, set `WINGET_GITHUB_TOKEN` and
+later releases are submitted by the workflow. `update-manifest.py` leaves an
+architecture out of the manifest when the release has no installer for it
+(`v1.0.0-rc3` predates the ARM64 installer).
+
+**Homebrew tap.** Create the public repository `rlankenau/homebrew-grimalkin`
+(the `homebrew-` prefix is what makes `brew tap rlankenau/grimalkin` work), put
+`packaging/homebrew/grimalkin.rb` in it as `Casks/grimalkin.rb`, and add
+`HOMEBREW_TAP_TOKEN`. Releases then update the cask by themselves; by hand, run
+`packaging/homebrew/update-cask.sh vX.Y.Z path/to/Casks/grimalkin.rb`. The
+cask is checked with `brew style --cask` (clean) from a temporary tap; run
+`brew audit --cask --new rlankenau/grimalkin/grimalkin` from the real tap too.
+The main `homebrew-cask` repository is not a realistic target yet: it only
+accepts notable software (about 75 GitHub stars, or 30 forks or 30 watchers, for
+self-submitted apps; check <https://docs.brew.sh/Acceptable-Casks>) and
+requires notarized apps. Revisit when the project is better known.
+
+**MacPorts.** `packaging/macports/Portfile` is a draft in the `aqua shells`
+categories (as `alacritty` and `kitty` have) using the `cargo` 1.0 port group. It
+builds only the `grimalkin` crate, wraps the binary with
+`scripts/make-app-bundle.sh --binary ... --no-dmg --no-notarize` (ad-hoc
+signing) and installs `grimalkin.app`, a `${prefix}/bin/grimalkin` symlink and
+the licenses. Its `test.run` executes `grimalkin --list-themes`. **It has not been
+run through `port lint` or `port install` yet** (the author's machine has no
+MacPorts); treat it as unverified until someone has done
+`sudo port lint --nitpick` and `sudo port -vst install` on a Mac with a
+checkout of macports-ports. For a release: set the version in `github.setup`,
+fix the `checksums` (`sudo port checksum grimalkin` prints the expected values),
+and regenerate the crate list when `Cargo.lock` changes (CI checks it):
+
+```
+packaging/macports/gen-crates.py --update packaging/macports/Portfile
+```
+
+Submit it as a pull request to <https://github.com/macports/macports-ports>
+adding `aqua/grimalkin/Portfile`; the reviewers will want a stable (non rc)
+version.
 
 ## License
 
