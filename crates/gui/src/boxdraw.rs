@@ -2,8 +2,9 @@
 //! (U+2500-257F).
 //!
 //! Drawing these as rectangles instead of font glyphs keeps lines joined across
-//! cells whatever the font or `line_height`. Dashed lines are drawn solid and
-//! rounded corners as square ones. Double lines and diagonals (U+2550-256C,
+//! cells whatever the font or `line_height`. Dashed lines are drawn as
+//! separate dashes and rounded corners (U+256D-2570) as anti-aliased quarter
+//! arcs built from per-pixel alpha rects. Double lines and diagonals (U+2550-256C,
 //! U+2571-2573) return `false` from [`draw`] and fall back to the font.
 
 use crate::renderer::{rect, RectInst};
@@ -80,6 +81,74 @@ pub fn draw(ch: char, x: f32, y: f32, cw: f32, chh: f32, color: Rgb, out: &mut V
                 }
             }
             _ => return false,
+        }
+        return true;
+    }
+
+    let light = ((w as f32 / 8.0).round() as i32).max(1);
+    // Rounded corners: quarter ellipse centred on the cell corner opposite the
+    // two arms, passing through the midpoints of the two arm edges.
+    if (0x256D..=0x2570).contains(&code) {
+        let (right, down) = match code {
+            0x256D => (true, true),
+            0x256E => (false, true),
+            0x256F => (false, false),
+            _ => (true, false),
+        };
+        let (rx, ry) = (w as f32 / 2.0, h as f32 / 2.0);
+        let (cx, cy) = (if right { w as f32 } else { 0.0 }, if down { h as f32 } else { 0.0 });
+        const N: i32 = 4;
+        for py in 0..h {
+            for px in 0..w {
+                let mut hit = 0;
+                for sy in 0..N {
+                    for sx in 0..N {
+                        let dx = px as f32 + (sx as f32 + 0.5) / N as f32 - cx;
+                        let dy = py as f32 + (sy as f32 + 0.5) / N as f32 - cy;
+                        let f = ((dx / rx).powi(2) + (dy / ry).powi(2)).sqrt();
+                        if f < 1e-6 {
+                            continue;
+                        }
+                        let g = ((dx / (rx * rx)).powi(2) + (dy / (ry * ry)).powi(2)).sqrt() / f;
+                        if ((f - 1.0) / g).abs() <= light as f32 / 2.0 {
+                            hit += 1;
+                        }
+                    }
+                }
+                if hit > 0 {
+                    push(px, py, 1, 1, (hit * 255 / (N * N)) as u8);
+                }
+            }
+        }
+        return true;
+    }
+    // Dashed lines: (horizontal, segments, heavy).
+    let dash = match code {
+        0x2504..=0x250B => {
+            let i = code - 0x2504;
+            Some((i % 4 < 2, if i < 4 { 3 } else { 4 }, i % 2 == 1))
+        }
+        0x254C..=0x254F => {
+            let i = code - 0x254C;
+            Some((i < 2, 2, i % 2 == 1))
+        }
+        _ => None,
+    };
+    if let Some((horiz, n, heavy)) = dash {
+        let t = if heavy { light * 2 } else { light };
+        let len = if horiz { w } else { h };
+        let cross = if horiz { h } else { w };
+        let off = (cross - t) / 2;
+        let period = len as f32 / n as f32;
+        let gap = (period / 3.0).max(1.0);
+        for i in 0..n {
+            let a = (period * i as f32 + gap / 2.0).round() as i32;
+            let b = (period * (i + 1) as f32 - gap / 2.0).round() as i32;
+            if horiz {
+                push(a, off, b - a, t, 255);
+            } else {
+                push(off, a, t, b - a, 255);
+            }
         }
         return true;
     }
@@ -168,7 +237,6 @@ pub fn draw(ch: char, x: f32, y: f32, cw: f32, chh: f32, color: Rgb, out: &mut V
         0x257F => (0, 0, 2, 1),
         _ => return false,
     };
-    let light = ((w as f32 / 8.0).round() as i32).max(1);
     let th = |wt: u8| match wt {
         1 => light,
         2 => light * 2,
@@ -201,4 +269,68 @@ pub fn draw(ch: char, x: f32, y: f32, cw: f32, chh: f32, color: Rgb, out: &mut V
         push(vx + (vth - t) / 2, start, t, h - start, 255);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: usize = 16;
+    const H: usize = 32;
+
+    fn raster(ch: char) -> Vec<u8> {
+        let mut out = Vec::new();
+        assert!(draw(ch, 0.0, 0.0, W as f32, H as f32, (255, 255, 255), &mut out));
+        let mut buf = vec![0u8; W * H];
+        for r in out {
+            let j = rect_parts(&r);
+            for y in j.1..j.1 + j.3 {
+                for x in j.0..j.0 + j.2 {
+                    let p = &mut buf[y * W + x];
+                    *p = (*p).max(j.4);
+                }
+            }
+        }
+        buf
+    }
+
+    // RectInst fields are private to renderer; read them through bytes.
+    fn rect_parts(r: &RectInst) -> (usize, usize, usize, usize, u8) {
+        let b: &[u8] = bytemuck::bytes_of(r);
+        let f = |i: usize| f32::from_ne_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        (f(0) as usize, f(1) as usize, f(2) as usize, f(3) as usize, b[16 + 3])
+    }
+
+    #[test]
+    fn rounded_corners_are_arcs() {
+        // (char, corner pixel, arc midpoint) ; midpoint at 45 degrees of the ellipse.
+        let m = |right: bool, down: bool| {
+            let k = std::f32::consts::FRAC_1_SQRT_2;
+            let x = if right { W as f32 - W as f32 / 2.0 * k } else { W as f32 / 2.0 * k };
+            let y = if down { H as f32 - H as f32 / 2.0 * k } else { H as f32 / 2.0 * k };
+            (x as usize, y as usize)
+        };
+        for (ch, right, down, corner) in [
+            ('\u{256D}', true, true, (0, 0)),
+            ('\u{256E}', false, true, (W - 1, 0)),
+            ('\u{256F}', false, false, (W - 1, H - 1)),
+            ('\u{2570}', true, false, (0, H - 1)),
+        ] {
+            let b = raster(ch);
+            // Corner of the cell opposite the arc centre is empty.
+            assert_eq!(b[corner.1 * W + corner.0], 0, "{ch} corner");
+            let (x, y) = m(right, down);
+            assert!(b[y * W + x] > 128, "{ch} midpoint {}", b[y * W + x]);
+        }
+    }
+
+    #[test]
+    fn dashes_have_gaps() {
+        let b = raster('\u{2504}');
+        let row: Vec<u8> = (0..W).map(|x| b[(H / 2) * W + x]).collect();
+        assert!(row.contains(&0) && row.contains(&255));
+        let v = raster('\u{254E}');
+        let col: Vec<u8> = (0..H).map(|y| v[y * W + W / 2]).collect();
+        assert!(col.contains(&0) && col.contains(&255));
+    }
 }

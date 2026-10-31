@@ -139,6 +139,11 @@ Source: "..\..\dist\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
 
+[UninstallDelete]
+; Font index cache only; config and skins in %APPDATA%\grimalkin are kept.
+Type: files; Name: "{localappdata}\grimalkin\fonts.cache"
+Type: dirifempty; Name: "{localappdata}\grimalkin"
+
 [Icons]
 ; WorkingDir: start in the user's profile rather than the install folder.
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{%USERPROFILE}"

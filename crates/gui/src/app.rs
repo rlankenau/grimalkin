@@ -981,6 +981,7 @@ impl Running {
         }
 
         let font_changed = new.font.family != old.font.family
+            || new.font.fallback != old.font.fallback
             || new.font.line_height != old.font.line_height
             || new.font.size != old.font.size;
         let padding_changed = new.window.padding != old.window.padding;
@@ -988,7 +989,7 @@ impl Running {
             // A zoomed window keeps its zoom unless the configured size changed.
             let pt = if new.font.size != old.font.size { new.font.size } else { self.font_pt };
             self.font_pt = pt;
-            self.renderer.set_font(&new.font.family, pt, new.font.line_height);
+            self.renderer.set_font(&new.font.effective_families(), pt, new.font.line_height);
         }
         if padding_changed {
             self.renderer.set_scale_factor(crate::debug_script::effective_scale(self.window.scale_factor()), new.window.padding);

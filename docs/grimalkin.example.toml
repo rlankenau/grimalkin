@@ -39,10 +39,18 @@ theme = "default"
 [font]
 # Families in fallback order. The first installed one defines the cell size.
 # A single string also works: family = "JetBrains Mono"
-# Defaults: macOS ["Menlo", "SF Mono", "Monaco"], Windows ["Cascadia Mono",
-# "Consolas", "Courier New"], Linux ["DejaVu Sans Mono", ...]. Emoji, CJK and
-# symbols fall back to system fonts automatically.
-family = ["Menlo", "SF Mono", "Monaco"]
+# Defaults per OS (used when this is left unset): Windows ["Cascadia Mono",
+# "Consolas", "Courier New"], macOS ["Menlo", "SF Mono", "Monaco"], Linux
+# ["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono"]. Uncomment one:
+# family = ["Cascadia Mono", "Consolas"]       # Windows
+# family = ["Menlo", "SF Mono"]                # macOS
+# family = ["DejaVu Sans Mono"]                # Linux
+# Extra families tried after `family` and before the system fallback, in
+# order. The default is a CJK list per OS; each script group is served by one
+# family so kanji and kana match (Windows ["Yu Gothic UI", "Microsoft YaHei",
+# "Malgun Gothic"], macOS ["PingFang SC", "Hiragino Sans"], Linux
+# ["Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK KR"]).
+# fallback = ["Microsoft YaHei", "Malgun Gothic"]
 # Size in points.
 size = 13.0
 # Multiplier for the natural line height (ascent + descent).
