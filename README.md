@@ -66,7 +66,7 @@ want Program Files instead. The installer:
 - installs `grimalkin.exe` and `grimalkin.com` (the console launcher, see
   [Windows: two files](#windows-two-files)) together, plus Microsoft's ConPTY
   redistributable (`conpty.dll` and `OpenConsole.exe`) beside them. The bundled
-  ConPTY is what makes the kitty graphics protocol work on Windows 10 (see
+  ConPTY is what makes the kitty graphics protocol work on Windows 10 and 11 (see
   [Windows: kitty graphics need the bundled ConPTY](#windows-kitty-graphics-need-the-bundled-conpty));
   nothing extra to download
 - adds a Start Menu shortcut, and optionally a desktop icon
