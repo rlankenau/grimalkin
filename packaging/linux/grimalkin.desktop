@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Grimalkin
+GenericName=Terminal Emulator
+Comment=GPU-accelerated terminal emulator with kitty graphics protocol support
+Exec=grimalkin
+Icon=grimalkin
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;cmd;kitty;
+StartupNotify=true
+StartupWMClass=grimalkin
