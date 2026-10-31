@@ -13,7 +13,14 @@
 //!
 //! The window only redraws on its own events (input, config changes, jobs
 //! finishing), so an idle Preferences window costs nothing.
+//!
+//! Accessibility: the window owns an `accesskit_winit::Adapter` (made before
+//! the window is shown, as the platform adapters require), so screen readers
+//! see the controls through UI Automation (Windows), NSAccessibility (macOS)
+//! and AT-SPI (Linux). egui only builds the tree while a screen reader is
+//! attached; see `a11y` for the keyboard model and the tree dump.
 
+mod a11y;
 mod model;
 mod state;
 mod ui;
@@ -57,6 +64,9 @@ pub struct PreferencesWindow {
     prefs: Prefs,
     mods: ModifiersState,
     shown: bool,
+    /// `GRIMALKIN_PREFS_DUMP_TREE`: where to write the accessibility tree, and
+    /// the text last written there.
+    dump: Option<(PathBuf, String)>,
     next_repaint: Option<Instant>,
 }
 
@@ -85,7 +95,14 @@ impl PreferencesWindow {
                 }
             });
         }
-        let state = egui_winit::State::new(ctx.clone(), ViewportId::ROOT, window.as_ref(), Some(window.scale_factor() as f32), window.theme(), None);
+        let mut state = egui_winit::State::new(ctx.clone(), ViewportId::ROOT, window.as_ref(), Some(window.scale_factor() as f32), window.theme(), None);
+        // Before the window is shown. The adapter stays dormant (egui builds no
+        // tree) until a screen reader asks for it.
+        state.init_accesskit(event_loop, window.as_ref(), args.proxy.clone());
+        let dump = a11y::dump_path().map(|p| (p, String::new()));
+        if dump.is_some() {
+            ctx.enable_accesskit();
+        }
 
         let mut config = WgpuConfiguration::default();
         if let egui_wgpu::WgpuSetup::CreateNew(c) = &mut config.wgpu_setup {
@@ -106,7 +123,7 @@ impl PreferencesWindow {
         let repaint = Arc::new(move || w.request_redraw());
         let prefs = Prefs::new(args.config_path, dispatch, applied, repaint);
 
-        let mut win = PreferencesWindow { window, ctx, state, painter, prefs, mods: ModifiersState::empty(), shown: false, next_repaint: None };
+        let mut win = PreferencesWindow { window, ctx, state, painter, prefs, mods: ModifiersState::empty(), shown: false, dump, next_repaint: None };
         win.redraw(); // first frame before the window appears: no white flash
         win.window.set_visible(true);
         win.window.focus_window();
@@ -121,9 +138,22 @@ impl PreferencesWindow {
             return;
         }
         let now = Instant::now();
-        let raw = self.state.take_egui_input(&self.window);
+        let mut raw = self.state.take_egui_input(&self.window);
+        let step = a11y::take_section_keys(&mut raw.events);
+        if step != 0 {
+            self.prefs.section = self.prefs.section.cycle(step);
+        }
         let prefs = &mut self.prefs;
         let full = self.ctx.run_ui(raw, |ui| ui::show(ui, prefs));
+        if let (Some((path, last)), Some(update)) = (self.dump.as_mut(), full.platform_output.accesskit_update.as_ref()) {
+            let text = a11y::dump(update);
+            if text != *last {
+                if let Err(e) = std::fs::write(&*path, &text) {
+                    log::warn!("cannot write {}: {e}", path.display());
+                }
+                *last = text;
+            }
+        }
         self.state.handle_platform_output(&self.window, full.platform_output);
 
         // A drag in progress holds writes back (they go out ~10 times a second
@@ -262,6 +292,23 @@ impl SecondaryWindow for PreferencesWindow {
         if self.prefs.restart_notice(text) {
             self.window.request_redraw();
         }
+    }
+
+    fn accessibility_event(&mut self, event: egui_winit::accesskit_winit::WindowEvent) {
+        use egui_winit::accesskit_winit::WindowEvent as Ev;
+        match event {
+            // A screen reader attached: from now on every frame carries the tree.
+            Ev::InitialTreeRequested => self.ctx.enable_accesskit(),
+            Ev::ActionRequested(request) => self.state.on_accesskit_action_request(request),
+            Ev::AccessibilityDeactivated => {
+                // Keep building the tree when the text dump wants it.
+                if self.dump.is_none() {
+                    self.ctx.disable_accesskit();
+                }
+                return;
+            }
+        }
+        self.window.request_redraw();
     }
 
     fn window(&self) -> &Window {
