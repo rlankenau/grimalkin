@@ -469,6 +469,10 @@ fn advanced(ui: &mut Ui, p: &mut Prefs) {
             ui.spinner();
         }
     });
+    ui.horizontal(|ui| {
+        ui.add_enabled(!busy, TextEdit::singleline(&mut p.text.install_name).desired_width(CONTROL_WIDTH + 40.0).hint_text("Name (optional)"));
+    });
+    hint(ui, "Raw museum links (r2.webampskins.org/skins/<md5>.wsz) install under their hash unless you give a name. Names are lower-cased.");
     ui.checkbox(&mut p.overwrite_skin, "Overwrite if already installed");
     if let Some(value) = p.last_installed.clone() {
         if ui.button("Use the installed skin").clicked() {
