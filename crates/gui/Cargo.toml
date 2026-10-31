@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Grimalkin: GPU-accelerated terminal emulator"
+description = "GPU-accelerated terminal emulator with kitty graphics support"
 
 [[bin]]
 name = "grimalkin"
@@ -81,7 +81,7 @@ winresource = "0.1"
 name = "grimalkin"
 maintainer = "Alice Lankenau <rlankenau@gmail.com>"
 copyright = "2025-2026, grimalkin contributors"
-license-file = ["../../LICENSE", "0"]
+license-file = ["../../packaging/linux/copyright", "0"]
 extended-description = """\
 Grimalkin is a GPU-accelerated terminal emulator with kitty graphics protocol \
 support, window skins and color themes. It renders with Vulkan and runs on \
@@ -104,8 +104,7 @@ assets = [
     ["../../assets/icon/grimalkin-512.png", "usr/share/icons/hicolor/512x512/apps/grimalkin.png", "644"],
     ["../../README.md", "usr/share/doc/grimalkin/README.md", "644"],
     ["../../docs/grimalkin.example.toml", "usr/share/doc/grimalkin/grimalkin.example.toml", "644"],
-    ["../../LICENSE-MIT", "usr/share/doc/grimalkin/LICENSE-MIT", "644"],
-    ["../../LICENSE-APACHE", "usr/share/doc/grimalkin/LICENSE-APACHE", "644"],
+    ["../../packaging/linux/grimalkin.lintian-overrides", "usr/share/lintian/overrides/grimalkin", "644"],
 ]
 
 [package.metadata.generate-rpm]
