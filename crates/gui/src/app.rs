@@ -845,6 +845,14 @@ impl Running {
                 TermEvent::CursorShape(_) => need_redraw = true,
                 // Handled by `Graphics` (graphics_glue.rs) as the bytes are fed.
                 TermEvent::GraphicsCommand(_) => {}
+                // Column change rewrapped the primary screen: absolute rows
+                // no longer name the same lines, so the selection goes (the
+                // graphics glue already dropped the placements).
+                TermEvent::Reflowed => {
+                    self.selection.clear();
+                    self.renderer.invalidate();
+                    need_redraw = true;
+                }
             }
         }
         // The program wrote over (or switched away from) the selected text.
@@ -917,6 +925,9 @@ impl Running {
         self.term.set_cell_pixel_size(cw, ch);
         if self.term.size() != (cols, rows) {
             self.term.resize(cols, rows);
+            // A reflow invalidates image placements: drop them now rather
+            // than when the next pty output happens to arrive.
+            self.gfx.process_events(&mut self.term);
             self.selection.clear();
             self.renderer.invalidate();
         }

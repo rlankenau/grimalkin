@@ -369,13 +369,14 @@ fn cells_stay_compact() {
 }
 
 #[test]
-fn column_resize_repairs_a_wide_char_cut_in_half() {
+fn column_resize_moves_a_wide_char_that_no_longer_fits() {
     let mut t = Terminal::new(6, 2, 10);
     feed(&mut t, "ab\u{4e2d}\u{4e2d}");
     // Cells: a b W S W S; shrinking to 5 cuts the second wide char.
     t.resize(5, 2);
     assert_eq!(t.grid().cell(0, 4).width, CellWidth::Single);
-    assert_eq!(t.snapshot_lines()[0], "ab\u{4e2d}");
+    assert_eq!(t.snapshot_lines()[..2], ["ab\u{4e2d}", "\u{4e2d}"]);
     t.resize(8, 2);
+    assert_eq!(t.snapshot_lines()[0], "ab\u{4e2d}\u{4e2d}");
     assert_eq!(t.grid().row(0).cells.len(), 8);
 }

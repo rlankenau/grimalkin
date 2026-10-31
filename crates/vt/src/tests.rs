@@ -1116,14 +1116,15 @@ fn move_cursor_rel_wraps_and_scrolls() {
 // ---------------------------------------------------------------- resize
 
 #[test]
-fn resize_columns_truncates_and_extends() {
+fn resize_columns_rewraps_and_extends() {
     let mut t = term(8, 3);
     feed(&mut t, "abcdefgh");
     t.resize(4, 3);
-    assert_eq!(snap(&t)[0], "abcd");
-    assert_eq!(t.cursor().col, 3);
+    assert_eq!(snap(&t)[..2], ["abcd", "efgh"]);
+    assert_eq!(t.cursor(), Cursor { col: 3, row: 1 });
     t.resize(10, 3);
-    assert_eq!(snap(&t)[0], "abcd");
+    assert_eq!(snap(&t)[0], "abcdefgh");
+    assert_eq!(t.cursor(), Cursor { col: 8, row: 0 });
     assert_eq!(t.size(), (10, 3));
     assert_eq!(t.grid().row(0).len(), 10);
 }
