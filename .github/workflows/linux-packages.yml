@@ -140,7 +140,7 @@ jobs:
           grimalkin --version
           grimalkin --list-themes
           # Children get TERM=xterm-kitty because kitty-terminfo is installed.
-          ls /usr/share/terminfo/x/xterm-kitty /lib/terminfo/x/xterm-kitty 2>/dev/null
+          dpkg -L kitty-terminfo | grep xterm-kitty
       - name: Smoke test, headless render (Xvfb + lavapipe)
         env:
           RUST_LOG: info
