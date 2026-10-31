@@ -202,6 +202,45 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # ---- gcat test tool (kitty graphics) ---------------------------------------
+      # A test tool for people without a Rust toolchain. It is deliberately
+      # UNSIGNED and is NOT part of dist/, so the signing job (which only
+      # downloads dist-<arch>) never sees it and it is never a release asset.
+      - name: Build gcat (kitty graphics test tool)
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p grimalkin-graphics --example gcat
+          if ($LASTEXITCODE -ne 0) { throw "cargo build gcat failed: $LASTEXITCODE" }
+      - name: Stage gcat
+        shell: bash
+        run: |
+          mkdir -p dist-tools/${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/examples/gcat.exe dist-tools/${{ matrix.arch }}/gcat.exe
+          cat > dist-tools/${{ matrix.arch }}/README-tools.txt <<'TXT'
+          gcat - kitty graphics protocol test tool for grimalkin (${{ matrix.arch }})
+          UNSIGNED test tool; not part of the grimalkin release.
+
+          Run it inside a grimalkin window:
+            gcat.exe --demo                   terminal self-test (colours, text styles, images)
+            gcat.exe image.png                display an image
+            gcat.exe image.png --place COLSxROWS@XxY   scale to COLS x ROWS cells at column X, row Y (0-based)
+            gcat.exe image.png --zlib         compress the payload with zlib (o=z)
+            gcat.exe image.png --png          send the file's PNG bytes as-is (f=100)
+            gcat.exe --delete                 delete all images
+            gcat.exe --help                   all options
+
+          On Windows gcat automatically uses the ConPTY cursor workaround
+          (--no-conpty turns it off).
+          TXT
+      - name: Check gcat machine type
+        run: scripts/windows/check-pe-machine.ps1 -Dir dist-tools/${{ matrix.arch }} -Arch ${{ matrix.arch }} -Files gcat.exe
+      - name: Upload gcat tools (unsigned)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-tools-${{ matrix.arch }}
+          path: dist-tools/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14
+
       # ---- unsigned packaging (this run does not sign) ---------------------------
       # The signing job packages signed runs; everything below only runs when
       # signing is off, and produces "-unsigned" names so an unsigned file can
