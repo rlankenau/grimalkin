@@ -6,11 +6,19 @@ on:
     tags: ['v*']
   pull_request:
 
+# Read-only by default. Jobs that publish release assets ask for contents: write
+# themselves; only the Windows signing job gets id-token: write.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # The only repository that may sign Windows releases.
+  UPSTREAM_REPOSITORY: rlankenau/grimalkin
+  # Microsoft.Windows.Console.ConPTY (Windows Terminal project, MIT). The hash
+  # pins the exact .nupkg downloaded from api.nuget.org.
+  CONPTY_VERSION: 1.25.260930003
+  CONPTY_SHA256: 02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee
 
 jobs:
   test:
@@ -31,18 +39,96 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # Builds the Windows release binaries for each architecture, bundles the
-  # architecture-matching ConPTY redistributable and produces the Inno Setup
-  # installer and the portable zip. Also uploads the plain exe+com pair as
-  # grimalkin-windows-<arch>.
+  # ---------------------------------------------------------------------------
+  # Windows release pipeline.
   #
-  # x64 builds on windows-latest. ARM64 builds natively on windows-11-arm (a
-  # free hosted runner for public repositories), so the ARM64 test suite and the
-  # installer smoke test run on real ARM64 Windows instead of cross-compiling.
-  windows-installer:
-    name: windows installer (${{ matrix.arch }})
+  #   windows-gate     decides, once, whether this run signs (see below)
+  #   windows-build    per architecture: build + stage dist. NO cloud permissions.
+  #                    Unsigned runs also package here (installer + zip).
+  #   windows-sign     ONE job, the only one with `id-token: write`: signs both
+  #                    architectures through AWS KMS, packages, verifies
+  #   windows-smoke    per architecture, on a native runner: install / uninstall
+  #                    the installer that will be released
+  #   windows-release  attaches the verified assets to the GitHub release
+  #
+  # Signing happens only when ALL of these hold: the repository variable
+  # WINDOWS_SIGNING_ENABLED is "true", the event is a push of a v* tag on the
+  # upstream repository, and the tagged commit is on trunk. Once enabled, a
+  # release tag fails closed: any missing configuration, signing or verification
+  # error means nothing is uploaded. Every other run (PRs, forks, trunk pushes,
+  # signing disabled) builds exactly as before; its installer and zip are named
+  # "...-unsigned" and carry an UNSIGNED.txt. Setup: README, "Windows release
+  # signing"; AWS resources: infra/aws/.
+  # ---------------------------------------------------------------------------
+  windows-gate:
+    name: windows signing gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sign: ${{ steps.gate.outputs.sign }}
+      # "" for a signed build, "-unsigned" otherwise (artifact / file names).
+      suffix: ${{ steps.gate.outputs.suffix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Decide whether this run signs
+        id: gate
+        env:
+          SIGNING_ENABLED: ${{ vars.WINDOWS_SIGNING_ENABLED }}
+          ROLE_ARN: ${{ vars.AWS_SIGNING_ROLE_ARN }}
+          AWS_REGION_VAR: ${{ vars.AWS_REGION }}
+          PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+        run: |
+          set -euo pipefail
+          sign=false
+          if [[ "$SIGNING_ENABLED" != "true" ]]; then
+            echo "::notice::Windows signing is off (repository variable WINDOWS_SIGNING_ENABLED is not 'true'): this build is UNSIGNED"
+          elif [[ "$GITHUB_REPOSITORY" != "$UPSTREAM_REPOSITORY" || "$GITHUB_EVENT_NAME" != "push" || "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::notice::Signing is enabled but only release tags (v*) pushed to $UPSTREAM_REPOSITORY are signed: this build is UNSIGNED"
+          else
+            # A real release: from here on every problem is an error, never a
+            # silent fall back to unsigned.
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/trunk; then
+              echo "::error::$GITHUB_REF points at $GITHUB_SHA, which is not on trunk; refusing to sign"
+              exit 1
+            fi
+            for name in ROLE_ARN AWS_REGION_VAR PUBLISHER; do
+              if [[ -z "${!name}" ]]; then
+                echo "::error::signing is enabled but a repository variable is missing (AWS_SIGNING_ROLE_ARN, AWS_REGION, WINDOWS_SIGNING_PUBLISHER); see README, Windows release signing"
+                exit 1
+              fi
+            done
+            if ! [[ "$ROLE_ARN" =~ ^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$ ]]; then
+              echo "::error::AWS_SIGNING_ROLE_ARN is not an IAM role ARN"
+              exit 1
+            fi
+            if ! grep -q -- '-----BEGIN CERTIFICATE-----' installer/windows/codesign-chain.pem; then
+              echo "::error::installer/windows/codesign-chain.pem holds no certificate yet (still the placeholder)"
+              exit 1
+            fi
+            sign=true
+          fi
+          echo "sign=$sign" >> "$GITHUB_OUTPUT"
+          if [[ "$sign" == "true" ]]; then echo "suffix=" >> "$GITHUB_OUTPUT"; else echo "suffix=-unsigned" >> "$GITHUB_OUTPUT"; fi
+          echo "windows signing: $sign" >> "$GITHUB_STEP_SUMMARY"
+
+  # Builds the Windows binaries for each architecture and stages dist/ with the
+  # architecture-matching ConPTY redistributable. x64 builds on windows-latest.
+  # ARM64 builds natively on windows-11-arm (a free hosted runner for public
+  # repositories), so the ARM64 test suite and installer smoke test run on real
+  # ARM64 Windows instead of cross-compiling.
+  #
+  # This job runs untrusted build code (build.rs, proc macros) and therefore has
+  # no cloud permissions at all: read-only contents, no id-token.
+  windows-build:
+    name: windows build (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
-    needs: test
+    needs: [test, windows-gate]
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -50,43 +136,38 @@ jobs:
           - arch: x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            # Paths inside the ConPTY .nupkg for this architecture.
-            conpty_dll: runtimes/win-x64/native/conpty.dll
-            conpty_openconsole: build/native/runtimes/x64/OpenConsole.exe
           - arch: arm64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            conpty_dll: runtimes/win-arm64/native/conpty.dll
-            conpty_openconsole: build/native/runtimes/arm64/OpenConsole.exe
-    env:
-      # Microsoft.Windows.Console.ConPTY (Windows Terminal project, MIT). The
-      # hash pins the exact .nupkg downloaded from api.nuget.org.
-      CONPTY_VERSION: 1.25.260930003
-      CONPTY_SHA256: 02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee
+    defaults:
+      run:
+        shell: pwsh
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (pinned 2026-10-30)
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      # No build cache when the output will be signed: a restored cache must not
+      # influence what gets a signature.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: needs.windows-gate.outputs.sign != 'true'
         with:
           key: ${{ matrix.target }}
       # Always pass --target so the output lands in target/<triple>/release,
       # separate per architecture.
-      - run: cargo build --release --locked --target ${{ matrix.target }} -p grimalkin -p grimalkin-launcher
+      - name: Build
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p grimalkin -p grimalkin-launcher
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed: $LASTEXITCODE" }
       - name: Stage dist
         shell: bash
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/grimalkin.exe dist/grimalkin.exe
           cp target/${{ matrix.target }}/release/grimalkin-launcher.exe dist/grimalkin.com
-      - name: Upload plain exe and com
-        uses: actions/upload-artifact@v4
-        with:
-          name: grimalkin-windows-${{ matrix.arch }}
-          path: |
-            dist/grimalkin.exe
-            dist/grimalkin.com
       - name: Determine version
         id: version
         shell: bash
@@ -100,180 +181,364 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Version: $version"
       - name: Fetch ConPTY redistributable
-        shell: pwsh
-        env:
-          CONPTY_DLL_ENTRY: ${{ matrix.conpty_dll }}
-          CONPTY_OPENCONSOLE_ENTRY: ${{ matrix.conpty_openconsole }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $v = $env:CONPTY_VERSION
-          $pkg = "microsoft.windows.console.conpty.$v.nupkg"
-          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/$v/$pkg"
-          Invoke-WebRequest -Uri $url -OutFile $pkg
-          $actual = (Get-FileHash -Algorithm SHA256 $pkg).Hash.ToLowerInvariant()
-          if ($actual -ne $env:CONPTY_SHA256) {
-            throw "SHA256 mismatch for ${pkg}: expected $($env:CONPTY_SHA256), got $actual"
-          }
-          # A .nupkg is a zip. Extract the pair for THIS architecture next to
-          # grimalkin.exe. A missing entry fails the job: never fall back to
-          # another architecture's files.
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $wanted = [ordered]@{
-            $env:CONPTY_DLL_ENTRY         = 'conpty.dll'
-            $env:CONPTY_OPENCONSOLE_ENTRY = 'OpenConsole.exe'
-          }
-          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $pkg).Path)
-          try {
-            foreach ($name in $wanted.Keys) {
-              $entry = $zip.GetEntry($name)
-              if ($null -eq $entry) { throw "${{ matrix.arch }} asset $name not found in $pkg; refusing to ship another architecture under the ${{ matrix.arch }} label" }
-              if ($entry.Length -eq 0) { throw "$name is empty in $pkg" }
-              $dest = Join-Path (Resolve-Path dist).Path $wanted[$name]
-              [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
-            }
-          } finally { $zip.Dispose() }
+          ./scripts/windows/fetch-conpty.ps1 -Version $env:CONPTY_VERSION -Sha256 $env:CONPTY_SHA256 -Arch ${{ matrix.arch }} -Dest dist
           Copy-Item installer/windows/LICENSE-ConPTY.txt dist/
           Copy-Item README.md, LICENSE, LICENSE-MIT, LICENSE-APACHE dist/
           Get-ChildItem dist | Format-Table Name, Length
       - name: Check machine types (grimalkin.exe, grimalkin.com, conpty.dll, OpenConsole.exe)
-        shell: pwsh
         run: scripts/windows/check-pe-machine.ps1 -Dir dist -Arch ${{ matrix.arch }}
-      - name: Portable zip
-        shell: pwsh
-        run: Compress-Archive -Path dist/* -DestinationPath grimalkin-portable-${{ matrix.arch }}.zip
-      - name: Build installer
-        shell: pwsh
+      # The ConPTY pair must be byte-identical to the pinned NuGet package and
+      # keep Microsoft's own signature. (grimalkin never re-signs these.)
+      - name: Check the ConPTY pair against the package and its Microsoft signature
+        run: scripts/windows/check-conpty.ps1 -Dir dist -Arch ${{ matrix.arch }} -Version $env:CONPTY_VERSION -Sha256 $env:CONPTY_SHA256
+      - name: Test the signature verifier (mocked trust APIs)
+        run: scripts/windows/test-verify-signature.ps1
+      - name: Upload dist
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+      # ---- unsigned packaging (this run does not sign) ---------------------------
+      # The signing job packages signed runs; everything below only runs when
+      # signing is off, and produces "-unsigned" names so an unsigned file can
+      # never be mistaken for a release.
+      - name: Package unsigned zip
+        if: needs.windows-gate.outputs.sign != 'true'
         run: |
-          $ErrorActionPreference = 'Stop'
-          # Inno Setup 6 is preinstalled on the windows runner images (6.7.x on
-          # windows-latest and windows-11-arm; ARM64 installers need 6.3+).
-          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
-          if (-not (Test-Path $iscc)) {
-            Write-Host 'Inno Setup 6 not preinstalled; installing with choco'
-            choco install innosetup --no-progress -y
-            if ($LASTEXITCODE -ne 0) { throw 'choco install innosetup failed' }
-          }
-          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
-          $full = '${{ steps.version.outputs.version }}'
-          # Inno's VersionInfoVersion must be numeric x.y.z.w: drop any -suffix/+build.
-          $core = ($full -split '[-+]')[0]
-          if ($core -notmatch '^\d+\.\d+\.\d+$') { throw "unexpected version format: $full" }
-          $numeric = "$core.0"
-          Write-Host "AppVersion=$full AppVersionNumeric=$numeric Arch=${{ matrix.arch }}"
-          & $iscc "/DAppVersion=$full" "/DAppVersionNumeric=$numeric" "/DArch=${{ matrix.arch }}" installer/windows/grimalkin.iss
-          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
-          Get-Item installer-out/grimalkin-setup-${{ matrix.arch }}.exe
+          @(
+            'UNSIGNED build of grimalkin for Windows.',
+            'These files carry no Authenticode signature and no verified publisher.',
+            'Windows SmartScreen / Smart App Control may warn about them.',
+            'Signed releases are announced in the README; see "Windows release signing".'
+          ) | Set-Content dist/UNSIGNED.txt
+          Compress-Archive -Path dist/* -DestinationPath grimalkin-portable-${{ matrix.arch }}-unsigned.zip
+      - name: Build unsigned installer and CI test twin
+        if: needs.windows-gate.outputs.sign != 'true'
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ./scripts/windows/build-installer.ps1 -Arch ${{ matrix.arch }} -Version $env:APP_VERSION
           # CI-only twin that behaves as an unelevated setup even on this
           # administrator runner, to exercise the per-user replace flow. Not
-          # uploaded or released; the shipped installer is the one above.
-          & $iscc "/DAppVersion=$full" "/DAppVersionNumeric=$numeric" "/DArch=${{ matrix.arch }}" /DCITestUnelevated /Oinstaller-test "/Fgrimalkin-setup-citest-${{ matrix.arch }}" installer/windows/grimalkin.iss
-          if ($LASTEXITCODE -ne 0) { throw "ISCC (CI test build) failed with exit code $LASTEXITCODE" }
-          Get-Item installer-test/grimalkin-setup-citest-${{ matrix.arch }}.exe
-      # The installer is built for ${{ matrix.arch }}; it can only run on a
-      # machine of that architecture. x64 builds run on windows-latest (x64);
-      # arm64 builds run on windows-11-arm (native ARM64), so both get smoked.
-      - name: Smoke-test installer (silent install, check, uninstall)
+          # released; the shipped installer is the one above.
+          ./scripts/windows/build-installer.ps1 -Arch ${{ matrix.arch }} -Version $env:APP_VERSION -CITest
+      - name: Upload unsigned installer
+        if: needs.windows-gate.outputs.sign != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-setup-${{ matrix.arch }}-unsigned
+          path: installer-out/grimalkin-setup-${{ matrix.arch }}-unsigned.exe
+          if-no-files-found: error
+      - name: Upload unsigned portable zip
+        if: needs.windows-gate.outputs.sign != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-portable-${{ matrix.arch }}-unsigned
+          path: grimalkin-portable-${{ matrix.arch }}-unsigned.zip
+          if-no-files-found: error
+      - name: Upload CI test installer
+        if: needs.windows-gate.outputs.sign != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installer-citest-${{ matrix.arch }}
+          path: installer-test/grimalkin-setup-citest-${{ matrix.arch }}.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  # Signs both architectures, builds the signed installers and zips, verifies
+  # everything, and only then uploads. The ONLY job with `id-token: write`.
+  #
+  # It never runs cargo or any code from the build: it downloads the staged
+  # binaries, runs jsign (hash-pinned) and ISCC over them. Key custody: the
+  # private key is an AWS KMS key that cannot be exported; this job's role may
+  # only Sign / GetPublicKey / DescribeKey with it (infra/aws/).
+  windows-sign:
+    name: windows sign
+    runs-on: windows-latest
+    needs: [windows-gate, windows-build]
+    if: needs.windows-gate.outputs.sign == 'true'
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      # jsign (https://ebourg.github.io/jsign/), downloaded from its GitHub
+      # release; the hash pins the exact jar. To update: change both, after
+      # checking the release.
+      JSIGN_VERSION: '7.6'
+      JSIGN_SHA256: 6cf58aa080e7ff82656f320cff8d4a3bff30408df8766806dcba3740dd839fa5
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_KMS_KEY_ALIAS: ${{ vars.AWS_KMS_KEY_ALIAS || 'alias/grimalkin-codesign' }}
+      WINDOWS_SIGNING_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+      WINDOWS_SIGNING_TSA_URL: ${{ vars.WINDOWS_SIGNING_TSA_URL || 'http://timestamp.digicert.com' }}
+      SIGNING_CHAIN: installer/windows/codesign-chain.pem
+    defaults:
+      run:
         shell: pwsh
+    steps:
+      - name: Assert this is an authorised release run
         run: |
-          $ErrorActionPreference = 'Stop'
-          $arch = '${{ matrix.arch }}'
-          $setup = (Resolve-Path installer-out/grimalkin-setup-$arch.exe).Path
-          # Per-user silent install with the optional tasks turned on.
-          $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=addtopath,contextmenu','/LOG=install.log'
-          if ($p.ExitCode -ne 0) { Get-Content install.log; throw "installer exit code $($p.ExitCode)" }
-          $dir = Join-Path $env:LOCALAPPDATA 'Programs\grimalkin'
-          foreach ($f in 'grimalkin.exe','grimalkin.com','conpty.dll','OpenConsole.exe','LICENSE-ConPTY.txt','README.md','unins000.exe') {
-            if (-not (Test-Path (Join-Path $dir $f))) { throw "missing after install: $f" }
+          if ($env:GITHUB_REPOSITORY -cne $env:UPSTREAM_REPOSITORY -or $env:GITHUB_EVENT_NAME -ne 'push' -or $env:GITHUB_REF -notlike 'refs/tags/v*') {
+            throw 'signing is restricted to v* tag pushes on the upstream repository'
           }
-          # The installed binaries are the right architecture too.
-          scripts/windows/check-pe-machine.ps1 -Dir $dir -Arch $arch
-          $recorded = (Get-ItemProperty 'HKCU:\Software\grimalkin\Install').Arch
-          if ($recorded -ne $arch) { throw "installed Arch value is '$recorded', expected '$arch'" }
-          $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-          if (-not (($userPath -split ';') -contains $dir)) { throw "install dir not on user PATH: $userPath" }
-          $cmd = (Get-ItemProperty 'HKCU:\Software\Classes\Directory\Background\shell\grimalkin\command').'(default)'
-          Write-Host "context menu command: $cmd"
-          if ($cmd -notlike '*--working-directory*') { throw 'context menu command missing' }
-          & (Join-Path $dir 'grimalkin.com') --version
-          if ($LASTEXITCODE -ne 0) { throw "grimalkin.com --version failed: $LASTEXITCODE" }
-
-          # Coexistence: pretend the install on disk is the OTHER architecture.
-          # Re-running this installer must then refuse (silent mode, no
-          # /REPLACEARCH) and leave the install untouched.
-          $other = if ($arch -eq 'x64') { 'arm64' } else { 'x64' }
-          Set-ItemProperty 'HKCU:\Software\grimalkin\Install' -Name Arch -Value $other
-          $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/TASKS=addtopath,contextmenu','/LOG=refuse.log'
-          Write-Host "installer exit code with $other install present and no /REPLACEARCH: $($p.ExitCode)"
-          if ($p.ExitCode -eq 0) { throw "installer must refuse to install over a $other install without /REPLACEARCH=1" }
-          if (-not (Test-Path (Join-Path $dir 'grimalkin.exe'))) { throw 'refused install must leave the existing install untouched' }
-          # Security rule (review finding): an ELEVATED setup must never run a
-          # per-user (HKCU) uninstaller, even with /REPLACEARCH=1. This runner is
-          # an administrator, so the shipped installer is elevated here.
-          $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-          Write-Host "runner is elevated: $isAdmin"
-          if ($isAdmin) {
-            $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/REPLACEARCH=1','/TASKS=addtopath,contextmenu','/LOG=elevated-refuse.log'
-            Write-Host "elevated installer exit code with a per-user $other install and /REPLACEARCH=1: $($p.ExitCode)"
-            if ($p.ExitCode -eq 0) { throw 'an elevated installer must not replace a per-user install of the other architecture' }
-            if ((Get-Content elevated-refuse.log -Raw) -notmatch 'Refusing to run a per-user uninstaller') { Get-Content elevated-refuse.log; throw 'elevated refusal not logged' }
-            if ((Get-Content elevated-refuse.log -Raw) -match 'Removing other-architecture install') { throw 'elevated installer ran the per-user uninstaller' }
-            $recorded = (Get-ItemProperty 'HKCU:\Software\grimalkin\Install').Arch
-            if ($recorded -ne $other) { throw "elevated refusal changed the Arch value to '$recorded'" }
-            if (-not (Test-Path (Join-Path $dir 'grimalkin.exe'))) { throw 'elevated refusal must leave the existing install untouched' }
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          if ($version -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.+-]+)?$') { throw "unexpected tag: $env:GITHUB_REF_NAME" }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist-x64
+          path: stage/x64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist-arm64
+          path: stage/arm64
+      - name: Check the staged files before signing anything
+        run: |
+          foreach ($arch in 'x64', 'arm64') {
+            if (Test-Path "stage/$arch/UNSIGNED.txt") { throw "stage/$arch contains UNSIGNED.txt in a signing run" }
+            scripts/windows/check-pe-machine.ps1 -Dir "stage/$arch" -Arch $arch
+            scripts/windows/check-conpty.ps1 -Dir "stage/$arch" -Arch $arch -Version $env:CONPTY_VERSION -Sha256 $env:CONPTY_SHA256
           }
-          # Unelevated per-user flow (CI-only twin build): with /REPLACEARCH=1 it
-          # uninstalls the old install first and ends with one consistent install.
-          $setup = (Resolve-Path installer-test/grimalkin-setup-citest-$arch.exe).Path
-          $p = Start-Process $setup -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/REPLACEARCH=1','/TASKS=addtopath,contextmenu','/LOG=replace.log'
-          if ($p.ExitCode -ne 0) { Get-Content replace.log; throw "installer with /REPLACEARCH=1 exit code $($p.ExitCode)" }
-          $recorded = (Get-ItemProperty 'HKCU:\Software\grimalkin\Install').Arch
-          if ($recorded -ne $arch) { throw "after replacing, Arch is '$recorded', expected '$arch'" }
-          if ((Get-Content replace.log -Raw) -notmatch 'other-architecture install') { Get-Content replace.log; throw 'replace log does not show the old install being removed' }
-          scripts/windows/check-pe-machine.ps1 -Dir $dir -Arch $arch
-          $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-          if ((($userPath -split ';') | Where-Object { $_ -eq $dir }).Count -ne 1) { throw "install dir must be on user PATH exactly once: $userPath" }
+          # Copies for the negative tests: an unsigned binary and a ConPTY file.
+          New-Item -ItemType Directory $env:RUNNER_TEMP/negative | Out-Null
+          Copy-Item stage/x64/grimalkin.exe $env:RUNNER_TEMP/negative/unsigned-sample.exe
+          Copy-Item stage/x64/conpty.dll $env:RUNNER_TEMP/negative/conpty.dll
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Download and verify jsign
+        run: |
+          $jar = Join-Path $env:RUNNER_TEMP "jsign-$($env:JSIGN_VERSION).jar"
+          Invoke-WebRequest -Uri "https://github.com/ebourg/jsign/releases/download/$($env:JSIGN_VERSION)/jsign-$($env:JSIGN_VERSION).jar" -OutFile $jar
+          $actual = (Get-FileHash -Algorithm SHA256 $jar).Hash.ToLowerInvariant()
+          if ($actual -ne $env:JSIGN_SHA256) {
+            Remove-Item $jar -Force
+            throw "SHA256 mismatch for jsign $($env:JSIGN_VERSION): expected $($env:JSIGN_SHA256), got $actual"
+          }
+          "JSIGN_JAR=$jar" >> $env:GITHUB_ENV
+          java -version
+      - name: Assume the signing role (GitHub OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_SIGNING_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: grimalkin-sign-${{ github.run_id }}
+          role-duration-seconds: 1800
+      - name: Check that the certificate chain belongs to the KMS key
+        run: |
+          scripts/windows/check-signing-config.ps1 -ChainFile $env:SIGNING_CHAIN -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -KeyAlias $env:AWS_KMS_KEY_ALIAS -Region $env:AWS_REGION
+      # grimalkin.exe and the renamed launcher grimalkin.com, both architectures.
+      # Each file is verified right after it is signed. conpty.dll and
+      # OpenConsole.exe are deliberately not in this list (and sign-file.ps1
+      # refuses them).
+      - name: Sign first-party binaries and verify each
+        run: |
+          foreach ($arch in 'x64', 'arm64') {
+            foreach ($name in 'grimalkin.exe', 'grimalkin.com') {
+              $file = "stage/$arch/$name"
+              scripts/windows/sign-file.ps1 -Path $file
+              scripts/windows/verify-signature.ps1 -Path $file -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ChainFile $env:SIGNING_CHAIN
+            }
+          }
+      - name: Negative tests of the verifier (on copies)
+        run: |
+          scripts/windows/test-verify-signature.ps1 `
+            -UnsignedPath "$env:RUNNER_TEMP/negative/unsigned-sample.exe" `
+            -SignedPath stage/x64/grimalkin.exe, stage/x64/grimalkin.com, stage/arm64/grimalkin.exe, stage/arm64/grimalkin.com `
+            -ConptyPath "$env:RUNNER_TEMP/negative/conpty.dll" `
+            -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ChainFile $env:SIGNING_CHAIN
+      - name: Build signed installers (Setup and uninstaller signed by Inno)
+        run: |
+          . scripts/windows/signing-common.ps1
+          $publisher = (Read-PemCertificates $env:SIGNING_CHAIN)[0].GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          foreach ($arch in 'x64', 'arm64') {
+            # ISCC builds the arm64 installer fine on this x64 runner.
+            scripts/windows/build-installer.ps1 -Arch $arch -Version $env:APP_VERSION -Dist "stage/$arch" -Sign -Publisher $publisher
+            scripts/windows/verify-signature.ps1 -Path "installer-out/grimalkin-setup-$arch.exe" -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ChainFile $env:SIGNING_CHAIN
+            # CI-only twin (unelevated behaviour): payload is the signed one, the
+            # twin itself is never signed or released.
+            scripts/windows/build-installer.ps1 -Arch $arch -Version $env:APP_VERSION -Dist "stage/$arch" -CITest
+          }
+      - name: Build portable zips and verify what is inside them
+        run: |
+          foreach ($arch in 'x64', 'arm64') {
+            $zip = "grimalkin-portable-$arch.zip"
+            Compress-Archive -Path "stage/$arch/*" -DestinationPath $zip
+            $x = Join-Path $env:RUNNER_TEMP "unzip-$arch"
+            Expand-Archive -LiteralPath $zip -DestinationPath $x
+            foreach ($f in Get-ChildItem "stage/$arch" -File) {
+              if ((Get-FileHash $f.FullName).Hash -ne (Get-FileHash (Join-Path $x $f.Name)).Hash) { throw "$arch zip: $($f.Name) differs from the staged file" }
+            }
+            scripts/windows/verify-signature.ps1 -Path "$x/grimalkin.exe", "$x/grimalkin.com" -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ChainFile $env:SIGNING_CHAIN
+            scripts/windows/check-conpty.ps1 -Dir $x -Arch $arch -Version $env:CONPTY_VERSION -Sha256 $env:CONPTY_SHA256
+            scripts/windows/check-pe-machine.ps1 -Dir $x -Arch $arch
+          }
+      - name: Upload signed x64 installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-setup-x64
+          path: installer-out/grimalkin-setup-x64.exe
+          if-no-files-found: error
+      - name: Upload signed arm64 installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-setup-arm64
+          path: installer-out/grimalkin-setup-arm64.exe
+          if-no-files-found: error
+      - name: Upload signed x64 portable zip
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-portable-x64
+          path: grimalkin-portable-x64.zip
+          if-no-files-found: error
+      - name: Upload signed arm64 portable zip
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-portable-arm64
+          path: grimalkin-portable-arm64.zip
+          if-no-files-found: error
+      - name: Upload CI test installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installer-citest-all
+          path: installer-test/grimalkin-setup-citest-*.exe
+          if-no-files-found: error
+          retention-days: 3
 
-          # Uninstall via the registered uninstaller (after a replace its file
-          # name need not be unins000.exe). _?= runs it in place so -Wait really waits.
-          Get-ChildItem $dir -Filter 'unins*' | Format-Table Name, Length
-          $uninst = ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{5E56C746-3735-4FF7-96B9-E90F7D4C5AA7}_is1').UninstallString).Trim('"')
-          Write-Host "registered uninstaller: $uninst"
-          if (-not (Test-Path $uninst)) { throw "registered uninstaller missing: $uninst" }
-          $u = Start-Process $uninst -Wait -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"_?=$dir"
-          if ($u.ExitCode -ne 0) { throw "uninstaller exit code $($u.ExitCode)" }
-          $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-          if (($userPath -split ';') -contains $dir) { throw 'install dir still on user PATH after uninstall' }
-          if (Test-Path 'HKCU:\Software\Classes\Directory\shell\grimalkin') { throw 'context menu key left behind' }
-          if (Test-Path 'HKCU:\Software\Classes\Directory\Background\shell\grimalkin') { throw 'background context menu key left behind' }
-          if (Test-Path 'HKCU:\Software\grimalkin\Install') { throw 'Arch marker key left behind' }
-      - name: Upload installer
-        uses: actions/upload-artifact@v4
+  # The installer is built for ${{ matrix.arch }}; it can only run on a machine
+  # of that architecture. x64 runs on windows-latest (x64), arm64 on
+  # windows-11-arm (native ARM64). Signed or unsigned, it is the installer that
+  # will be released. The smoke test itself is scripts/windows/smoke-installer.ps1.
+  windows-smoke:
+    name: windows smoke (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    needs: [windows-gate, windows-build, windows-sign]
+    # Run after a successful sign job, or when signing is off (sign job skipped).
+    if: ${{ !cancelled() && needs.windows-build.result == 'success' && (needs.windows-gate.outputs.sign != 'true' || needs.windows-sign.result == 'success') }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-latest
+          - arch: arm64
+            os: windows-11-arm
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          name: grimalkin-setup-${{ matrix.arch }}
-          path: installer-out/grimalkin-setup-${{ matrix.arch }}.exe
-      - name: Upload portable zip
-        uses: actions/upload-artifact@v4
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: grimalkin-portable-${{ matrix.arch }}
-          path: grimalkin-portable-${{ matrix.arch }}.zip
-      # Release assets: installer and portable zip per architecture. The bare
-      # grimalkin.exe / grimalkin.com are NOT attached any more (the x64 and
-      # ARM64 names would collide); they are inside the portable zips and the
-      # grimalkin-windows-<arch> workflow artifacts.
+          name: grimalkin-setup-${{ matrix.arch }}${{ needs.windows-gate.outputs.suffix }}
+          path: installer-out
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: grimalkin-portable-${{ matrix.arch }}${{ needs.windows-gate.outputs.suffix }}
+          path: portable
+      # Signed runs upload one artifact with both twins; unsigned runs one per arch.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: installer-citest-*
+          merge-multiple: true
+          path: installer-test
+      - name: Check the portable zip
+        env:
+          SIGNED: ${{ needs.windows-gate.outputs.sign }}
+          PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          SUFFIX: ${{ needs.windows-gate.outputs.suffix }}
+        run: |
+          $x = Join-Path $env:RUNNER_TEMP 'portable'
+          Expand-Archive -LiteralPath "portable/grimalkin-portable-${{ matrix.arch }}$($env:SUFFIX).zip" -DestinationPath $x
+          scripts/windows/check-pe-machine.ps1 -Dir $x -Arch ${{ matrix.arch }}
+          $unsignedMarker = Test-Path (Join-Path $x 'UNSIGNED.txt')
+          if ($env:SIGNED -eq 'true') {
+            if ($unsignedMarker) { throw 'a signed portable zip must not contain UNSIGNED.txt' }
+            scripts/windows/verify-signature.ps1 -Path "$x/grimalkin.exe", "$x/grimalkin.com" -ExpectedSubject $env:PUBLISHER -ChainFile installer/windows/codesign-chain.pem -AllowMissingSignTool
+          } elseif (-not $unsignedMarker) {
+            throw 'an unsigned portable zip must contain UNSIGNED.txt'
+          }
+          & "$x/grimalkin.com" --version
+          if ($LASTEXITCODE -ne 0) { throw "portable grimalkin.com --version failed: $LASTEXITCODE" }
+      - name: Smoke-test installer (silent install, check, uninstall)
+        env:
+          SIGNED: ${{ needs.windows-gate.outputs.sign }}
+          PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          SUFFIX: ${{ needs.windows-gate.outputs.suffix }}
+        run: |
+          $params = @{
+            Arch            = '${{ matrix.arch }}'
+            SetupPath       = "installer-out/grimalkin-setup-${{ matrix.arch }}$($env:SUFFIX).exe"
+            CITestSetupPath = 'installer-test/grimalkin-setup-citest-${{ matrix.arch }}.exe'
+          }
+          if ($env:SIGNED -eq 'true') {
+            $params.Signed = $true
+            $params.ExpectedSubject = $env:PUBLISHER
+            $params.ChainFile = 'installer/windows/codesign-chain.pem'
+          }
+          scripts/windows/smoke-installer.ps1 @params
+
+  # Attaches the verified assets to the GitHub release. Runs only for a tag, and
+  # only after both architectures passed the signature checks (when signed) and
+  # the installer smoke tests. The bare grimalkin.exe / grimalkin.com are NOT
+  # attached (the x64 and ARM64 names would collide); they are inside the zips.
+  windows-release:
+    name: windows release assets
+    runs-on: ubuntu-latest
+    needs: [windows-gate, windows-smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: grimalkin-setup-*
+          merge-multiple: true
+          path: release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: grimalkin-portable-*
+          merge-multiple: true
+          path: release
+      - name: List and sanity-check the assets
+        env:
+          SIGNED: ${{ needs.windows-gate.outputs.sign }}
+          SUFFIX: ${{ needs.windows-gate.outputs.suffix }}
+        run: |
+          set -euo pipefail
+          ls -l release
+          for arch in x64 arm64; do
+            test -s "release/grimalkin-setup-${arch}${SUFFIX}.exe"
+            test -s "release/grimalkin-portable-${arch}${SUFFIX}.zip"
+          done
+          test "$(find release -type f | wc -l)" -eq 4
+          if [[ "$SIGNED" == "true" && -n "$(find release -type f -name '*unsigned*')" ]]; then
+            echo "::error::a signed release must not contain unsigned assets"; exit 1
+          fi
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: |
-            installer-out/grimalkin-setup-${{ matrix.arch }}.exe
-            grimalkin-portable-${{ matrix.arch }}.zip
+          files: release/*
 
   # Verifies the exe resources (build.rs / winresource): the icon group and the
   # version info must actually be in the shipped binaries, for each architecture.
   windows-exe-resources:
     name: windows exe icon and version info (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
-    needs: windows-installer
+    needs: windows-build
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -283,10 +548,12 @@ jobs:
           - arch: arm64
             os: windows-11-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          name: grimalkin-windows-${{ matrix.arch }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist-${{ matrix.arch }}
           path: dist
       - name: Check machine types
         shell: pwsh
@@ -320,6 +587,8 @@ jobs:
     name: macos bundle (${{ matrix.arch }})
     runs-on: macos-latest
     needs: test
+    permissions:
+      contents: write   # attaches the dmg to the release
     strategy:
       fail-fast: false
       matrix:

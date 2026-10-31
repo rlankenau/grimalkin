@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  grimalkin Windows code signing: a non-exportable KMS signing key, an IAM role that
+  GitHub Actions assumes through OIDC for v* tag builds only, and (if absent) the GitHub
+  OIDC identity provider. See scripts/aws/README.md for the order of operations.
+
+# Why CloudFormation and not Terraform: this is four resources deployed once by one
+# person. CloudFormation needs no state bucket, lock table or extra tooling (the AWS CLI
+# is enough), stack deletion protection and DeletionPolicy: Retain protect the key, and
+# the template can be read in the console. Terraform would add a state backend that
+# itself needs hosting and protecting.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: rlankenau
+    Description: GitHub user or organisation that owns the repository.
+  GitHubRepo:
+    Type: String
+    Default: grimalkin
+    Description: Repository name.
+  GitHubOwnerId:
+    Type: String
+    Default: '503001'
+    AllowedPattern: '^([0-9]+)?$'
+    Description: >-
+      Numeric id of the owner. Together with GitHubRepoId it selects GitHub's immutable
+      OIDC subject format (repo:OWNER@OWNERID/REPO@REPOID:...), which repositories
+      created after 2026-07-15 use. Read both with
+      gh api repos/OWNER/REPO/actions/oidc/customization/sub  (sub_claim_prefix).
+      Leave BOTH empty to trust the legacy format repo:OWNER/REPO:...
+  GitHubRepoId:
+    Type: String
+    Default: '1437335379'
+    AllowedPattern: '^([0-9]+)?$'
+    Description: Numeric id of the repository (see GitHubOwnerId).
+  TagPattern:
+    Type: String
+    Default: 'v*'
+    Description: Tags that may assume the role (StringLike on the ref).
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of the existing GitHub OIDC provider in this account
+      (arn:aws:iam::ACCOUNT:oidc-provider/token.actions.githubusercontent.com). Leave empty
+      to create it. An account can have only one provider for that URL.
+  RoleName:
+    Type: String
+    Default: grimalkin-release-signer
+  CsrSignerPrincipalArn:
+    Type: String
+    Default: ''
+    Description: >-
+      OPTIONAL, temporary. ARN of ONE IAM user or role (yours) that may also call
+      kms:Sign, only so that scripts/aws/make-csr.py can sign the certificate request.
+      Update the stack with this parameter empty again as soon as the CSR is made.
+  KeyAliasName:
+    Type: String
+    Default: alias/grimalkin-codesign
+    AllowedPattern: '^alias/[a-zA-Z0-9/_-]+$'
+
+Conditions:
+  HasCsrSigner: !Not [!Equals [!Ref CsrSignerPrincipalArn, '']]
+  CreateOidcProvider: !Equals [!Ref ExistingOidcProviderArn, '']
+  UseImmutableSubject: !And
+    - !Not [!Equals [!Ref GitHubOwnerId, '']]
+    - !Not [!Equals [!Ref GitHubRepoId, '']]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  SignerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Assumed by GitHub Actions (tag builds only) to sign grimalkin Windows binaries with the KMS key.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidcProvider
+                - !GetAtt GitHubOidcProvider.Arn
+                - !Ref ExistingOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                'token.actions.githubusercontent.com:sub': !If
+                  - UseImmutableSubject
+                  - !Sub 'repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/tags/${TagPattern}'
+                  - !Sub 'repo:${GitHubOwner}/${GitHubRepo}:ref:refs/tags/${TagPattern}'
+      Policies:
+        # kms:Sign / GetPublicKey / DescribeKey are granted by the KEY policy below, on
+        # that one key. jsign also calls kms:ListKeys, which IAM can only grant on "*"
+        # (it returns key ids and nothing else).
+        - PolicyName: list-kms-keys
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: kms:ListKeys
+                Resource: '*'
+
+  CodeSigningKey:
+    Type: AWS::KMS::Key
+    # The certificate is bound to this key: replacing or deleting it means a new
+    # CSR and a new certificate. Never let CloudFormation do that by accident.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: grimalkin Windows code signing key (private key never leaves KMS)
+      KeySpec: RSA_4096
+      KeyUsage: SIGN_VERIFY
+      Enabled: true
+      MultiRegion: false
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Account administration (and, through IAM, break-glass management). Root is
+          # NOT able to sign: the Deny statement below excludes everyone but the role.
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: SignerSign
+            Effect: Allow
+            Principal:
+              AWS: !If
+                - HasCsrSigner
+                - [!GetAtt SignerRole.Arn, !Ref CsrSignerPrincipalArn]
+                - [!GetAtt SignerRole.Arn]
+            Action: kms:Sign
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:SigningAlgorithm':
+                  - RSASSA_PKCS1_V1_5_SHA_256
+                  - RSASSA_PKCS1_V1_5_SHA_384
+                  - RSASSA_PKCS1_V1_5_SHA_512
+          - Sid: SignerRead
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SignerRole.Arn
+            Action:
+              - kms:GetPublicKey
+              - kms:DescribeKey
+            Resource: '*'
+          # Nobody else can sign, whatever IAM policies exist in the account.
+          - Sid: DenySignToEveryoneElse
+            Effect: Deny
+            Principal:
+              AWS: '*'
+            Action: kms:Sign
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                'aws:PrincipalArn': !If
+                  - HasCsrSigner
+                  - [!GetAtt SignerRole.Arn, !Ref CsrSignerPrincipalArn]
+                  - [!GetAtt SignerRole.Arn]
+
+  CodeSigningKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Ref KeyAliasName
+      TargetKeyId: !Ref CodeSigningKey
+
+Outputs:
+  KeyArn:
+    Value: !GetAtt CodeSigningKey.Arn
+  KeyId:
+    Value: !Ref CodeSigningKey
+  KeyAlias:
+    Description: Value for the repository variable AWS_KMS_KEY_ALIAS.
+    Value: !Ref KeyAliasName
+  SignerRoleArn:
+    Description: Value for the repository variable AWS_SIGNING_ROLE_ARN.
+    Value: !GetAtt SignerRole.Arn
+  Region:
+    Description: Value for the repository variable AWS_REGION.
+    Value: !Ref 'AWS::Region'
+  OidcSubjectTrusted:
+    Value: !If
+      - UseImmutableSubject
+      - !Sub 'repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/tags/${TagPattern}'
+      - !Sub 'repo:${GitHubOwner}/${GitHubRepo}:ref:refs/tags/${TagPattern}'

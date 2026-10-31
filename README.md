@@ -55,7 +55,10 @@ of its own architecture.
 ### Installing
 
 Download the installer for your machine from the
-[Releases](https://github.com/rlankenau/grimalkin/releases) page and run it. It
+[Releases](https://github.com/rlankenau/grimalkin/releases) page and run it. Releases
+are Authenticode-signed once release signing is set up; files named `...-unsigned` are
+not signed and Windows will warn about an unknown publisher (see
+[Windows release signing](#windows-release-signing)). It
 installs per user by default (into `%LOCALAPPDATA%\Programs\grimalkin`, no
 administrator prompt); the first page offers "install for all users" if you
 want Program Files instead. The installer:
@@ -116,11 +119,13 @@ installer the same way.
 publishes everything to the GitHub release: per architecture the installer
 (`grimalkin-setup-x64.exe`, `grimalkin-setup-arm64.exe`, versioned from the tag)
 and the portable zip (`grimalkin-portable-x64.zip`,
-`grimalkin-portable-arm64.zip`). The bare `grimalkin.exe` / `grimalkin.com` are
-no longer separate release assets (the names would collide between
-architectures); they are inside the zips, and available per architecture as the
-`grimalkin-windows-x64` / `grimalkin-windows-arm64` workflow artifacts on every
-trunk build, together with the installers and zips. x64 is built on
+`grimalkin-portable-arm64.zip`). These names are for signed releases; while signing is
+not enabled the assets are published as `grimalkin-setup-<arch>-unsigned.exe` and
+`grimalkin-portable-<arch>-unsigned.zip` (see
+[Windows release signing](#windows-release-signing)). The bare `grimalkin.exe` /
+`grimalkin.com` are no longer separate release assets (the names would collide between
+architectures); they are inside the zips. Every run also uploads the installers and zips as
+workflow artifacts (same names). x64 is built on
 `windows-latest`, ARM64 natively on the `windows-11-arm` runner (target
 `aarch64-pc-windows-msvc`), where the tests and the installer smoke test also
 run. The installers are built from `installer/windows/grimalkin.iss`
@@ -185,6 +190,124 @@ folder, next to both files, as before.
 When building yourself: `cargo build --release -p grimalkin -p grimalkin-launcher`,
 then copy `target/release/grimalkin-launcher.exe` to `grimalkin.com` beside
 `grimalkin.exe`.
+
+### Windows release signing
+
+Windows releases are meant to be Authenticode-signed: `grimalkin.exe`, `grimalkin.com`,
+the installer and its uninstaller carry a signature with a trusted timestamp. The private key
+lives in AWS KMS and cannot be exported; GitHub Actions signs with it through short-lived
+OIDC credentials, only for `v*` tags on this repository. Microsoft's `conpty.dll` and
+`OpenConsole.exe` are never re-signed: CI checks that they are byte-identical to the pinned
+NuGet package and still carry Microsoft's own signature.
+
+**Unsigned builds and the caveat.** Signing is switched on by the repository variable
+`WINDOWS_SIGNING_ENABLED`. Until it is `true` (the state of this repository before the AWS
+side is provisioned), and for every pull request, fork, trunk push and non-release run,
+nothing is signed. Such files are always labelled: the installer and zip are named
+`grimalkin-setup-<arch>-unsigned.exe` and `grimalkin-portable-<arch>-unsigned.zip`, the zip
+contains `UNSIGNED.txt`, and the installer's publisher reads "grimalkin contributors
+(unsigned build)". If a tag is pushed while signing is off, the release gets those
+`-unsigned` assets. Signed releases have the plain names. Windows will show "Unknown
+publisher" for unsigned files. Releases made before signing was set up stay unsigned.
+
+**Publisher and SmartScreen.** Windows shows the certificate holder's name (the
+validated identity on the certificate) as the publisher. A valid signature proves who
+published the file and that it was not modified; it does **not** by itself give SmartScreen
+reputation. A new certificate may still trigger "Windows protected your PC" until enough
+users have downloaded the files, and Smart App Control, WDAC, antivirus or enterprise
+policy can still object. Extended Validation no longer bypasses SmartScreen (Microsoft),
+so use an OV or IV certificate and keep the same signing identity across renewals.
+
+#### How the pipeline works
+
+```
+windows gate -> windows build (x64, arm64)  -> windows sign -> windows smoke (x64, arm64) -> release assets
+                (no cloud permissions)          (one job, the only id-token: write)
+```
+
+- **gate**: signs only if `WINDOWS_SIGNING_ENABLED` is `true` **and** the event is a push of a
+  `v*` tag on `rlankenau/grimalkin` **and** the tagged commit is an ancestor of `trunk`. When
+  signing is enabled and the run is a release tag, a missing variable, the placeholder
+  certificate chain or a tag off trunk fails the run: **there is no silent unsigned
+  fallback and nothing is uploaded**.
+- **build**: compiles, stages the architecture's files and the ConPTY pair, checks machine
+  types and the ConPTY bytes/signature, tests the signature verifier. It runs build scripts
+  and has no cloud credentials. With signing off it also builds the unsigned installer and zip.
+- **sign**: downloads both architectures' files (it never runs cargo), verifies the pinned
+  [jsign](https://ebourg.github.io/jsign/) jar by SHA-256, assumes the AWS role, proves that
+  the committed certificate belongs to the KMS key, signs `grimalkin.exe` and `grimalkin.com`
+  of both architectures and verifies each right away (`signtool verify /pa /all /tw /v` plus
+  `Get-AuthenticodeSignature`: valid, embedded, exact publisher, timestamp present, leaf and
+  issuer equal to `installer/windows/codesign-chain.pem`). Then it runs negative tests (unsigned,
+  tampered, wrong publisher, ConPTY refusal, no double signing) on copies, builds both installers
+  with Inno Setup (`SignTool=` calls `scripts/windows/sign-file.ps1`; `SignedUninstaller=yes`
+  signs the uninstaller too), builds the zips, verifies what is inside them, and only then
+  uploads.
+- **smoke**: on a native x64 and a native ARM64 runner, re-runs the whole installer smoke test
+  (PE machine types, `Arch` marker, refuse and `/REPLACEARCH=1` flows, elevated refusal, unelevated
+  twin) on the installer that will be released, and for signed builds verifies Setup, the installed
+  files and the installed uninstaller.
+- **release assets**: attached to the GitHub release only after the smoke tests of both
+  architectures pass. Actions in this path are pinned by commit SHA.
+
+Local `cargo build` and ordinary Inno builds are unsigned and need no signing tools.
+`scripts/windows/` holds the scripts and `installer/windows/codesign-chain.pem` the public
+certificate chain (a placeholder until a certificate is issued).
+
+#### Setup
+
+Order of operations, with commands, is in [scripts/aws/README.md](scripts/aws/README.md); the
+research behind the choices (CA options, costs, key protection evidence, jsign) is in
+[docs/SIGNING-AWS.md](docs/SIGNING-AWS.md).
+
+1. Deploy `infra/aws/codesign.yaml` (CloudFormation): GitHub OIDC provider, IAM role
+   (assumable only by `v*` tag builds of this repository, with GitHub's immutable subject),
+   RSA_4096 `SIGN_VERIFY` KMS key `alias/grimalkin-codesign` whose key policy lets only that
+   role `Sign`. Turn CloudTrail on (CAs require access logging) and restrict `v*` tag
+   creation with a repository ruleset.
+2. `scripts/aws/make-csr.py` builds the certificate request signed by the KMS key.
+3. Get an OV or IV code signing certificate from a CA that accepts KMS keys (your choice).
+   Certificates last at most 460 days, so renew yearly.
+4. Commit leaf + intermediates to `installer/windows/codesign-chain.pem`.
+5. Set the repository **variables** (Settings, Secrets and variables, Actions, Variables;
+   none is a secret):
+
+   | Variable | Value |
+   | --- | --- |
+   | `WINDOWS_SIGNING_ENABLED` | `true` to sign release tags; anything else builds unsigned |
+   | `AWS_SIGNING_ROLE_ARN` | the stack's `SignerRoleArn` |
+   | `AWS_REGION` | region of the key |
+   | `AWS_KMS_KEY_ALIAS` | key alias or id; default `alias/grimalkin-codesign` |
+   | `WINDOWS_SIGNING_PUBLISHER` | exact, case-sensitive Subject of the leaf certificate |
+   | `WINDOWS_SIGNING_TSA_URL` | RFC 3161 timestamp server(s), comma separated; default `http://timestamp.digicert.com` |
+
+6. Push a `v*` tag on a trunk commit. Renewal means replacing the chain file (and the publisher
+   variable if the subject changed); no workflow edits.
+
+jsign reads the credentials that `aws-actions/configure-aws-credentials` exports
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`); it needs
+`kms:Sign`, `kms:GetPublicKey`, `kms:DescribeKey` and `kms:ListKeys`. Timestamps are RFC 3161
+with retries (3 attempts, 10 s wait, then the whole signature call retries with backoff).
+
+#### Windows 10/11 acceptance checklist
+
+CI runs on Windows Server images (`windows-latest`) and Windows 11 ARM64, which cannot stand in
+for a real Windows 10 or 11 desktop. Before announcing the first signed release, on a clean
+x64 Windows 10, an x64 Windows 11 and a Windows 11 ARM64 machine, with the files **downloaded
+through a browser** (so Mark of the Web is set):
+
+- [ ] File Properties, Digital Signatures: signer is the expected publisher, a counter-signature
+      (timestamp) is present, "This digital signature is OK", on `grimalkin-setup-<arch>.exe`,
+      and after install on `grimalkin.exe`, `grimalkin.com` and `unins000.exe`.
+- [ ] `Get-AuthenticodeSignature` reports `Valid` for each of those files, and
+      `conpty.dll` / `OpenConsole.exe` show Microsoft Corporation.
+- [ ] Running the installer shows the verified publisher in the UAC / SmartScreen dialog (record
+      any "Windows protected your PC" warning and the browser used; a warning is reputation, not
+      a failed signature). Run it again with the ZIP and `grimalkin.exe` downloaded directly.
+- [ ] Silent install, launch from the Start menu and `grimalkin.com`, add-to-PATH, context menu,
+      uninstall (Settings, Apps) and upgrade over the previous version.
+- [ ] Smart App Control or an enterprise WDAC policy, if available, runs the signed build.
+- [ ] Record release tag, SHA-256 hashes, certificate subject and expiry, date and the results.
 
 ## Installing on macOS
 

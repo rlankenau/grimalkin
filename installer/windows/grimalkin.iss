@@ -14,7 +14,8 @@
 ;   grimalkin.exe, grimalkin.com (the console launcher, renamed
 ;   grimalkin-launcher.exe), conpty.dll, OpenConsole.exe, LICENSE-ConPTY.txt,
 ;   README.md, LICENSE, LICENSE-MIT, LICENSE-APACHE
-; Output: <repo>\installer-out\grimalkin-setup-<Arch>.exe
+; Output: <repo>\installer-out\grimalkin-setup-<Arch>.exe (CI overrides the name
+; with ISCC /F, e.g. grimalkin-setup-<Arch>-unsigned.exe)
 ;
 ; The setup/wizard icon is <repo>\assets\icon\grimalkin.ico. If that file is
 ; ever missing the build falls back to Inno's default icon (see HaveIcon
@@ -35,6 +36,13 @@
   #error Arch must be x64 or arm64 (/DArch=x64 or /DArch=arm64)
 #endif
 
+; Publisher shown in Apps & features. CI passes /DAppPublisher=<certificate common
+; name> for a signed release and "grimalkin contributors (unsigned build)" for
+; an unsigned one.
+#ifndef AppPublisher
+  #define AppPublisher "grimalkin contributors"
+#endif
+
 #define AppName "grimalkin"
 #define AppExe "grimalkin.exe"
 #define IconPath "..\..\assets\icon\grimalkin.ico"
@@ -51,7 +59,7 @@ AppVersion={#AppVersion}
 VersionInfoVersion={#AppVersionNumeric}
 VersionInfoProductTextVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=grimalkin contributors
+AppPublisher={#AppPublisher}
 AppPublisherURL=https://github.com/rlankenau/grimalkin
 AppSupportURL=https://github.com/rlankenau/grimalkin/issues
 AppUpdatesURL=https://github.com/rlankenau/grimalkin/releases
@@ -82,6 +90,18 @@ ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 Compression=lzma2/ultra
 SolidCompression=yes
+
+; Release signing. CI passes /DSignInstaller together with
+; /Sgrimalkin=<command that signs $f> (see scripts/windows/build-installer.ps1
+; and sign-file.ps1) only in the protected "windows sign" job. Inno then signs
+; Setup AND the generated uninstaller (SignedUninstaller) before the uninstaller
+; is embedded, which a signature added to the finished Setup could not do. Without
+; /DSignInstaller nothing here changes and no signing tool is needed.
+#ifdef SignInstaller
+SignTool=grimalkin
+SignedUninstaller=yes
+SignToolRetryCount=3
+#endif
 
 OutputDir=..\..\installer-out
 OutputBaseFilename=grimalkin-setup-{#Arch}

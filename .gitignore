@@ -4,3 +4,4 @@
 # Installer / bundle output
 /dist/
 /installer-out
+/installer-test
