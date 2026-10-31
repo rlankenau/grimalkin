@@ -1013,12 +1013,30 @@ impl Renderer {
         }
 
         if let Some(msg) = view.prompt {
-            // A centred box in the selection colours, over the whole window
-            // (skin or not; it uses the surface size, not the grid).
-            let n = msg.chars().count() as f32;
+            // A centred box in the selection colours, over the whole surface
+            // (inside the skin's viewport, not just the grid). The message wraps at
+            // spaces so both answers stay visible in a narrow window.
+            let (ax, ay) = (self.origin.0 as f32, self.origin.1 as f32);
+            let (aw, ah) = (vw - ax - self.inset.0 as f32, vh - ay - self.inset.1 as f32);
+            let max_cols = (((aw - 2.0 * cw) / cw).floor() as usize).max(1);
+            let mut rows: Vec<String> = Vec::new();
+            for word in msg.split(' ').filter(|w| !w.is_empty()) {
+                match rows.last_mut() {
+                    Some(r) if r.chars().count() + 1 + word.chars().count() <= max_cols => {
+                        r.push(' ');
+                        r.push_str(word);
+                    }
+                    _ => rows.push(word.chars().take(max_cols).collect()),
+                }
+            }
+            // Keep the two-space gap before "[Esc]" when the line fits whole.
+            if msg.chars().count() <= max_cols {
+                rows = vec![msg.to_string()];
+            }
+            let n = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0) as f32;
             let pad_x = cw;
-            let (w, h) = ((n * cw + 2.0 * pad_x).min(vw), chh * 3.0);
-            let (x, y) = (((vw - w) / 2.0).max(0.0), ((vh - h) / 2.0).max(0.0));
+            let (w, h) = (n * cw + 2.0 * pad_x, chh * (rows.len() as f32 + 2.0));
+            let (x, y) = (ax + ((aw - w) / 2.0).max(0.0), ay + ((ah - h) / 2.0).max(0.0));
             let (sb, sf) = (self.sel_bg, self.sel_fg);
             let t = (self.scale.round() as f32).max(1.0);
             self.cur_rect.push(rect(x, y, w, h, sf, 255, KIND_SOLID));
@@ -1027,12 +1045,15 @@ impl Renderer {
                 device: &self.device,
                 queue: &self.queue,
             };
-            for (i, ch) in msg.chars().enumerate() {
-                if ch == ' ' || (i as f32 + 1.0) * cw > w - pad_x {
-                    continue;
+            for (ri, row) in rows.iter().enumerate() {
+                for (i, ch) in row.chars().enumerate() {
+                    if ch == ' ' {
+                        continue;
+                    }
+                    let quads = self.glyphs.lookup(&gpu, ch, &[], 0, false);
+                    let (gx, gy) = (x + pad_x + i as f32 * cw, y + chh * (ri as f32 + 1.0));
+                    push_glyphs(quads, gx, gy, sf, &mut self.cur_mask, &mut self.cur_color);
                 }
-                let quads = self.glyphs.lookup(&gpu, ch, &[], 0, false);
-                push_glyphs(quads, x + pad_x + i as f32 * cw, y + chh, sf, &mut self.cur_mask, &mut self.cur_color);
             }
         }
 

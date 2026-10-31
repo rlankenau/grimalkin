@@ -933,9 +933,28 @@ pub fn paste_needs_confirm(text: &str, bracketed: bool, confirm_multiline: bool,
     (confirm_multiline && text.contains(['\n', '\r'])) || (large_bytes > 0 && text.len() > large_bytes)
 }
 
+/// Lines in a paste, counting CR, LF and CRLF alike (all are Enter once sent).
+fn count_lines(text: &str) -> usize {
+    let mut n = 0;
+    let mut open = false; // text since the last break
+    let mut prev_cr = false;
+    for c in text.chars() {
+        match c {
+            '\n' if prev_cr => {}
+            '\n' | '\r' => {
+                n += 1;
+                open = false;
+            }
+            _ => open = true,
+        }
+        prev_cr = c == '\r';
+    }
+    (n + usize::from(open)).max(1)
+}
+
 /// The prompt text for a pending paste.
 pub fn paste_prompt_message(text: &str) -> String {
-    let lines = text.lines().count().max(1);
+    let lines = count_lines(text);
     if text.contains(['\n', '\r']) {
         format!("Paste {lines} {}? [Enter] paste  [Esc] cancel", if lines == 1 { "line" } else { "lines" })
     } else {
@@ -1232,6 +1251,8 @@ mod tests {
         assert!(!paste_needs_confirm(&"x".repeat(1 << 20), false, true, 0));
         assert!(!paste_needs_confirm(&"x".repeat(100), true, true, 10));
         assert_eq!(paste_prompt_message("a\nb\nc"), "Paste 3 lines? [Enter] paste  [Esc] cancel");
+        assert_eq!(paste_prompt_message("a\rb\rc"), "Paste 3 lines? [Enter] paste  [Esc] cancel");
+        assert_eq!(paste_prompt_message("a\r\nb\r\n\r\nc"), "Paste 4 lines? [Enter] paste  [Esc] cancel");
         assert_eq!(paste_prompt_message("ls\n"), "Paste 1 line? [Enter] paste  [Esc] cancel");
     }
 

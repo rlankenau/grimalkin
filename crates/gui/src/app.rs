@@ -455,6 +455,7 @@ impl App {
             menu_accels: false,
             context_menu_requested: None,
             pending_paste: None,
+            prompt_swallow: None,
             notice: None,
         };
         running.update_skin_min_size();
@@ -707,6 +708,9 @@ struct Running {
     context_menu_requested: Option<Option<(f64, f64)>>,
     /// A paste waiting for Enter/Esc (see `input::paste_needs_confirm`).
     pending_paste: Option<PendingPaste>,
+    /// The key that answered the paste prompt: its repeats and release are
+    /// consumed too, so they never reach the shell.
+    prompt_swallow: Option<winit::keyboard::Key>,
     /// Something the last config reload could not do live; the app passes it
     /// to the open secondary windows.
     notice: Option<String>,
@@ -1227,8 +1231,22 @@ impl Running {
     fn on_key(&mut self, ev: &winit::event::KeyEvent) {
         if self.pending_paste.is_some() {
             // The paste prompt takes every key until it is answered.
-            self.answer_prompt(input::prompt_key(&ev.logical_key, ev.state.is_pressed()));
+            let key = input::prompt_key(&ev.logical_key, ev.state.is_pressed());
+            if key != input::PromptKey::Ignore {
+                self.prompt_swallow = Some(ev.logical_key.clone());
+            }
+            self.answer_prompt(key);
             return;
+        }
+        if let Some(k) = self.prompt_swallow.take() {
+            if k == ev.logical_key {
+                // Repeats and the release of the answering key; the
+                // release ends it.
+                if ev.state.is_pressed() {
+                    self.prompt_swallow = Some(k);
+                }
+                return;
+            }
         }
         let st = EncodeState {
             app_cursor: self.term.app_cursor_keys(),
@@ -1400,12 +1418,20 @@ impl Running {
         if text.is_empty() {
             return;
         }
+        if self.pending_paste.is_some() {
+            // One paste at a time: the prompt is about the text it shows.
+            return;
+        }
         if input::paste_needs_confirm(
             text,
             self.term.bracketed_paste(),
             self.cfg.paste.confirm_multiline,
             self.cfg.paste.confirm_large_bytes,
         ) {
+            if self.win_state.is_shaded() {
+                // The prompt is not drawn in a shaded window.
+                self.toggle_shade();
+            }
             self.pending_paste = Some(PendingPaste { text: text.to_string(), message: input::paste_prompt_message(text) });
             self.window.request_redraw();
             return;
@@ -1757,6 +1783,10 @@ impl Running {
     fn toggle_shade(&mut self) {
         if self.skin.is_none() {
             return;
+        }
+        if !self.win_state.is_shaded() {
+            // The paste prompt cannot be shown in a shaded window.
+            self.pending_paste = None;
         }
         let plan = self.win_state.toggle_shade(self.window_rect(), self.shade_bar(), skin::work_area(&self.window));
         self.apply_plan(plan);
