@@ -1,0 +1,8 @@
+# Created from packaging/winget/templates by packaging/winget/update-manifest.py.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+
+PackageIdentifier: rlankenau.grimalkin
+PackageVersion: "@VERSION@"
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

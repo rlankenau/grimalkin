@@ -1,0 +1,31 @@
+# Created from packaging/winget/templates by packaging/winget/update-manifest.py.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: rlankenau.grimalkin
+PackageVersion: "@VERSION@"
+PackageLocale: en-US
+Publisher: grimalkin contributors
+PublisherUrl: https://github.com/rlankenau
+PublisherSupportUrl: https://github.com/rlankenau/grimalkin/issues
+PackageName: grimalkin
+PackageUrl: https://github.com/rlankenau/grimalkin
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/rlankenau/grimalkin/blob/v@VERSION@/LICENSE
+Copyright: Copyright (c) the grimalkin authors
+ShortDescription: A GPU-accelerated terminal emulator with the kitty graphics and keyboard protocols.
+Description: |-
+  grimalkin is a GPU-accelerated terminal emulator written in Rust. It runs on
+  Windows 10/11 through ConPTY (a matching ConPTY is bundled) and supports the
+  kitty graphics protocol, the kitty keyboard protocol, themes with live reload
+  and WinAMP-style skins.
+Moniker: grimalkin
+Tags:
+  - terminal
+  - terminal-emulator
+  - console
+  - gpu
+  - kitty
+  - rust
+ReleaseNotesUrl: https://github.com/rlankenau/grimalkin/releases/tag/v@VERSION@
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
