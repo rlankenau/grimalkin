@@ -34,6 +34,8 @@ pub struct TextBuffers {
     pub shell: String,
     pub title: String,
     pub install: String,
+    /// Optional name for the skin being installed (overrides the derived one).
+    pub install_name: String,
 }
 
 pub struct Prefs {
@@ -237,6 +239,7 @@ impl Prefs {
     /// Install a WinAMP skin from a path or URL on a worker thread.
     pub fn start_install(&mut self) {
         let src = self.text.install.trim().to_string();
+        let name = self.text.install_name.trim().to_string();
         if src.is_empty() {
             return;
         }
@@ -256,7 +259,7 @@ impl Prefs {
         let repaint = self.repaint.clone();
         let force = self.overwrite_skin;
         let spawned = std::thread::Builder::new().name("skin-install".into()).spawn(move || {
-            let r = skin::winamp::install::install_from(&src, &dir, force);
+            let r = skin::winamp::install::install_from(&src, &dir, force, Some(&name));
             if let Ok(mut g) = state.lock() {
                 *g = Install::Done(r);
             }
@@ -284,6 +287,7 @@ impl Prefs {
                 Ok(name) => {
                     self.note(format!("Installed WinAMP skin \"{name}\""));
                     self.text.install.clear();
+                    self.text.install_name.clear();
                     self.skins = model::skin_options(skin::user_skin_dir().as_deref(), &self.cfg.skin);
                     self.last_installed = Some(format!("winamp:{name}"));
                 }

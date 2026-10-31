@@ -124,12 +124,14 @@ visual_ms = 150
 audible = false
 
 [pty]
-# Windows only (ignored elsewhere). Create the ConPTY pseudoconsole in
-# passthrough mode so a sideloaded modern ConPTY (conpty.dll + OpenConsole.exe
-# next to grimalkin.exe) or Windows 11 forwards kitty graphics (APC) and other
-# sequences untouched. Stock Windows 10 ConPTY strips APC; see the README
-# section "Windows: kitty graphics need a newer ConPTY". The environment
-# variable GRIMALKIN_CONPTY_PASSTHROUGH=1 (or 0) overrides this setting.
+# Windows only (ignored elsewhere). EXPERIMENTAL. Ask the in-box ConPTY for
+# flag 0x8 at creation. It does not make the in-box ConPTY forward kitty graphics
+# (APC): Windows 11 25H2 still strips APC with it on, and it had no observable
+# effect on 24H2/25H2 in tests. Kitty graphics on Windows 10 and 11 need the
+# bundled conpty.dll + OpenConsole.exe next to grimalkin.exe (which already
+# forward APC; this flag is never sent to them). See the README section
+# "Windows: kitty graphics need the bundled ConPTY". The environment variable
+# GRIMALKIN_CONPTY_PASSTHROUGH=1 (or 0) overrides this setting.
 passthrough = false
 
 # Cursor movement after a kitty graphics placement: "auto", "protocol" or

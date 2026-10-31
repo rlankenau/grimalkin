@@ -1,0 +1,32 @@
+# Created from packaging/winget/templates by packaging/winget/update-manifest.py.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: rlankenau.grimalkin
+PackageVersion: "@VERSION@"
+InstallerType: inno
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+InstallerSwitches:
+  Silent: /VERYSILENT /NORESTART /SUPPRESSMSGBOXES
+  SilentWithProgress: /SILENT /NORESTART /SUPPRESSMSGBOXES
+UpgradeBehavior: install
+# The installer is per-user by default and offers "all users" in its wizard
+# (/ALLUSERS). No Scope is declared so winget does not force either choice.
+ElevationRequirement: elevatesSelf
+# Inno Setup registers the uninstall entry as "<AppId>_is1". Both architectures
+# share one AppId (installer/windows/grimalkin.iss), on purpose.
+ProductCode: "{5E56C746-3735-4FF7-96B9-E90F7D4C5AA7}_is1"
+@RELEASEDATE_LINE@
+Installers:
+  - Architecture: x64
+    MinimumOSVersion: 10.0.17763.0
+    InstallerUrl: "@X64_URL@"
+    InstallerSha256: "@X64_SHA256@"
+  - Architecture: arm64
+    MinimumOSVersion: 10.0.22000.0
+    InstallerUrl: "@ARM64_URL@"
+    InstallerSha256: "@ARM64_SHA256@"
+ManifestType: installer
+ManifestVersion: 1.6.0
