@@ -1,0 +1,2 @@
+# The upstream project keeps release notes on GitHub, not in a Debian changelog.
+grimalkin: no-changelog *

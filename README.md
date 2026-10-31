@@ -140,7 +140,7 @@ the PE machine type of every shipped binary
 - Rust stable 1.92+
 - Windows: just `cargo`
 - macOS: just `cargo`
-- Linux: `sudo apt-get install libxkbcommon-dev libwayland-dev libfontconfig1-dev`
+- Linux: `sudo apt-get install libxkbcommon-dev libwayland-dev libfontconfig1-dev`; at run time a Vulkan driver (see Installing on Linux)
 
 ## Build and run
 
@@ -406,6 +406,124 @@ builds ad-hoc signed as before.
 
 The certificate secrets alone give a signed (not notarized) build; notarization
 needs all three `NOTARY_*` secrets.
+
+## Installing on Linux
+
+**Status: Linux has had CI builds and unit tests, but no interactive testing yet.**
+The packages below are built and smoke-tested in CI (installed on a clean
+Ubuntu runner and a clean Fedora container, `--list-themes`, and a headless
+first-frame render on a software Vulkan device), but nobody has used Grimalkin
+as a daily terminal on a real Linux desktop. Expect rough edges on both Wayland and X11
+(there are no native menus on Linux yet) and report them.
+
+### Packages from a release
+
+Download from the [latest release](https://github.com/rlankenau/grimalkin/releases)
+(or the `grimalkin-deb-<arch>` / `grimalkin-rpm-<arch>` CI artifacts):
+
+| Package | Architectures | Install |
+| --- | --- | --- |
+| `grimalkin_<version>_amd64.deb`, `..._arm64.deb` | x86-64, ARM64 | `sudo apt install ./grimalkin_<version>_amd64.deb` |
+| `grimalkin-<version>.x86_64.rpm`, `...aarch64.rpm` | x86-64, ARM64 | `sudo dnf install ./grimalkin-<version>.x86_64.rpm` |
+
+The packages are built on Ubuntu 24.04 (glibc 2.39), so they need a distribution
+at least that recent (Ubuntu 24.04+, Debian 13+, Fedora 40+). The RPM requires
+its libraries by soname, not by distribution-specific package name. Pre-release
+versions are written
+`1.0.0~rc3` inside the packages (so `1.0.0` upgrades them) and `1.0.0-rc3` in
+the file names on the release page.
+
+They install `/usr/bin/grimalkin`, a desktop entry (the window class and
+Wayland app id is `grimalkin`, matching `StartupWMClass`), hicolor icons from
+16 to 512 px, AppStream metadata and the docs.
+
+### apt and dnf repositories
+
+*Available once the signing key is configured* (see "Linux repository signing"
+below); until the maintainer has published the first signed release these
+URLs do not exist yet.
+
+Debian, Ubuntu (use `testing` instead of `stable` for pre-releases):
+
+```
+sudo curl -fsSL https://rlankenau.github.io/grimalkin/grimalkin.gpg -o /usr/share/keyrings/grimalkin.gpg
+echo "deb [signed-by=/usr/share/keyrings/grimalkin.gpg] https://rlankenau.github.io/grimalkin/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/grimalkin.list
+sudo apt update && sudo apt install grimalkin
+```
+
+Fedora, RHEL and derivatives (`grimalkin-testing.repo` for pre-releases):
+
+```
+sudo curl -fsSL https://rlankenau.github.io/grimalkin/grimalkin.repo -o /etc/yum.repos.d/grimalkin.repo
+sudo dnf install grimalkin
+```
+
+The apt repository signs `InRelease`/`Release.gpg`; the dnf repository signs
+`repomd.xml` (`repo_gpgcheck=1`, and the package checksums hang off it). The
+individual `.rpm` files are not signed.
+
+### Runtime requirements
+
+- A **Vulkan** driver. Grimalkin renders with wgpu's Vulkan backend (there is no
+  OpenGL backend in the build). On a machine without a GPU driver, Mesa's
+  software Vulkan (`mesa-vulkan-drivers`, lavapipe) works, slowly; the package
+  recommends `mesa-vulkan-drivers`.
+- **Wayland or X11.** The needed libraries (`libvulkan`, `libxkbcommon`,
+  `libxkbcommon-x11`, `libwayland-client`, `fontconfig`) are package
+  dependencies; most are loaded at run time.
+- `kitty-terminfo` (recommended; the same package name on Debian/Ubuntu and
+  Fedora). Grimalkin sets `TERM=xterm-kitty`; if no kitty terminfo entry is
+  installed it falls back to `TERM=xterm-256color` (see TERM), which works but
+  turns off the kitty-aware features of tools that key off `TERM`.
+
+### Building the packages yourself
+
+```
+sudo apt-get install libxkbcommon-dev libwayland-dev libfontconfig1-dev dpkg-dev
+cargo install --locked cargo-deb cargo-generate-rpm
+cargo build --release --locked -p grimalkin
+cargo deb -p grimalkin --no-build                      # target/debian/*.deb
+cargo generate-rpm -p crates/gui -s 'version = "1.0.0~rc3"'   # target/generate-rpm/*.rpm
+```
+
+The metadata is in `crates/gui/Cargo.toml` (`[package.metadata.deb]`,
+`[package.metadata.generate-rpm]`) and `packaging/linux/`. The `Linux
+packages` workflow (`.github/workflows/linux-packages.yml`) does all of this
+for amd64 and arm64.
+
+### Linux repository signing
+
+Maintainer notes. The `Linux packages` workflow always builds, lints, installs
+and smoke-tests the packages and attaches them to a release on a `v*` tag. It
+publishes the signed apt and dnf repositories to the `gh-pages` branch only
+when both of these repository secrets exist (Settings > Secrets and variables >
+Actions) and the tag is pushed to `rlankenau/grimalkin`. With either missing it
+logs a notice, builds the repositories with a throwaway key to test the
+repository code, and publishes nothing. Pull requests never publish.
+
+| Secret | What it is |
+| --- | --- |
+| `LINUX_REPO_GPG_PRIVATE_KEY` | The ASCII-armored private key (a signing key; RSA for the oldest rpm and apt versions). |
+| `LINUX_REPO_GPG_PASSPHRASE` | Its passphrase. |
+
+Create the key once on a trusted machine, then store the secrets:
+
+```
+gpg --quick-generate-key "Grimalkin Packages <rlankenau@gmail.com>" rsa4096 sign 3y   # asks for the passphrase
+gpg --list-secret-keys --keyid-format long                                             # note the KEYID
+gpg --armor --export-secret-keys KEYID | gh secret set LINUX_REPO_GPG_PRIVATE_KEY
+gh secret set LINUX_REPO_GPG_PASSPHRASE
+gpg --armor --export-secret-keys --export-options export-backup KEYID > grimalkin-repo-key.asc   # keep a backup offline
+```
+
+Then turn on GitHub Pages (Settings > Pages > Deploy from a branch > `gh-pages`,
+`/ (root)`); the first signed tag creates the branch. Pre-release tags (`v1.0.0-rc4`)
+go to the `testing` suite and `rpm-testing/`, final tags to `stable` and `rpm/`.
+Older package versions stay in the repository. The key expires after three years:
+extend it (`gpg --quick-set-expire`) and update the secret before then; users
+keep trusting the same public key `grimalkin.gpg` as long as the key itself does
+not change.
 
 ## Configuration
 

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Grimalkin: GPU-accelerated terminal emulator"
+description = "GPU-accelerated terminal emulator with kitty graphics support"
 
 [[bin]]
 name = "grimalkin"
@@ -69,3 +69,78 @@ muda = { version = "0.21", default-features = false }
 [build-dependencies]
 winresource = "0.1"
 
+
+# Linux packages (see packaging/linux/ and .github/workflows/linux-packages.yml).
+# `cargo deb -p grimalkin` and `cargo generate-rpm -p crates/gui` after a
+# `cargo build --release`. Asset sources are relative to this crate.
+#
+# Libraries wgpu, winit and xkbcommon open with dlopen do not show up in the ELF
+# NEEDED list, so the ones a window needs are listed by hand: the Vulkan loader,
+# xkbcommon, the Wayland client library and fontconfig.
+[package.metadata.deb]
+name = "grimalkin"
+maintainer = "Alice Lankenau <rlankenau@gmail.com>"
+copyright = "2025-2026, grimalkin contributors"
+license-file = ["../../packaging/linux/copyright", "0"]
+extended-description = """\
+Grimalkin is a GPU-accelerated terminal emulator with kitty graphics protocol \
+support, window skins and color themes. It renders with Vulkan and runs on \
+Wayland or X11. Install kitty-terminfo so programs see TERM=xterm-kitty; \
+without it Grimalkin falls back to TERM=xterm-256color."""
+section = "shells"
+priority = "optional"
+depends = "$auto, libvulkan1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libfontconfig1"
+recommends = "kitty-terminfo, mesa-vulkan-drivers"
+assets = [
+    ["target/release/grimalkin", "usr/bin/grimalkin", "755"],
+    ["../../packaging/linux/grimalkin.desktop", "usr/share/applications/grimalkin.desktop", "644"],
+    ["../../packaging/linux/grimalkin.metainfo.xml", "usr/share/metainfo/grimalkin.metainfo.xml", "644"],
+    ["../../assets/icon/grimalkin-16.png", "usr/share/icons/hicolor/16x16/apps/grimalkin.png", "644"],
+    ["../../assets/icon/grimalkin-32.png", "usr/share/icons/hicolor/32x32/apps/grimalkin.png", "644"],
+    ["../../assets/icon/grimalkin-48.png", "usr/share/icons/hicolor/48x48/apps/grimalkin.png", "644"],
+    ["../../assets/icon/grimalkin-64.png", "usr/share/icons/hicolor/64x64/apps/grimalkin.png", "644"],
+    ["../../assets/icon/grimalkin-128.png", "usr/share/icons/hicolor/128x128/apps/grimalkin.png", "644"],
+    ["../../assets/icon/grimalkin-256.png", "usr/share/icons/hicolor/256x256/apps/grimalkin.png", "644"],
+    ["../../assets/icon/grimalkin-512.png", "usr/share/icons/hicolor/512x512/apps/grimalkin.png", "644"],
+    ["../../README.md", "usr/share/doc/grimalkin/README.md", "644"],
+    ["../../docs/grimalkin.example.toml", "usr/share/doc/grimalkin/grimalkin.example.toml", "644"],
+    ["../../packaging/linux/grimalkin.lintian-overrides", "usr/share/lintian/overrides/grimalkin", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "grimalkin"
+license = "MIT OR Apache-2.0"
+summary = "GPU-accelerated terminal emulator with kitty graphics protocol support"
+url = "https://github.com/rlankenau/grimalkin"
+# ELF dependencies (glibc, fontconfig) are detected from the binary.
+auto-req = "auto"
+assets = [
+    { source = "target/release/grimalkin", dest = "/usr/bin/grimalkin", mode = "755" },
+    { source = "../../packaging/linux/grimalkin.desktop", dest = "/usr/share/applications/grimalkin.desktop", mode = "644" },
+    { source = "../../packaging/linux/grimalkin.metainfo.xml", dest = "/usr/share/metainfo/grimalkin.metainfo.xml", mode = "644" },
+    { source = "../../assets/icon/grimalkin-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/grimalkin.png", mode = "644" },
+    { source = "../../assets/icon/grimalkin-32.png", dest = "/usr/share/icons/hicolor/32x32/apps/grimalkin.png", mode = "644" },
+    { source = "../../assets/icon/grimalkin-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/grimalkin.png", mode = "644" },
+    { source = "../../assets/icon/grimalkin-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/grimalkin.png", mode = "644" },
+    { source = "../../assets/icon/grimalkin-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/grimalkin.png", mode = "644" },
+    { source = "../../assets/icon/grimalkin-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/grimalkin.png", mode = "644" },
+    { source = "../../assets/icon/grimalkin-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/grimalkin.png", mode = "644" },
+    { source = "../../README.md", dest = "/usr/share/doc/grimalkin/README.md", mode = "644", doc = true },
+    { source = "../../docs/grimalkin.example.toml", dest = "/usr/share/doc/grimalkin/grimalkin.example.toml", mode = "644", doc = true },
+    { source = "../../LICENSE-MIT", dest = "/usr/share/licenses/grimalkin/LICENSE-MIT", mode = "644", license = true },
+    { source = "../../LICENSE-APACHE", dest = "/usr/share/licenses/grimalkin/LICENSE-APACHE", mode = "644", license = true },
+]
+
+# The libraries winit and wgpu open with dlopen are not in the ELF NEEDED list,
+# so they are required by soname. Sonames resolve to the right package on every
+# RPM distribution (Fedora names the Wayland one libwayland-client, openSUSE
+# another way); fontconfig is detected from the binary.
+[package.metadata.generate-rpm.requires]
+"libvulkan.so.1()(64bit)" = "*"
+"libxkbcommon.so.0()(64bit)" = "*"
+"libxkbcommon-x11.so.0()(64bit)" = "*"
+"libwayland-client.so.0()(64bit)" = "*"
+
+[package.metadata.generate-rpm.recommends]
+kitty-terminfo = "*"
+mesa-vulkan-drivers = "*"

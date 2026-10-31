@@ -1,0 +1,360 @@
+name: Linux packages
+
+# Builds the .deb and .rpm packages (amd64 and arm64), tests them, and on a v*
+# tag attaches them to the release. When the signing key secrets exist, also
+# publishes signed apt and dnf repositories to the gh-pages branch. Setup: README,
+# "Installing on Linux" and "Linux repository signing"; packaging files:
+# packaging/linux/.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/linux-packages.yml'
+      - 'crates/gui/Cargo.toml'
+      - 'crates/gui/src/icon.rs'
+      - 'assets/icon/**'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The only repository that publishes the signed package repositories.
+  UPSTREAM_REPOSITORY: rlankenau/grimalkin
+  CARGO_DEB_VERSION: 3.8.0
+  CARGO_GENERATE_RPM_VERSION: 0.21.1
+
+jobs:
+  package:
+    name: package (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # attaches the packages to the release (tags only)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            # Pinned (not ubuntu-latest) so the glibc baseline in the README holds.
+            os: ubuntu-24.04
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (pinned 2026-10-30)
+      - uses: Swatinem/rust-cache@v2
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libfontconfig1-dev dpkg-dev rpm jq
+      - name: Cache cargo-deb and cargo-generate-rpm
+        id: tools
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.cargo-tools
+          key: cargo-tools-${{ matrix.arch }}-deb${{ env.CARGO_DEB_VERSION }}-rpm${{ env.CARGO_GENERATE_RPM_VERSION }}
+      - name: Install cargo-deb and cargo-generate-rpm
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --root "$HOME/.cargo-tools" \
+            cargo-deb@"$CARGO_DEB_VERSION" cargo-generate-rpm@"$CARGO_GENERATE_RPM_VERSION"
+      - name: Put the packaging tools on PATH
+        run: echo "$HOME/.cargo-tools/bin" >> "$GITHUB_PATH"
+
+      - name: Version
+        id: ver
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "grimalkin") | .version')
+          if [[ "$GITHUB_REF" == refs/tags/v* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"
+            exit 1
+          fi
+          # Debian and RPM both sort "1.0.0~rc3" before "1.0.0".
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tilde=${version//-/\~}" >> "$GITHUB_OUTPUT"
+          # Release asset names: GitHub rewrites characters such as "~".
+          echo "asset=${version//\~/-}" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "suite=testing" >> "$GITHUB_OUTPUT"; else echo "suite=stable" >> "$GITHUB_OUTPUT"; fi
+          echo "version $version ($(uname -m))"
+
+      - name: Build
+        run: cargo build --release --locked -p grimalkin
+      - name: Build the .deb
+        run: cargo deb -p grimalkin --no-build
+      - name: Build the .rpm
+        run: |
+          cargo generate-rpm -p crates/gui -s 'version = "${{ steps.ver.outputs.tilde }}"'
+          ls -l target/debian target/generate-rpm
+
+      - name: Lintian
+        run: |
+          sudo apt-get install -y --no-install-recommends lintian
+          # Warnings and info are printed; only errors fail the job.
+          lintian --fail-on error --display-info --tag-display-limit 0 target/debian/*.deb
+      - name: Package contents
+        run: |
+          dpkg-deb --info target/debian/*.deb
+          dpkg-deb --contents target/debian/*.deb
+          echo ---- rpm
+          rpm -qpi target/generate-rpm/*.rpm
+          rpm -qpl target/generate-rpm/*.rpm
+          rpm -qp --requires target/generate-rpm/*.rpm
+          rpm -qp --recommends target/generate-rpm/*.rpm
+
+      - name: Install the .deb
+        run: |
+          sudo apt-get install -y xvfb vulkan-tools desktop-file-utils appstream
+          # apt resolves the Depends and, by default, the Recommends (kitty-terminfo
+          # and the Mesa Vulkan drivers, which include the lavapipe software GPU).
+          sudo apt-get install -y ./target/debian/*.deb
+      - name: Installed files
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/grimalkin
+          test -f /usr/share/applications/grimalkin.desktop
+          test -f /usr/share/metainfo/grimalkin.metainfo.xml
+          for s in 16 32 48 64 128 256 512; do
+            f=/usr/share/icons/hicolor/${s}x${s}/apps/grimalkin.png
+            test -f "$f"
+            file "$f" | grep -q "PNG image data, $s x $s"
+          done
+          desktop-file-validate /usr/share/applications/grimalkin.desktop
+          grep -qx 'StartupWMClass=grimalkin' /usr/share/applications/grimalkin.desktop
+          # Errors fail; the warning for a non-rDNS id stays (the id has to match
+          # the desktop file name and the window's app id, "grimalkin").
+          appstreamcli validate --no-net /usr/share/metainfo/grimalkin.metainfo.xml | tee /tmp/appstream.txt || true
+          if grep -q '^E:' /tmp/appstream.txt; then exit 1; fi
+          dpkg -s grimalkin | grep -E '^(Version|Depends|Recommends):'
+          dpkg -s kitty-terminfo | grep -E '^Status:'
+      - name: Smoke test, no display
+        run: |
+          set -euo pipefail
+          grimalkin --version
+          grimalkin --list-themes
+          # Children get TERM=xterm-kitty because kitty-terminfo is installed.
+          dpkg -L kitty-terminfo | grep xterm-kitty
+      - name: Smoke test, headless render (Xvfb + lavapipe)
+        env:
+          RUST_LOG: info
+          WGPU_BACKEND: vulkan
+        run: |
+          set -euo pipefail
+          vulkaninfo --summary || true
+          rm -f /tmp/f.png
+          # The child outlives the first frame (a child that exits at once can
+          # close the window before a frame is dumped); EXIT_AFTER_FRAME ends it.
+          GRIMALKIN_DUMP_FRAME=/tmp/f.png GRIMALKIN_EXIT_AFTER_FRAME=1 \
+            timeout 120 xvfb-run -a -s '-screen 0 1280x800x24' grimalkin -e sleep 100
+          ls -l /tmp/f.png
+          file /tmp/f.png | grep -q 'PNG image data'
+          test "$(stat -c %s /tmp/f.png)" -gt 1000
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: grimalkin-frame-${{ matrix.arch }}
+          path: /tmp/f.png
+          if-no-files-found: ignore
+      - name: Remove the package
+        run: |
+          set -euo pipefail
+          sudo apt-get remove -y grimalkin
+          test ! -e /usr/bin/grimalkin
+          test ! -e /usr/share/applications/grimalkin.desktop
+
+      - name: Install the .rpm on Fedora
+        run: |
+          # A clean Fedora container: dnf resolves the Requires from the Fedora
+          # repositories and installs the weak dependencies (kitty-terminfo).
+          docker run --rm -v "$PWD/target/generate-rpm:/rpm:ro" fedora:latest sh -ec '
+            dnf install -y /rpm/*.rpm
+            rpm -q grimalkin kitty-terminfo
+            grimalkin --version
+            grimalkin --list-themes
+            test -f /usr/share/applications/grimalkin.desktop
+            test -f /usr/share/icons/hicolor/256x256/apps/grimalkin.png
+            test -f /usr/share/metainfo/grimalkin.metainfo.xml'
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp target/debian/*.deb "release/grimalkin_${{ steps.ver.outputs.asset }}_${{ matrix.arch }}.deb"
+          rpm=$(ls target/generate-rpm/*.rpm)
+          cp "$rpm" "release/grimalkin-${{ steps.ver.outputs.asset }}.$(rpm -qp --qf '%{ARCH}' "$rpm").rpm"
+          ls -l release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: grimalkin-deb-${{ matrix.arch }}
+          path: target/debian/*.deb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: grimalkin-rpm-${{ matrix.arch }}
+          path: target/generate-rpm/*.rpm
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: release/*
+
+  # Signed apt and dnf repositories. On a v* tag pushed to the upstream
+  # repository, with LINUX_REPO_GPG_PRIVATE_KEY and LINUX_REPO_GPG_PASSPHRASE
+  # set, they are published to the gh-pages branch. Every other run (pull
+  # requests, forks, dispatches, no secrets) builds the same repositories with a
+  # throwaway key and installs from them, so the repository code is exercised
+  # but nothing is published and no secret is touched.
+  repo:
+    name: signed repositories
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # pushes gh-pages (publish mode only)
+    concurrency:
+      group: linux-repo-${{ startsWith(github.ref, 'refs/tags/v') && 'publish' || github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: grimalkin-deb-*
+          merge-multiple: true
+          path: pkgs/deb
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: grimalkin-rpm-*
+          merge-multiple: true
+          path: pkgs/rpm
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils createrepo-c gnupg
+      - name: Decide whether to publish
+        id: mode
+        env:
+          KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+          PASS: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          mode='test'
+          if [[ "$GITHUB_EVENT_NAME" != "push" || "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::notice::Not a release tag: building the repositories with a throwaway key to test them; nothing is published"
+          elif [[ "$GITHUB_REPOSITORY" != "$UPSTREAM_REPOSITORY" ]]; then
+            echo "::notice::Only $UPSTREAM_REPOSITORY publishes the repositories; testing with a throwaway key"
+          elif [[ -z "$KEY" || -z "$PASS" ]]; then
+            echo "::notice::Linux repositories are NOT published: the secrets LINUX_REPO_GPG_PRIVATE_KEY and LINUX_REPO_GPG_PASSPHRASE are not both set (README, Linux repository signing). Testing with a throwaway key."
+          else
+            mode=publish
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          # The suite follows the version in the package name: pre-release -> testing.
+          if ls pkgs/deb/*~*.deb >/dev/null 2>&1; then suite=testing; else suite=stable; fi
+          echo "suite=$suite" >> "$GITHUB_OUTPUT"
+      - name: Prepare the signing key
+        id: key
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+          PASS: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          if [[ "$MODE" == publish ]]; then
+            printf '%s\n' "$KEY" | gpg --batch --import
+            echo "::add-mask::$PASS"
+            echo "GPG_PASSPHRASE=$PASS" >> "$GITHUB_ENV"
+          else
+            gpg --batch --passphrase '' --quick-generate-key 'Grimalkin CI test key <ci-test@invalid>' rsa3072 sign 1d
+          fi
+          fpr=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
+          test -n "$fpr"
+          echo "fpr=$fpr" >> "$GITHUB_OUTPUT"
+          echo "signing with key $fpr ($MODE)"
+      - name: Fetch the existing repository
+        if: steps.mode.outputs.mode == 'publish'
+        run: |
+          set -euo pipefail
+          # Exit status 2 means "no such branch"; any other failure (network,
+          # server) must stop the job, or an empty tree would replace the
+          # published repository.
+          rc=0
+          git ls-remote --exit-code --heads "https://github.com/$GITHUB_REPOSITORY.git" gh-pages >/dev/null || rc=$?
+          if [[ $rc -eq 0 ]]; then
+            git clone --depth 1 --branch gh-pages "https://github.com/$GITHUB_REPOSITORY.git" repo
+            rm -rf repo/.git
+          elif [[ $rc -eq 2 ]]; then
+            echo "no gh-pages branch yet: starting an empty repository"
+            mkdir repo
+          else
+            echo "::error::could not look up the gh-pages branch (git ls-remote exit $rc); refusing to publish"
+            exit 1
+          fi
+      - name: Build the repositories
+        env:
+          # A local path in test mode (it is mounted at /repo in the container).
+          BASE_URL: ${{ steps.mode.outputs.mode == 'publish' && format('https://{0}.github.io/{1}', github.repository_owner, github.event.repository.name) || 'file:///repo' }}
+        run: |
+          set -euo pipefail
+          mkdir -p repo
+          packaging/linux/build-repo.sh repo pkgs/deb pkgs/rpm "${{ steps.mode.outputs.suite }}" "${{ steps.key.outputs.fpr }}"
+          find repo -maxdepth 4 -not -path '*/pool/*' | sort
+      - name: Verify with apt
+        run: |
+          set -euo pipefail
+          suite=${{ steps.mode.outputs.suite }}
+          sudo rm -rf /tmp/aptrepo && sudo cp -r repo /tmp/aptrepo && sudo chmod -R a+rX /tmp/aptrepo
+          echo "deb [signed-by=/tmp/aptrepo/grimalkin.gpg] file:///tmp/aptrepo/apt $suite main" | sudo tee /etc/apt/sources.list.d/grimalkin.list
+          # Install from the generated repository (dependencies come from the
+          # system sources) and run the result.
+          sudo apt-get update
+          apt-cache policy grimalkin | tee /tmp/policy
+          grep -q 'file:/tmp/aptrepo/apt' /tmp/policy
+          sudo apt-get install -y grimalkin
+          grimalkin --version
+          # A tampered Release must be refused. Only this source list is used.
+          sudo sed -i 's/^Suite: .*/Suite: tampered/' /tmp/aptrepo/apt/dists/$suite/InRelease
+          opts=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/grimalkin.list -o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 -o APT::Update::Error-Mode=any)
+          # With Error-Mode=any apt exits non-zero; the output names the bad signature.
+          out=$(sudo apt-get "${opts[@]}" update 2>&1 || true)
+          echo "$out"
+          if ! grep -q 'BADSIG' <<<"$out"; then echo "::error::apt did not reject a tampered InRelease"; exit 1; fi
+      - name: Verify with dnf (Fedora container)
+        run: |
+          set -euo pipefail
+          suite=${{ steps.mode.outputs.suite }}
+          if [[ "${{ steps.mode.outputs.mode }}" == publish ]]; then
+            echo "publish mode: the .repo files point at the public URL; checking their syntax only"
+            cat repo/grimalkin.repo repo/grimalkin-testing.repo
+          else
+            repofile=grimalkin.repo; [[ $suite == testing ]] && repofile=grimalkin-testing.repo
+            docker run --rm -v "$PWD/repo:/repo:ro" fedora:latest sh -ec "
+              cp /repo/$repofile /etc/yum.repos.d/
+              dnf install -y grimalkin
+              rpm -q grimalkin
+              grimalkin --version"
+          fi
+      - name: Publish to gh-pages
+        if: steps.mode.outputs.mode == 'publish'
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: repo
+          # The whole tree (older pool entries included) was fetched and is
+          # republished, so history can be dropped to keep the branch small.
+          force_orphan: true
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_message: "Linux repositories for ${{ github.ref_name }}"
+      - name: Clean up the key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/gnupg"
