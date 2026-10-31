@@ -584,7 +584,8 @@ fn advanced(ui: &mut Ui, p: &mut Prefs) {
         }
     });
     ui.horizontal(|ui| {
-        ui.add_enabled(!busy, TextEdit::singleline(&mut p.text.install_name).desired_width(CONTROL_WIDTH + 40.0).hint_text("Name (optional)"));
+        let r = ui.add_enabled(!busy, TextEdit::singleline(&mut p.text.install_name).desired_width(CONTROL_WIDTH + 40.0).hint_text("Name (optional)"));
+        a11y::describe(ui, &r, "WinAMP skin name (optional)", None);
     });
     hint(ui, "Raw museum links (r2.webampskins.org/skins/<md5>.wsz) install under their hash unless you give a name. Names are lower-cased.");
     ui.checkbox(&mut p.overwrite_skin, "Overwrite if already installed");
