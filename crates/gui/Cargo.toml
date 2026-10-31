@@ -131,14 +131,15 @@ assets = [
     { source = "../../LICENSE-APACHE", dest = "/usr/share/licenses/grimalkin/LICENSE-APACHE", mode = "644", license = true },
 ]
 
-# Names are the Fedora / RHEL ones; the dlopened libraries are not in the ELF
-# NEEDED list, so they are listed here.
+# The libraries winit and wgpu open with dlopen are not in the ELF NEEDED list,
+# so they are required by soname. Sonames resolve to the right package on every
+# RPM distribution (Fedora names the Wayland one libwayland-client, openSUSE
+# another way); fontconfig is detected from the binary.
 [package.metadata.generate-rpm.requires]
-vulkan-loader = "*"
-libxkbcommon = "*"
-libxkbcommon-x11 = "*"
-wayland-libs-client = "*"
-fontconfig = "*"
+"libvulkan.so.1()(64bit)" = "*"
+"libxkbcommon.so.0()(64bit)" = "*"
+"libxkbcommon-x11.so.0()(64bit)" = "*"
+"libwayland-client.so.0()(64bit)" = "*"
 
 [package.metadata.generate-rpm.recommends]
 kitty-terminfo = "*"

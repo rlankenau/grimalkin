@@ -379,8 +379,9 @@ Download from the [latest release](https://github.com/rlankenau/grimalkin/releas
 | `grimalkin-<version>.x86_64.rpm`, `...aarch64.rpm` | x86-64, ARM64 | `sudo dnf install ./grimalkin-<version>.x86_64.rpm` |
 
 The packages are built on Ubuntu 24.04 (glibc 2.39), so they need a distribution
-at least that recent (Ubuntu 24.04+, Debian 13+, Fedora 40+). RPMs target the
-Fedora / RHEL family package names. Pre-release versions are written
+at least that recent (Ubuntu 24.04+, Debian 13+, Fedora 40+). The RPM requires
+its libraries by soname, not by distribution-specific package name. Pre-release
+versions are written
 `1.0.0~rc3` inside the packages (so `1.0.0` upgrades them) and `1.0.0-rc3` in
 the file names on the release page.
 
