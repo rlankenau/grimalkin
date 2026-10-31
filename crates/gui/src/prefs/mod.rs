@@ -64,6 +64,8 @@ pub struct PreferencesWindow {
     prefs: Prefs,
     mods: ModifiersState,
     shown: bool,
+    /// Section step (Ctrl+Tab) waiting for a text box to commit.
+    pending_step: i32,
     /// `GRIMALKIN_PREFS_DUMP_TREE`: where to write the accessibility tree, and
     /// the text last written there.
     dump: Option<(PathBuf, String)>,
@@ -123,7 +125,7 @@ impl PreferencesWindow {
         let repaint = Arc::new(move || w.request_redraw());
         let prefs = Prefs::new(args.config_path, dispatch, applied, repaint);
 
-        let mut win = PreferencesWindow { window, ctx, state, painter, prefs, mods: ModifiersState::empty(), shown: false, dump, next_repaint: None };
+        let mut win = PreferencesWindow { window, ctx, state, painter, prefs, mods: ModifiersState::empty(), shown: false, pending_step: 0, dump, next_repaint: None };
         win.redraw(); // first frame before the window appears: no white flash
         win.window.set_visible(true);
         win.window.focus_window();
@@ -139,9 +141,24 @@ impl PreferencesWindow {
         }
         let now = Instant::now();
         let mut raw = self.state.take_egui_input(&self.window);
+        // A section switch asked for while a text box is being edited waits one
+        // frame: the box first loses the focus, which commits what was typed.
+        if self.pending_step != 0 {
+            self.prefs.section = self.prefs.section.cycle(std::mem::take(&mut self.pending_step));
+        }
         let step = a11y::take_section_keys(&mut raw.events);
         if step != 0 {
-            self.prefs.section = self.prefs.section.cycle(step);
+            if self.ctx.egui_wants_keyboard_input() {
+                self.ctx.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+                self.pending_step = step;
+                self.window.request_redraw();
+            } else {
+                self.prefs.section = self.prefs.section.cycle(step);
+            }
         }
         let prefs = &mut self.prefs;
         let full = self.ctx.run_ui(raw, |ui| ui::show(ui, prefs));
