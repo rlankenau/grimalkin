@@ -298,7 +298,7 @@ impl App {
         let resolved = theme::resolve_for_skin(&self.cfg, skin.as_deref());
         let palette = skin_palette(resolved.palette, &self.cfg, skin.as_deref());
         let cfg = &resolved.config;
-        let mut attrs = Window::default_attributes()
+        let mut attrs = crate::icon::with_app_id(Window::default_attributes())
             .with_title(sanitize_title(&cfg.window.title))
             .with_inner_size(LogicalSize::new(900.0, 600.0))
             .with_window_icon(crate::icon::window_icon())

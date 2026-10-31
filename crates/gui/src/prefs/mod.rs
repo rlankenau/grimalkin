@@ -62,7 +62,7 @@ pub struct PreferencesWindow {
 
 impl PreferencesWindow {
     pub fn open(event_loop: &ActiveEventLoop, args: OpenArgs) -> Result<PreferencesWindow, String> {
-        let mut attrs = Window::default_attributes()
+        let mut attrs = crate::icon::with_app_id(Window::default_attributes())
             .with_title(TITLE)
             .with_inner_size(LogicalSize::new(SIZE.0, SIZE.1))
             .with_min_inner_size(LogicalSize::new(MIN_SIZE.0, MIN_SIZE.1))
