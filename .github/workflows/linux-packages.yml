@@ -309,9 +309,11 @@ jobs:
           apt-cache "${opts[@]}" policy grimalkin | tee /tmp/policy
           grep -q 'file:/tmp/aptrepo/apt' /tmp/policy
           # A tampered Release must be refused.
-          sudo cp /tmp/aptrepo/apt/dists/$suite/InRelease /tmp/InRelease.good
           sudo sed -i 's/^Suite: .*/Suite: tampered/' /tmp/aptrepo/apt/dists/$suite/InRelease
-          if sudo apt-get "${opts[@]}" update; then echo "::error::apt accepted a tampered InRelease"; exit 1; fi
+          # apt exits 0 here but reports the bad signature and keeps the old lists.
+          out=$(sudo apt-get "${opts[@]}" update 2>&1 || true)
+          echo "$out"
+          if ! grep -q 'BADSIG' <<<"$out"; then echo "::error::apt did not reject a tampered InRelease"; exit 1; fi
       - name: Verify with dnf (Fedora container)
         run: |
           set -euo pipefail
