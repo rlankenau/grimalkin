@@ -1,0 +1,264 @@
+# Package-manager publishing: winget (Windows), a Homebrew tap (macOS) and the
+# MacPorts Portfile. Separate from ci.yml so release builds are untouched.
+#
+# When it runs:
+#   - workflow_run: after the CI workflow finished successfully for a pushed v*
+#     tag. (Not "release: published": the release is created by CI's own
+#     GITHUB_TOKEN, and events made with that token never start other workflows;
+#     it would also fire before the installers are attached.)
+#   - workflow_dispatch: run it by hand for any existing release tag.
+#   - pull_request touching packaging/ or this file: a dry run against the latest
+#     published release, to keep the scripts and manifests honest. Never submits.
+#
+# Secrets (all optional; without them the jobs only build and validate the
+# package files and upload them as artifacts; see README "Packaging"):
+#   WINGET_GITHUB_TOKEN  PAT with public_repo, owner of the winget-pkgs fork
+#   HOMEBREW_TAP_TOKEN   PAT (or fine-grained token) with contents:write on
+#                        rlankenau/homebrew-grimalkin
+name: Packaging
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to package (for example v1.0.0)
+        required: true
+      submit:
+        description: Submit/push to winget-pkgs and the Homebrew tap (needs the secrets)
+        type: boolean
+        default: false
+      prerelease_ok:
+        description: Allow submitting a pre-release tag (one containing "-")
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/packaging.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: resolve release
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.r.outputs.run }}
+      tag: ${{ steps.r.outputs.tag }}
+      submit: ${{ steps.r.outputs.submit }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          # workflow_run
+          WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WR_EVENT: ${{ github.event.workflow_run.event }}
+          WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          # workflow_dispatch
+          IN_TAG: ${{ inputs.tag }}
+          IN_SUBMIT: ${{ inputs.submit }}
+          IN_PRERELEASE_OK: ${{ inputs.prerelease_ok }}
+        run: |
+          set -euo pipefail
+          run=false; tag=""; submit=false
+          case "$EVENT" in
+            workflow_run)
+              # Only successful CI runs for tags pushed to this very repository.
+              if [[ "$WR_CONCLUSION" == success && "$WR_EVENT" == push && "$WR_REPO" == "$GITHUB_REPOSITORY" && "$WR_BRANCH" == v* ]]; then
+                tag="$WR_BRANCH"; run=true; submit=true
+                # head_branch is a branch or a tag name; insist on a tag.
+                gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --silent || { echo "::notice::$tag is not a tag"; run=false; }
+              else
+                echo "::notice::not a successful CI run for a pushed v* tag; nothing to package"
+              fi ;;
+            workflow_dispatch)
+              tag="$IN_TAG"; run=true; submit="$IN_SUBMIT" ;;
+            *)
+              tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"; run=true ;;
+          esac
+          if [[ "$run" == true ]]; then
+            [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::bad tag: $tag"; exit 1; }
+            # winget and Homebrew have no real pre-release channel: do not push rc/beta tags
+            # to them unless asked for by hand.
+            if [[ "$submit" == true && "$tag" == *-* && "$EVENT" != workflow_dispatch ]]; then
+              echo "::notice::$tag is a pre-release: building and validating only, not submitting"
+              submit=false
+            fi
+            if [[ "$submit" == true && "$tag" == *-* && "$IN_PRERELEASE_OK" != true ]]; then
+              echo "::notice::$tag is a pre-release and prerelease_ok is off: not submitting"
+              submit=false
+            fi
+          fi
+          { echo "run=$run"; echo "tag=$tag"; echo "submit=$submit"; } >> "$GITHUB_OUTPUT"
+          echo "run=$run tag=$tag submit=$submit"
+
+  winget:
+    name: winget manifests
+    needs: resolve
+    if: needs.resolve.outputs.run == 'true'
+    runs-on: windows-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SUBMIT: ${{ needs.resolve.outputs.submit }}
+      WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Generate the manifests from the release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python packaging/winget/update-manifest.py "$TAG" --out-dir out/manifests --urls-file out/urls.txt
+          for f in out/manifests/*.yaml; do echo "=== $f"; cat "$f"; done
+          echo "=== urls"; cat out/urls.txt
+      - name: Make sure winget is available
+        shell: pwsh
+        run: |
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+            winget --version
+          } else {
+            Write-Host "winget not preinstalled; installing it with the Microsoft.WinGet.Client module"
+            Install-PackageProvider -Name NuGet -Force | Out-Null
+            Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery
+            Repair-WinGetPackageManager -AllUsers -Force
+            "$env:LOCALAPPDATA\Microsoft\WindowsApps" | Out-File -FilePath $env:GITHUB_PATH -Append
+            $env:PATH += ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
+            winget --version
+          }
+      - name: winget validate
+        shell: pwsh
+        run: |
+          winget validate --manifest out/manifests
+          if ($LASTEXITCODE -ne 0) { throw "winget validate failed ($LASTEXITCODE)" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: winget-manifests-${{ needs.resolve.outputs.tag }}
+          path: out/manifests
+          if-no-files-found: error
+          retention-days: 30
+      - name: Submit to microsoft/winget-pkgs (wingetcreate submit)
+        shell: pwsh
+        run: |
+          $version = $env:TAG.Substring(1)
+          $dir = 'out/manifests'
+          $cmd = "wingetcreate submit --token <PAT> $dir"
+          if ($env:SUBMIT -ne 'true') {
+            Write-Host "Not submitting for this run (dry run, pre-release tag, or submit=false)."
+            Write-Host "To submit by hand, from the 'winget-manifests-$($env:TAG)' artifact:  $cmd"
+            exit 0
+          }
+          if (-not $env:WINGET_GITHUB_TOKEN) {
+            Write-Host "::notice::WINGET_GITHUB_TOKEN is not set; not submitting."
+            Write-Host "To submit by hand, from the 'winget-manifests-$($env:TAG)' artifact:  $cmd"
+            exit 0
+          }
+          # The first submission of a new package is manual (`wingetcreate new`, see
+          # README 'Packaging'); automation only adds versions to a package that is
+          # already in microsoft/winget-pkgs.
+          gh api repos/microsoft/winget-pkgs/contents/manifests/r/rlankenau/grimalkin --silent 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::notice::rlankenau.grimalkin is not in microsoft/winget-pkgs yet: the first submission is manual (wingetcreate new). See README 'Packaging'."
+            exit 0
+          }
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          # Submit the manifests that were just generated and validated (not
+          # `wingetcreate update`, which needs the installer count to match the
+          # previous version and would break when an architecture is added or dropped).
+          ./wingetcreate.exe submit --prtitle "New version: rlankenau.grimalkin version $version" --token $env:WINGET_GITHUB_TOKEN $dir
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit failed ($LASTEXITCODE)" }
+
+  homebrew:
+    name: homebrew cask
+    needs: resolve
+    if: needs.resolve.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SUBMIT: ${{ needs.resolve.outputs.submit }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Update the cask from the release dmgs
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp packaging/homebrew/grimalkin.rb out/grimalkin.rb
+          packaging/homebrew/update-cask.sh "$TAG" out/grimalkin.rb
+          cat out/grimalkin.rb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: homebrew-cask-${{ needs.resolve.outputs.tag }}
+          path: out/grimalkin.rb
+          if-no-files-found: error
+          retention-days: 30
+      - name: Check out the tap
+        if: env.SUBMIT == 'true' && env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: rlankenau/homebrew-grimalkin
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Push the cask to the tap
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          if [[ "$SUBMIT" != true || -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
+            echo "::notice::Not pushing to the tap (dry run, pre-release, submit=false, or HOMEBREW_TAP_TOKEN unset)."
+            echo "To publish by hand: copy the 'homebrew-cask-$TAG' artifact to Casks/grimalkin.rb in"
+            echo "rlankenau/homebrew-grimalkin, commit as 'grimalkin $version' and push."
+            exit 0
+          fi
+          mkdir -p tap/Casks
+          cp out/grimalkin.rb tap/Casks/grimalkin.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/grimalkin.rb
+          if git diff --cached --quiet; then
+            echo "cask already up to date"; exit 0
+          fi
+          git commit -m "grimalkin $version"
+          git push
+
+  macports:
+    name: macports portfile
+    needs: resolve
+    if: needs.resolve.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The crate list must match Cargo.lock. This does not install MacPorts; the
+      # Portfile itself is only verified by `port lint` / `port install` on a Mac.
+      - name: cargo.crates is in sync with Cargo.lock
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp packaging/macports/Portfile out/Portfile
+          python3 packaging/macports/gen-crates.py --update out/Portfile
+          diff -u packaging/macports/Portfile out/Portfile || {
+            echo "::error::packaging/macports/Portfile cargo.crates is stale; run packaging/macports/gen-crates.py --update packaging/macports/Portfile"
+            exit 1
+          }
+      - name: Portfile for this release
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          sed -E -i "s/^(github\.setup +rlankenau grimalkin )[^ ]+( v)/\1${version}\2/" out/Portfile
+          grep -n '^github.setup' out/Portfile
+          echo "::notice::The Portfile artifact has the version bumped but NOT the checksums (rmd160/sha256/size)."
+          echo "Refresh them on a Mac with MacPorts (sudo port checksum grimalkin reports the expected values), then lint and submit; see README 'Packaging'."
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macports-portfile-${{ needs.resolve.outputs.tag }}
+          path: out/Portfile
+          if-no-files-found: error
+          retention-days: 30
