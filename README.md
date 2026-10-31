@@ -67,7 +67,7 @@ want Program Files instead. The installer:
   [Windows: two files](#windows-two-files)) together, plus Microsoft's ConPTY
   redistributable (`conpty.dll` and `OpenConsole.exe`) beside them. The bundled
   ConPTY is what makes the kitty graphics protocol work on Windows 10 (see
-  [Windows: kitty graphics need a newer ConPTY](#windows-kitty-graphics-need-a-newer-conpty));
+  [Windows: kitty graphics need the bundled ConPTY](#windows-kitty-graphics-need-the-bundled-conpty));
   nothing extra to download
 - adds a Start Menu shortcut, and optionally a desktop icon
 - optionally adds grimalkin to your `PATH` so `grimalkin` works from any shell
@@ -442,6 +442,13 @@ grimalkin --install-skin https://skins.webamp.org/skin/<md5>/     # a museum pag
 grimalkin --list-skins
 ```
 
+Skin names are lower case by design (`Winamp3_Classified` installs as
+`winamp3-classified`). A museum page URL that ends in the file name keeps that
+name, but a raw archive link (`https://r2.webampskins.org/skins/<md5>.wsz`)
+installs under its hash. In Preferences > Advanced > "Install a WinAMP skin"
+the optional Name field overrides the derived name (it is sanitised and
+lower-cased too).
+
 and put the name it prints in `grimalkin.toml`:
 
 ```toml
@@ -518,7 +525,7 @@ between two skins is live).
 | --- | --- |
 | Mod+C | Copy selection |
 | Mod+V, Shift+Insert | Paste |
-| Ctrl+V (Windows; `input.ctrl_v_paste`, default on) | Paste, sanitised, instead of sending Ctrl+V to the shell |
+| Ctrl+V (Windows; `input.ctrl_v_paste`, default on) | Paste, sanitised, instead of sending Ctrl+V to the shell. On Windows plain Ctrl+V pastes by default, in addition to Ctrl+Shift+V; the context menu shows Ctrl+V while it is on |
 | Mod++ / Mod+- | Zoom in / out |
 | Mod+0 | Reset zoom |
 | Cmd+, (macOS) / Ctrl+, | Preferences |
@@ -569,12 +576,22 @@ keyboard protocols. On Unix, if no kitty terminfo database can be found
 back to `TERM=xterm-256color` so vim, tmux, less and friends keep working. See
 `crates/gui/src/terminfo.rs`.
 
-## Windows: kitty graphics need a newer ConPTY
+## Windows: kitty graphics need the bundled ConPTY
 
-Stock Windows 10 ConPTY (conhost 10.0.19041) strips APC sequences
-(`ESC _ ... ESC \`), so the kitty graphics protocol never reaches Grimalkin, and
-it swallows the kitty keyboard query (`CSI ? u`). Grimalkin talks to ConPTY
-directly (`crates/pty/src/win/`) and can use Microsoft's current one:
+The bundled ConPTY (`conpty.dll` + `OpenConsole.exe`, NuGet package
+`Microsoft.Windows.Console.ConPTY` 1.25) is required on both Windows 10 and
+Windows 11 for the kitty graphics protocol. The in-box console host strips APC
+sequences (`ESC _ ... ESC \`) on both:
+
+- Windows 11 25H2, in-box conhost 10.0.26100.9549: APC is stripped (a graphics
+  query gets no reply and images do not draw), even with `pty.passthrough`
+  enabled. `CSI ? u` (kitty keyboard) and XTVERSION pass through, and DA1 is
+  answered by conhost itself.
+- Windows 10 19041, in-box conhost: APC is stripped and `CSI ? u` is swallowed.
+
+The release builds and installers ship the pair next to `grimalkin.exe`. To add
+it to a build of your own, Grimalkin talks to ConPTY directly
+(`crates/pty/src/win/`) and can use Microsoft's current one:
 
 1. Download the `Microsoft.Windows.Console.ConPTY` NuGet package (a `.nupkg` is
    a zip file) and take `runtimes/win-x64/native/conpty.dll` and
@@ -586,9 +603,8 @@ At startup Grimalkin loads `conpty.dll` from the executable's directory if it
 exists and falls back to the in-box `kernel32.dll` ConPTY otherwise. Run with
 `RUST_LOG=info` to see which one was used.
 
-For the best chance of APC and other sequences arriving untouched, also turn on
-passthrough mode (`PSEUDOCONSOLE_PASSTHROUGH_MODE`), which stops ConPTY from
-re-rendering the child's output:
+`[pty] passthrough` (experimental, off by default) asks the in-box ConPTY for
+flag 0x8 when it creates the pseudoconsole:
 
 ```toml
 [pty]
@@ -596,10 +612,10 @@ passthrough = true
 ```
 
 or set `GRIMALKIN_CONPTY_PASSTHROUGH=1` (`0` forces it off), which overrides
-the file. Passthrough only applies to the in-box ConPTY of Windows 11 24H2 or newer;
-if it rejects the flag, Grimalkin logs a warning and starts without it. It is
-never sent to a sideloaded `conpty.dll` (see below).
-Passthrough is off by default.
+the file. It does not make kitty graphics work with the in-box ConPTY: it had
+no observable effect on Windows 11 24H2 or 25H2 in tests. If the system rejects
+the flag, Grimalkin logs a warning and starts without it. It is never sent to a
+sideloaded `conpty.dll` (see below).
 
 Tested facts (Windows 10, ConPTY package 1.25):
 

@@ -111,7 +111,7 @@ mod none {
     pub struct AppMenus;
 
     impl AppMenus {
-        pub fn new(_proxy: EventLoopProxy<UserEvent>, _theme: &str, _skin: &str) -> Option<AppMenus> {
+        pub fn new(_proxy: EventLoopProxy<UserEvent>, _theme: &str, _skin: &str, _ctrl_v_paste: bool) -> Option<AppMenus> {
             None
         }
         pub fn sync(&mut self, _theme: &str, _skin: &str) {}
@@ -219,14 +219,14 @@ mod native {
         /// Build the menus and route their clicks into the event loop. Call
         /// on the main thread once the event loop is running (macOS needs
         /// NSApp to exist).
-        pub fn new(proxy: EventLoopProxy<UserEvent>, active_theme: &str, active_skin: &str) -> Option<AppMenus> {
+        pub fn new(proxy: EventLoopProxy<UserEvent>, active_theme: &str, active_skin: &str, ctrl_v_paste: bool) -> Option<AppMenus> {
             MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
                 if let Some(action) = MenuAction::from_id(&ev.id().0) {
                     let _ = proxy.send_event(UserEvent::MenuAction(action));
                 }
             }));
             let mut m = AppMenus { bar: build_bar(), context: Menu::new(), context_choices: Choices::new() };
-            if let Err(e) = build_context(&m.context, &m.context_choices) {
+            if let Err(e) = build_context(&m.context, &m.context_choices, ctrl_v_paste) {
                 log::warn!("cannot build the context menu: {e}");
                 return None;
             }
@@ -281,7 +281,8 @@ mod native {
 
     /// The accelerator shown next to a context-menu item, matching the key
     /// bindings in `input.rs`: Cmd+key on macOS, Ctrl+Shift+key elsewhere
-    /// (`shifted` false: Ctrl+key, for Settings). The popup is never attached
+    /// (`shifted` false: Ctrl+key, for Settings and, on Windows, for Paste when
+    /// `input.ctrl_v_paste` is on). The popup is never attached
     /// to a window's accelerator table, and winit's loop does not call
     /// `TranslateAcceleratorW`, so on Windows these are labels only; on macOS
     /// a key equivalent only acts while the popup is open, and the key event
@@ -299,11 +300,11 @@ mod native {
     }
 
     /// Items shared by the context menu (and, in part, the menu bar).
-    fn build_context(menu: &Menu, choices: &Choices) -> muda::Result<()> {
+    fn build_context(menu: &Menu, choices: &Choices, ctrl_v_paste: bool) -> muda::Result<()> {
         use muda::accelerator::Code;
         menu.append_items(&[
             &item("Copy", &MenuAction::Copy, shortcut(Code::KeyC, true)),
-            &item("Paste", &MenuAction::Paste, shortcut(Code::KeyV, true)),
+            &item("Paste", &MenuAction::Paste, shortcut(Code::KeyV, !(cfg!(windows) && ctrl_v_paste))),
             &PredefinedMenuItem::separator(),
             &item("Zoom In", &MenuAction::ZoomIn, shortcut(Code::Equal, true)),
             &item("Zoom Out", &MenuAction::ZoomOut, shortcut(Code::Minus, true)),
