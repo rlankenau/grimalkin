@@ -472,7 +472,7 @@ impl ApplicationHandler<UserEvent> for App {
             Ok(mut r) => {
                 // NSApp exists now: install the menu bar (macOS) and build the
                 // context menu.
-                self.menus = AppMenus::new(self.proxy.clone(), &r.cfg.theme, &r.cfg.skin);
+                self.menus = AppMenus::new(self.proxy.clone(), &r.cfg.theme, &r.cfg.skin, r.cfg.input.ctrl_v_paste);
                 r.menu_accels = self.menus.as_ref().is_some_and(AppMenus::has_menu_bar);
                 r.redraw();
                 self.running = Some(r);
@@ -519,7 +519,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ConfigChanged => {
                 r.reload_config();
                 if let Some(m) = self.menus.as_mut() {
-                    m.sync(&r.cfg.theme, &r.cfg.skin);
+                    m.sync(&r.cfg.theme, &r.cfg.skin, r.cfg.input.ctrl_v_paste);
                 }
                 let notice = r.notice.take();
                 for w in self.secondary.values_mut() {

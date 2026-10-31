@@ -150,12 +150,16 @@ pub fn install_bytes(
 }
 
 /// Install from a local file or an https URL into `dir`.
-pub fn install_from(src: &str, dir: &Path, force: bool) -> Result<String, String> {
+///
+/// `name` overrides the derived skin name (a raw museum URL otherwise installs
+/// under its md5); it is sanitised like any other name (lower case).
+pub fn install_from(src: &str, dir: &Path, force: bool, name: Option<&str>) -> Result<String, String> {
+    let name = name.map(str::trim).filter(|n| !n.is_empty());
     if is_url(src) {
         let url = map_museum_url(src.trim());
         let bytes = download(&url)?;
         // A museum page URL may carry a readable name after the hash.
-        let stem = museum_name(src).unwrap_or_else(|| stem_of_url(&url));
+        let stem = name.map(String::from).unwrap_or_else(|| museum_name(src).unwrap_or_else(|| stem_of_url(&url)));
         return install_bytes(bytes, &stem, dir, force);
     }
     let path = Path::new(src);
@@ -174,10 +178,11 @@ pub fn install_from(src: &str, dir: &Path, force: bool) -> Result<String, String
         ));
     }
     let bytes = crate::fsutil::read_regular(path, MAX_DOWNLOAD).map_err(|e| format!("{}: {e}", path.display()))?;
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let stem = name.map(String::from).unwrap_or_else(|| {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
     install_bytes(bytes, &stem, dir, force)
 }
 
@@ -187,7 +192,7 @@ pub fn run(src: &str, force: bool) -> i32 {
         eprintln!("grimalkin: cannot determine the config directory");
         return 1;
     };
-    match install_from(src, &dir, force) {
+    match install_from(src, &dir, force, None) {
         Ok(name) => {
             println!("Installed. Add to grimalkin.toml:  skin = \"winamp:{name}\"");
             0
@@ -321,12 +326,15 @@ mod tests {
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
         std::fs::write(&src, good_wsz()).unwrap();
         let skins = d.join("skins");
-        let name = install_from(src.to_str().unwrap(), &skins, false).unwrap();
+        let name = install_from(src.to_str().unwrap(), &skins, false, None).unwrap();
         assert_eq!(name, "cool-skin");
         assert!(skins.join("cool-skin.wsz").is_file());
-        let again = install_from(src.to_str().unwrap(), &skins, false).unwrap_err();
+        let again = install_from(src.to_str().unwrap(), &skins, false, None).unwrap_err();
         assert!(again.contains("--force"), "{again}");
-        assert!(install_from(src.to_str().unwrap(), &skins, true).is_ok());
+        assert!(install_from(src.to_str().unwrap(), &skins, true, None).is_ok());
+        // An explicit name overrides the derived one (and is sanitised).
+        let named = install_from(src.to_str().unwrap(), &skins, false, Some(" My Skin ")).unwrap();
+        assert_eq!(named, "my-skin");
         // The listing shows it, and the skin reference resolves.
         assert!(list_text(Some(&skins)).contains("winamp:cool-skin"));
         assert!(crate::skin::Skin::load_from("winamp:cool-skin", Some(&skins)).is_ok());
@@ -346,10 +354,10 @@ mod tests {
             !skins.exists() || installed(&skins).is_empty(),
             "nothing installed on failure"
         );
-        assert!(install_from(d.to_str().unwrap(), &skins, false)
+        assert!(install_from(d.to_str().unwrap(), &skins, false, None)
             .unwrap_err()
             .contains("not a file"));
-        assert!(install_from("https://host.invalid/x.wsz", &skins, false).is_err());
+        assert!(install_from("https://host.invalid/x.wsz", &skins, false, None).is_err());
         assert!(download("http://example.com/x.wsz")
             .unwrap_err()
             .contains("https"));
