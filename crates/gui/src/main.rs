@@ -40,6 +40,7 @@ mod skin;
 mod terminfo;
 mod textsafe;
 mod theme;
+mod win32_input;
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;

@@ -52,6 +52,11 @@ pub struct EncodeState {
     pub alt_is_meta: bool,
     /// Plain Ctrl+V is grimalkin's paste (`input.ctrl_v_paste`).
     pub ctrl_v_paste: bool,
+    /// Send keys as win32-input-mode records (`crate::win32_input`): the pty
+    /// was created with `pty.win32_input_mode` and ConPTY has asked for the
+    /// mode with `CSI ? 9001 h`. The kitty keyboard protocol, when a program
+    /// enabled it, still takes precedence.
+    pub win32_input: bool,
 }
 
 /// The parts of a winit `KeyEvent` that the encoder needs (so it can be unit
@@ -124,6 +129,13 @@ pub fn translate(input: &KeyInput, mods: ModifiersState, st: &EncodeState) -> Ke
         if let Some(bytes) = encode_kitty(st.kitty_flags, input, kitty_mods(input, mods, st)) {
             return KeyAction::Send(bytes);
         }
+    }
+    if st.win32_input && st.kitty_flags == 0 {
+        // Presses and releases both; shortcuts above swallowed their own.
+        return match crate::win32_input::encode_event(input, mods) {
+            Some(bytes) => KeyAction::Send(bytes),
+            None => KeyAction::None,
+        };
     }
     // Swallow unbound Cmd combinations on macOS instead of sending garbage
     // (the kitty protocol can report Super, so it gets them above).

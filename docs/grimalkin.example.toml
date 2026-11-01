@@ -134,6 +134,14 @@ audible = false
 # GRIMALKIN_CONPTY_PASSTHROUGH=1 (or 0) overrides this setting.
 passthrough = false
 
+# Windows only (ignored elsewhere). EXPERIMENTAL. Create the pseudoconsole with
+# PSEUDOCONSOLE_WIN32_INPUT_MODE and, once ConPTY asks for it (CSI ? 9001 h),
+# send every key as a win32-input-mode record (CSI Vk;Sc;Uc;Kd;Cs;Rc _), the way
+# Windows Terminal does: real key events, releases, Ctrl+Break, Ctrl+Shift+letter.
+# Off: keys are sent as ordinary xterm bytes (a lone 0x03 is Ctrl+C). The kitty
+# keyboard protocol, when a program enables it, still takes precedence.
+win32_input_mode = false
+
 # Cursor movement after a kitty graphics placement: "auto", "protocol" or
 # "none". "protocol" moves the cursor past the image as the protocol says
 # (unless the command has C=1). "none" never moves it (C=1 for every

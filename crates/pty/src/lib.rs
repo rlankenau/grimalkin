@@ -147,6 +147,12 @@ pub struct SpawnConfig {
     /// re-rendering them. Ignored elsewhere. Falls back to a normal
     /// pseudoconsole if the ConPTY in use rejects the flag. Default `false`.
     pub passthrough: bool,
+    /// Windows only: create the pseudoconsole with
+    /// `PSEUDOCONSOLE_WIN32_INPUT_MODE`, so conhost asks the terminal
+    /// (`CSI ? 9001 h`) for win32-input-mode key records. Only set this when
+    /// the caller encodes keys that way, or key input is not understood the
+    /// classic way. Ignored elsewhere. Default `false`.
+    pub win32_input_mode: bool,
     /// Bounded channel receiving [`PtyEvent`]s (see [`event_channel`]). When
     /// it is full the reader thread blocks, which throttles the child.
     pub tx: SyncSender<PtyEvent>,
@@ -370,6 +376,7 @@ impl Pty {
             pixel_height: 0,
             login_shell: args.is_empty() && (cmd.is_empty() || is_known_shell(cmd)),
             passthrough: false,
+            win32_input_mode: false,
             tx,
             on_wake: None,
         })
@@ -859,6 +866,7 @@ mod tests {
             pixel_height: 0,
             login_shell: false,
             passthrough: false,
+            win32_input_mode: false,
             tx,
             on_wake: None,
         }

@@ -601,6 +601,11 @@ fn decset_basic_modes() {
     assert!(!t.bracketed_paste());
     feed(&mut t, "\x1b[?1004h");
     assert!(t.focus_reporting());
+    assert!(!t.win32_input_mode());
+    feed(&mut t, "\x1b[?9001h");
+    assert!(t.win32_input_mode());
+    feed(&mut t, "\x1b[?9001l");
+    assert!(!t.win32_input_mode());
     feed(&mut t, "\x1b[4h");
     assert!(t.modes().insert);
     feed(&mut t, "\x1b[4l");

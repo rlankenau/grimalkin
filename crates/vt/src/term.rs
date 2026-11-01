@@ -89,6 +89,9 @@ pub struct Modes {
     pub focus_reporting: bool,
     /// Bracketed paste (2004)
     pub bracketed_paste: bool,
+    /// Win32 input mode (9001): ConPTY asks for keys as
+    /// `CSI Vk;Sc;Uc;Kd;Cs;Rc _` records.
+    pub win32_input: bool,
     /// Synchronized output (2026)
     pub synchronized_output: bool,
     /// DECKPAM / DECKPNM
@@ -111,6 +114,7 @@ impl Default for Modes {
             mouse_encoding: MouseEncoding::Default,
             focus_reporting: false,
             bracketed_paste: false,
+            win32_input: false,
             synchronized_output: false,
             app_keypad: false,
         }
@@ -954,6 +958,10 @@ impl Terminal {
     }
     pub fn focus_reporting(&self) -> bool {
         self.modes.focus_reporting
+    }
+    /// Win32 input mode (`CSI ? 9001 h`), requested by ConPTY.
+    pub fn win32_input_mode(&self) -> bool {
+        self.modes.win32_input
     }
     pub fn app_cursor_keys(&self) -> bool {
         self.modes.app_cursor
