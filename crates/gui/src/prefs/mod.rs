@@ -35,7 +35,7 @@ use egui_wgpu::{RendererOptions, WgpuConfiguration, winit::Painter};
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, ModifiersState};
 use winit::window::Window;
 
 use crate::app::{SecondaryFlow, SecondaryWindow, UserEvent};
@@ -126,25 +126,26 @@ impl PreferencesWindow {
         let prefs = Prefs::new(args.config_path, dispatch, applied, repaint);
 
         let mut win = PreferencesWindow { window, ctx, state, painter, prefs, mods: ModifiersState::empty(), shown: false, pending_step: 0, dump, next_repaint: None };
-        win.redraw(); // first frame before the window appears: no white flash
+        let _ = win.redraw(); // first frame before the window appears: no white flash
         win.window.set_visible(true);
         win.window.focus_window();
         win.shown = true;
         Ok(win)
     }
 
-    fn redraw(&mut self) {
+    /// Draws a frame; true when the frame saw an Esc nothing else needed.
+    fn redraw(&mut self) -> bool {
         self.next_repaint = None;
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 {
-            return;
+            return false;
         }
         let now = Instant::now();
         let mut raw = self.state.take_egui_input(&self.window);
         // A section switch asked for while a text box is being edited waits one
         // frame: the box first loses the focus, which commits what was typed.
         if self.pending_step != 0 {
-            self.prefs.section = self.prefs.section.cycle(std::mem::take(&mut self.pending_step));
+            self.prefs.step_section(std::mem::take(&mut self.pending_step));
         }
         let step = a11y::take_section_keys(&mut raw.events);
         if step != 0 {
@@ -157,11 +158,19 @@ impl PreferencesWindow {
                 self.pending_step = step;
                 self.window.request_redraw();
             } else {
-                self.prefs.section = self.prefs.section.cycle(step);
+                self.prefs.step_section(step);
             }
         }
+        // Esc is decided here, around the frame that sees it, not when the key
+        // arrives: the popup / text box state of a frame that has not run yet
+        // is stale (a key and Esc in one batch, or the first key after the
+        // window was re-activated). The key still reaches egui, which uses it
+        // to close a popup or leave a text box.
+        let esc = raw.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, repeat: false, .. }));
+        let busy_before = self.ctx.egui_wants_keyboard_input() || self.ctx.any_popup_open();
         let prefs = &mut self.prefs;
         let full = self.ctx.run_ui(raw, |ui| ui::show(ui, prefs));
+        let close = esc && !busy_before && !self.ctx.egui_wants_keyboard_input() && !self.ctx.any_popup_open();
         if let (Some((path, last)), Some(update)) = (self.dump.as_mut(), full.platform_output.accesskit_update.as_ref()) {
             let text = a11y::dump(update);
             if text != *last {
@@ -200,17 +209,16 @@ impl PreferencesWindow {
                 self.next_repaint = Some(self.next_repaint.map_or(t, |n| n.min(t)));
             }
         }
+        close
     }
 
-    /// Escape and Cmd/Ctrl+W close the window, unless a text box or a popup
-    /// needs the key first.
+    /// Cmd/Ctrl+W closes the window (Esc is decided in `redraw`).
     fn closes(&self, event: &winit::event::KeyEvent) -> bool {
         if event.state != ElementState::Pressed || event.repeat {
             return false;
         }
         let w_mod = if cfg!(target_os = "macos") { self.mods.super_key() } else { self.mods.control_key() };
         match &event.logical_key {
-            Key::Named(NamedKey::Escape) => !self.ctx.egui_wants_keyboard_input() && !self.ctx.any_popup_open(),
             Key::Character(c) => w_mod && c.eq_ignore_ascii_case("w"),
             _ => false,
         }
@@ -246,6 +254,8 @@ fn style(ctx: &egui::Context) {
         s.spacing.slider_width = 140.0;
         s.spacing.combo_width = 232.0;
         s.spacing.window_margin = egui::Margin::same(12);
+        // Static text is not a control: no click target, so no Invoke pattern.
+        s.interaction.selectable_labels = false;
         for (style, size) in [(egui::TextStyle::Body, 14.0), (egui::TextStyle::Button, 14.0), (egui::TextStyle::Heading, 21.0), (egui::TextStyle::Small, 12.0)] {
             if let Some(f) = s.text_styles.get_mut(&style) {
                 f.size = size;
@@ -263,8 +273,7 @@ impl SecondaryWindow for PreferencesWindow {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => self.window.request_redraw(),
             WindowEvent::Occluded(false) => self.window.request_redraw(),
             WindowEvent::RedrawRequested => {
-                self.redraw();
-                return SecondaryFlow::Keep;
+                return if self.redraw() { SecondaryFlow::Close } else { SecondaryFlow::Keep };
             }
             _ => {}
         }

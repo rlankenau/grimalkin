@@ -3,7 +3,7 @@
 //! [`Prefs::tick`] writes the queue to the file.
 
 use egui::accesskit::Role;
-use egui::{Align, Align2, Button, Color32, ComboBox, CornerRadius, DragValue, EventFilter, FontId, Key, Layout, Modifiers, RichText, Sense, Slider, Stroke, TextEdit, Ui, WidgetInfo, WidgetType, vec2};
+use egui::{Align, Align2, Button, Color32, ComboBox, CornerRadius, DragValue, EventFilter, FontId, Key, Layout, Modifiers, RichText, Sense, Slider, Stroke, TextEdit, Ui, vec2};
 
 use super::a11y;
 use super::model::{self, BellMode, Edit, EditValue, Section};
@@ -77,6 +77,12 @@ fn sidebar(ui: &mut Ui, p: &mut Prefs) {
         let r = ui.add(b);
         a11y::tab(ui, &r, s.label(), selected);
         items.push((s, r));
+    }
+    if std::mem::take(&mut p.focus_tab) {
+        if let Some((_, r)) = items.iter().find(|(s, _)| *s == p.section) {
+            ui.memory_mut(|m| m.request_focus(r.id));
+            r.scroll_to_me(None);
+        }
     }
     let mut target = items.iter().position(|(_, r)| r.clicked());
     if let Some(i) = items.iter().position(|(_, r)| r.has_focus()) {
@@ -170,33 +176,63 @@ fn appearance(ui: &mut Ui, p: &mut Prefs) {
         ui.end_row();
 
         ui.label("Window opacity");
-        let mut v = p.cfg.window.opacity;
-        let r = ui.add(
-            Slider::new(&mut v, 0.1..=1.0)
-                .text(a11y::slider_name("Window opacity"))
-                .step_by(0.01)
-                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                .custom_parser(|s| s.trim().trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)),
-        );
-        if r.changed() {
-            p.cfg.window.opacity = v;
-            p.edit(Edit::float("window.opacity", v));
+        // The slider works in whole percent, so that is also what assistive
+        // technology sees (range 10..100, step 1); the config keeps a fraction.
+        let mut pct = (p.cfg.window.opacity as f64 * 100.0).round();
+        if slider_row(ui, SliderSpec { name: "Window opacity", range: 10.0..=100.0, step: 1.0, decimals: 0, suffix: "%", spoken_suffix: "", format: None }, &mut pct) {
+            let v = pct / 100.0;
+            p.cfg.window.opacity = v as f32;
+            p.edit(Edit::float("window.opacity", v as f32));
         }
         ui.end_row();
 
         ui.label("Padding");
-        let mut v = p.cfg.window.padding;
-        if ui.add(Slider::new(&mut v, 0.0..=40.0).text(a11y::slider_name("Padding")).step_by(1.0).suffix(" px")).changed() {
-            p.cfg.window.padding = v;
-            p.edit(Edit::float("window.padding", v));
+        let mut v = p.cfg.window.padding as f64;
+        if slider_row(ui, SliderSpec { name: "Padding", range: 0.0..=40.0, step: 1.0, decimals: 1, suffix: " px", spoken_suffix: " px", format: None }, &mut v) {
+            p.cfg.window.padding = v as f32;
+            p.edit(Edit::float("window.padding", v as f32));
         }
         ui.end_row();
     });
 }
 
+/// What a slider row looks like and says. The slider and its value box are
+/// two widgets that both edit the same number; each is named directly.
+struct SliderSpec {
+    name: &'static str,
+    range: std::ops::RangeInclusive<f64>,
+    step: f64,
+    decimals: usize,
+    /// Shown after the number in the value box.
+    suffix: &'static str,
+    /// Said after the number by a screen reader.
+    spoken_suffix: &'static str,
+    /// Replaces the number and suffix in the value box.
+    format: Option<fn(f64) -> String>,
+}
+
+/// A slider plus its value box. Returns true when the value changed.
+fn slider_row(ui: &mut Ui, spec: SliderSpec, v: &mut f64) -> bool {
+    ui.horizontal(|ui| {
+        let slider = ui.add(Slider::new(v, spec.range.clone()).show_value(false).step_by(spec.step));
+        let mut drag = DragValue::new(v).range(spec.range.clone()).clamp_existing_to_range(true).speed(spec.step).fixed_decimals(spec.decimals).suffix(spec.suffix);
+        if let Some(f) = spec.format {
+            drag = drag.custom_formatter(move |v, _| f(v));
+        }
+        let value = ui.add(drag);
+        let spoken = format!("{:.*}{}", spec.decimals, *v, spec.spoken_suffix);
+        a11y::describe(ui, &slider, spec.name, Some(&spoken));
+        a11y::describe(ui, &value, spec.name, None);
+        slider.changed() || value.changed()
+    })
+    .inner
+}
+
 fn theme_combo(ui: &mut Ui, p: &mut Prefs) {
     let mut picked: Option<String> = None;
+    let watch = a11y::ComboWatch::new(ui, "theme");
     let combo = ComboBox::from_id_salt("theme").width(CONTROL_WIDTH).selected_text(p.cfg.theme.as_str()).height(360.0).show_ui(ui, |ui| {
+        a11y::list_box(ui, "Themes");
         let mut items = Vec::new();
         for t in &p.themes {
             let selected = t.name == p.cfg.theme;
@@ -221,7 +257,7 @@ fn theme_combo(ui: &mut Ui, p: &mut Prefs) {
                 resp.scroll_to_me(None);
             }
             let name = if t.user { format!("{} (yours)", t.name) } else { t.name.clone() };
-            resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, name.clone()));
+            watch.option(ui, &resp, &name, selected);
             if resp.clicked() {
                 picked = Some(t.name.clone());
                 ui.close();
@@ -230,7 +266,7 @@ fn theme_combo(ui: &mut Ui, p: &mut Prefs) {
         }
         a11y::list_keys(ui, &items);
     });
-    a11y::describe(ui, &combo.response, "Theme", Some(p.cfg.theme.as_str()));
+    watch.finish(ui, &combo, "Theme", p.cfg.theme.as_str(), picked.is_some());
     if let Some(name) = picked {
         p.pick_theme(&name);
     }
@@ -271,11 +307,14 @@ fn theme_preview(ui: &mut Ui, p: &Prefs) {
 fn skin_combo(ui: &mut Ui, p: &mut Prefs) {
     let current = p.skins.iter().find(|o| crate::skin::same_choice(&p.cfg.skin, &o.value)).map_or(p.cfg.skin.as_str(), |o| o.label.as_str()).to_string();
     let mut picked: Option<String> = None;
+    let watch = a11y::ComboWatch::new(ui, "skin");
     let combo = ComboBox::from_id_salt("skin").width(CONTROL_WIDTH).selected_text(&current).height(360.0).show_ui(ui, |ui| {
+        a11y::list_box(ui, "Skins");
         let mut items = Vec::new();
         for o in &p.skins {
             let selected = crate::skin::same_choice(&p.cfg.skin, &o.value);
             let r = ui.selectable_label(selected, &o.label);
+            watch.option(ui, &r, &o.label, selected);
             if r.clicked() {
                 picked = Some(o.value.clone());
             }
@@ -283,7 +322,7 @@ fn skin_combo(ui: &mut Ui, p: &mut Prefs) {
         }
         a11y::list_keys(ui, &items);
     });
-    a11y::describe(ui, &combo.response, "Skin", Some(&current));
+    watch.finish(ui, &combo, "Skin", &current, picked.is_some());
     if let Some(v) = picked {
         p.pick_skin(&v);
     }
@@ -324,10 +363,14 @@ fn font(ui: &mut Ui, p: &mut Prefs) {
             Some(list) => {
                 let primary = p.cfg.font.family.first().cloned().unwrap_or_default();
                 let mut picked: Option<String> = None;
+                let watch = a11y::ComboWatch::new(ui, "font-family");
                 let combo = ComboBox::from_id_salt("font-family").width(CONTROL_WIDTH).selected_text(primary.as_str()).height(360.0).show_ui(ui, |ui| {
+                    a11y::list_box(ui, "Fonts");
                     let mut items = Vec::new();
                     for name in list {
-                        let r = ui.selectable_label(name.eq_ignore_ascii_case(&primary), name);
+                        let selected = name.eq_ignore_ascii_case(&primary);
+                        let r = ui.selectable_label(selected, name);
+                        watch.option(ui, &r, name, selected);
                         if r.clicked() {
                             picked = Some(name.clone());
                         }
@@ -335,7 +378,7 @@ fn font(ui: &mut Ui, p: &mut Prefs) {
                     }
                     a11y::list_keys(ui, &items);
                 });
-                a11y::describe(ui, &combo.response, "Pick font", Some(primary.as_str()));
+                watch.finish(ui, &combo, "Pick font", primary.as_str(), picked.is_some());
                 if let Some(name) = picked {
                     let fam = model::with_primary_family(&p.cfg.font.family, &name);
                     p.edit(model::family_edit(&fam));
@@ -348,18 +391,19 @@ fn font(ui: &mut Ui, p: &mut Prefs) {
         ui.end_row();
 
         ui.label("Size");
-        let mut v = p.cfg.font.size;
-        if ui.add(Slider::new(&mut v, 8.0..=32.0).text(a11y::slider_name("Font size")).step_by(0.5).suffix(" pt")).changed() {
-            p.cfg.font.size = v;
-            p.edit(Edit::float("font.size", v));
+        let mut v = p.cfg.font.size as f64;
+        if slider_row(ui, SliderSpec { name: "Font size", range: 8.0..=32.0, step: 0.5, decimals: 1, suffix: " pt", spoken_suffix: " points", format: None }, &mut v) {
+            p.cfg.font.size = v as f32;
+            p.edit(Edit::float("font.size", v as f32));
         }
         ui.end_row();
 
         ui.label("Line height");
-        let mut v = p.cfg.font.line_height;
-        if ui.add(Slider::new(&mut v, 0.8..=2.0).text(a11y::slider_name("Line height")).step_by(0.05).custom_formatter(|v, _| format!("{v:.2}\u{d7}"))).changed() {
-            p.cfg.font.line_height = v;
-            p.edit(Edit::float("font.line_height", v));
+        let mut v = p.cfg.font.line_height as f64;
+        let spec = SliderSpec { name: "Line height", range: 0.8..=2.0, step: 0.05, decimals: 2, suffix: "", spoken_suffix: "", format: Some(|v| format!("{v:.2}\u{d7}")) };
+        if slider_row(ui, spec, &mut v) {
+            p.cfg.font.line_height = v as f32;
+            p.edit(Edit::float("font.line_height", v as f32));
         }
         ui.end_row();
     });
@@ -445,10 +489,13 @@ fn terminal(ui: &mut Ui, p: &mut Prefs) {
         ui.label("Bell");
         let mode = BellMode::of(&p.cfg.bell);
         let mut picked = None;
+        let watch = a11y::ComboWatch::new(ui, "bell");
         let combo = ComboBox::from_id_salt("bell").width(CONTROL_WIDTH).selected_text(mode.label()).show_ui(ui, |ui| {
+            a11y::list_box(ui, "Bell modes");
             let mut items = Vec::new();
             for m in BellMode::ALL {
                 let r = ui.selectable_label(m == mode, m.label());
+                watch.option(ui, &r, m.label(), m == mode);
                 if r.clicked() {
                     picked = Some(m);
                 }
@@ -456,7 +503,7 @@ fn terminal(ui: &mut Ui, p: &mut Prefs) {
             }
             a11y::list_keys(ui, &items);
         });
-        a11y::describe(ui, &combo.response, "Bell", Some(mode.label()));
+        watch.finish(ui, &combo, "Bell", mode.label(), picked.is_some());
         if let Some(m) = picked {
             let [v, a] = m.edits();
             p.cfg.bell.visual = matches!(m, BellMode::Visual | BellMode::Both);
@@ -489,10 +536,13 @@ fn advanced(ui: &mut Ui, p: &mut Prefs) {
                 GraphicsCursor::None => "Never move",
             };
             let mut picked = None;
+            let watch = a11y::ComboWatch::new(ui, "graphics-cursor");
             let combo = ComboBox::from_id_salt("graphics-cursor").width(CONTROL_WIDTH).selected_text(name(cur)).show_ui(ui, |ui| {
+                a11y::list_box(ui, "Graphics cursor modes");
                 let mut items = Vec::new();
                 for g in [GraphicsCursor::Auto, GraphicsCursor::Protocol, GraphicsCursor::None] {
                     let r = ui.selectable_label(g == cur, name(g));
+                    watch.option(ui, &r, name(g), g == cur);
                     if r.clicked() {
                         picked = Some(g);
                     }
@@ -500,7 +550,7 @@ fn advanced(ui: &mut Ui, p: &mut Prefs) {
                 }
                 a11y::list_keys(ui, &items);
             });
-            a11y::describe(ui, &combo.response, "Graphics cursor", Some(name(cur)));
+            watch.finish(ui, &combo, "Graphics cursor", name(cur), picked.is_some());
             if let Some(g) = picked {
                 p.cfg.pty.graphics_cursor = g;
                 let key = match g {

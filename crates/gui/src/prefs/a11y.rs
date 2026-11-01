@@ -14,7 +14,10 @@
 //! 3. The footer buttons come last, then Tab wraps to the section list.
 //! 4. Ctrl+Tab / Ctrl+Shift+Tab (also Ctrl+PageDown / Ctrl+PageUp) switch
 //!    sections from anywhere.
-//! 5. Esc closes the window, except while a popup or a text box has the key.
+//! 5. Esc closes the window, except while a popup or a text box has the key
+//!    (decided around the frame that sees the key, see `redraw` in `mod.rs`).
+//!    After a section switch the new tab has the focus; after a combo box
+//!    popup closes the combo has it; a popup opens on the current value.
 //!
 //! `GRIMALKIN_PREFS_DUMP_TREE=path` writes the tree and the focus order as
 //! text to `path` after every frame that changes them (debugging and tests).
@@ -78,11 +81,61 @@ pub fn image(ui: &Ui, r: &Response, name: &str) {
     });
 }
 
-/// Invisible-but-named text for a slider: egui ties the text it is given to
-/// both the slider and its value box (`labelled_by`), which is the only way
-/// to name both. Tiny and transparent, so it takes no visible room.
-pub fn slider_name(name: &str) -> egui::RichText {
-    egui::RichText::new(name).size(1.0).color(egui::Color32::TRANSPARENT)
+/// Follows a combo box across frames: whether its popup was open last frame
+/// (so the first frame of a popup can put the focus on the current value), and
+/// whether it just closed (so the focus can go back to the combo).
+pub struct ComboWatch {
+    key: Id,
+    was_open: bool,
+    /// The popup was asked to close (Esc, Enter, a pick) in its last frame.
+    closing: bool,
+}
+
+impl ComboWatch {
+    pub fn new(ui: &Ui, salt: &str) -> ComboWatch {
+        let key = ui.id().with(("combo-open", salt));
+        let state: u8 = ui.data(|d| d.get_temp(key)).unwrap_or(0);
+        ComboWatch { key, was_open: state != 0, closing: state == 2 }
+    }
+
+    /// One option of the popup, as a list box option; the current one takes the
+    /// focus when the popup opens, so the first Down moves relative to it.
+    pub fn option(&self, ui: &Ui, r: &Response, name: &str, selected: bool) {
+        ui.ctx().accesskit_node_builder(r.id, |n| {
+            n.set_role(Role::ListBoxOption);
+            n.set_label(name);
+            n.set_selected(selected);
+            n.clear_toggled();
+        });
+        if selected && !self.was_open {
+            r.request_focus();
+            r.scroll_to_me(None);
+        }
+    }
+
+    /// Name the combo box, say whether it is expanded, and give it the focus
+    /// back when the popup closed by Esc, Enter or a pick (egui leaves it with
+    /// nothing focused). A click elsewhere keeps the focus where it went.
+    pub fn finish(self, ui: &Ui, combo: &egui::InnerResponse<Option<()>>, name: &str, value: &str, picked: bool) {
+        // egui draws the popup once more in the frame that closes it, and it is
+        // gone in the next one; the focus goes back then.
+        let open = combo.inner.is_some();
+        let asked = picked || ui.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter));
+        ui.data_mut(|d| d.insert_temp(self.key, if !open { 0u8 } else if asked { 2 } else { 1 }));
+        ui.ctx().accesskit_node_builder(combo.response.id, |n| {
+            n.set_label(name);
+            n.set_value(value);
+            n.set_expanded(open);
+        });
+        if self.was_open && !open && self.closing {
+            combo.response.request_focus();
+        }
+    }
+}
+
+/// The popup of a combo box as a list box.
+pub fn list_box(ui: &Ui, name: &str) {
+    container(ui, Role::ListBox, name);
 }
 
 /// Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+PageDown / Ctrl+PageUp in `events`: removes
@@ -182,6 +235,16 @@ fn walk(nodes: &Nodes, id: NodeId, depth: usize, out: &mut String, order: &mut V
     }
     if let Some(v) = n.numeric_value() {
         line.push_str(&format!(" num={v}"));
+        line.push_str(&format!(" range={}..{} step={}", n.min_numeric_value().unwrap_or(f64::NAN), n.max_numeric_value().unwrap_or(f64::NAN), n.numeric_value_step().unwrap_or(f64::NAN)));
+    }
+    if let Some(l) = n.level() {
+        line.push_str(&format!(" level={l}"));
+    }
+    if let Some(e) = n.is_expanded() {
+        line.push_str(if e { " expanded" } else { " collapsed" });
+    }
+    if n.supports_action(accesskit::Action::Click) {
+        line.push_str(" [clickable]");
     }
     if n.is_selected() == Some(true) {
         line.push_str(" selected");
@@ -257,6 +320,10 @@ mod tests {
             };
             raw.time = Some(self.t);
             self.t += 0.016;
+            let step = take_section_keys(&mut raw.events);
+            if step != 0 {
+                self.prefs.step_section(step);
+            }
             let prefs = &mut self.prefs;
             let out = self.ctx.run_ui(raw, |ui| crate::prefs::ui::show(ui, prefs));
             self.last = out.platform_output.accesskit_update.expect("accesskit is enabled");
@@ -379,5 +446,74 @@ mod tests {
         for want in ["TabList \"Sections\"", "TabPanel \"Appearance\"", "Heading \"Appearance\"", "Image \"Preview of the", "Slider \"Window opacity\"", "focus order:"] {
             assert!(text.contains(want), "missing {want}:\n{text}");
         }
+    }
+
+    fn node_line(h: &Harness, needle: &str) -> String {
+        dump(&h.last).lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle} in:\n{}", dump(&h.last))).to_string()
+    }
+
+    #[test]
+    fn section_titles_are_headings_with_levels() {
+        let h = Harness::new("headings", Section::Appearance);
+        assert!(node_line(&h, "Heading \"Appearance\"").contains("level=1"));
+        let h = Harness::new("headings2", Section::Advanced);
+        assert!(node_line(&h, "Heading \"Install a WinAMP skin\"").contains("level=2"));
+    }
+
+    #[test]
+    fn sliders_speak_percent_and_pixels() {
+        let h = Harness::new("range", Section::Appearance);
+        let l = node_line(&h, "Slider \"Window opacity\"");
+        assert!(l.contains("num=100 range=10..100 step=1") && l.contains("value=\"100\""), "{l}");
+        let l = node_line(&h, "SpinButton \"Window opacity\"");
+        assert!(l.contains("value=\"100%\""), "{l}");
+        let l = node_line(&h, "Slider \"Padding\"");
+        assert!(l.contains("num=4 range=0..40 step=1"), "{l}");
+        assert!(node_line(&h, "SpinButton \"Padding\"").contains("value=\"4.0 px\""));
+    }
+
+    #[test]
+    fn no_hidden_helper_labels_and_static_text_is_not_clickable() {
+        for section in Section::ALL {
+            let h = Harness::new("labels", section);
+            let text = dump(&h.last);
+            assert!(!text.contains("labelled_by"), "{section:?}: sliders are named directly:\n{text}");
+            for l in text.lines().filter(|l| l.trim_start().starts_with("Label")) {
+                assert!(!l.contains("[clickable]") && !l.contains("[focusable]"), "{section:?}: {l}");
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_tab_lands_on_the_new_tab() {
+        let mut h = Harness::new("ctrltab", Section::Appearance);
+        h.key(Key::Tab, Modifiers::CTRL);
+        assert_eq!(h.prefs.section, Section::Font);
+        assert_eq!(h.focused(), r#"Tab "Font""#);
+        h.key(Key::PageUp, Modifiers::CTRL);
+        assert_eq!(h.focused(), r#"Tab "Appearance""#);
+        h.key(Key::Tab, Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(h.focused(), r#"Tab "Advanced""#);
+    }
+
+    #[test]
+    fn theme_popup_is_a_list_box_and_returns_the_focus() {
+        let mut h = Harness::new("popup", Section::Appearance);
+        h.key(Key::Tab, Modifiers::NONE);
+        h.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(h.focused(), r#"ComboBox "Theme""#);
+        assert!(node_line(&h, "ComboBox \"Theme\"").contains("collapsed"));
+        h.key(Key::Enter, Modifiers::NONE);
+        h.frame(vec![]);
+        let text = dump(&h.last);
+        assert!(node_line(&h, "ComboBox \"Theme\"").contains("expanded"), "{text}");
+        assert!(text.contains("ListBox \"Themes\""), "{text}");
+        assert!(text.lines().any(|l| l.contains("ListBoxOption") && l.contains(" selected")), "{text}");
+        let cur = h.prefs.cfg.theme.clone();
+        assert!(h.focused().starts_with("ListBoxOption") && h.focused().contains(&cur), "popup opens on the current theme: {}", h.focused());
+        h.key(Key::Escape, Modifiers::NONE);
+        h.frame(vec![]);
+        assert_eq!(h.focused(), r#"ComboBox "Theme""#);
+        assert!(node_line(&h, "ComboBox \"Theme\"").contains("collapsed"));
     }
 }
