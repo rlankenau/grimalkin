@@ -350,9 +350,18 @@ step 11.
   a real file; the pipeline refuses to continue if the variables differ).
 - Whether SignPath accepts the artifact configuration XML as written (restrictions on
   `<pe-file-set>`, wildcard `uninst-*.exe` with the default of exactly one match) - the
-  editor reports schema problems immediately. If `product-version` cannot be enforced for the
-  uninstaller or Setup (their ProductVersion comes from Inno's `VersionInfoProductTextVersion`),
-  ask SignPath what they enforce; `check-product-info.ps1` already checks the same values in CI.
+  editor reports schema problems immediately. The `<pe-file-set product-name=... product-version=...>`
+  form is the one in SignPath's own metadata example
+  (<https://docs.signpath.io/artifact-configuration/examples>).
+- **Trailing spaces in Inno's version strings.** Inno Setup writes `ProductName` and
+  `ProductVersion` into fixed-size slots of its stub (`UpdateVersionInfo` in
+  `Compiler.ExeUpdateFunc.pas` overwrites the slot in place), and CI showed the uninstaller's
+  ProductName as `Grimalkin` followed by padding spaces. SignPath's documentation does not say
+  whether metadata restrictions trim whitespace. `check-product-info.ps1` ignores trailing
+  spaces (and warns); if SignPath rejects request 1 or 2 with a metadata mismatch for the
+  uninstaller or Setup, ask SignPath support how they want Inno-built files restricted
+  (many open source projects ship Inno Setup installers signed through SignPath) and adjust the
+  two XML files - no workflow change is needed.
 - How "Allowed branch names" treats tag builds (leave it empty until confirmed).
 - Whether SignPath's signature on the uninstaller is accepted by Inno's byte-for-byte check
   (it should be: SignPath uses standard Authenticode; the final compile fails closed if not).
