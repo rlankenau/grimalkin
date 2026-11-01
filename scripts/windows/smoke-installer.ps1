@@ -13,8 +13,9 @@
   -SetupPath      the shipped installer for this architecture
   -CITestSetupPath the CI-only unelevated twin (never released)
   -Signed         the installer is a signed release build; -ExpectedSubject and
-                  -ChainFile are then required (WINDOWS_SIGNING_PUBLISHER and
-                  installer/windows/codesign-chain.pem)
+                  -ChainFile (AWS KMS route: installer/windows/codesign-chain.pem)
+                  or -ExpectedIssuer (SignPath route: the issuing CA, because
+                  SignPath owns the leaf certificate) are then required
 #>
 param(
     [Parameter(Mandatory)][ValidateSet('x64', 'arm64')][string]$Arch,
@@ -22,12 +23,19 @@ param(
     [Parameter(Mandatory)][string]$CITestSetupPath,
     [switch]$Signed,
     [string]$ExpectedSubject,
-    [string]$ChainFile
+    [string]$ChainFile,
+    [string]$ExpectedIssuer
 )
 $ErrorActionPreference = 'Stop'
-if ($Signed -and (-not $ExpectedSubject -or -not $ChainFile)) { throw '-Signed needs -ExpectedSubject and -ChainFile' }
+if ($Signed -and (-not $ExpectedSubject -or (-not $ChainFile -and -not $ExpectedIssuer))) {
+  throw '-Signed needs -ExpectedSubject and -ChainFile or -ExpectedIssuer'
+}
+# How the signer is pinned: the committed chain (KMS) and/or the issuing CA (SignPath).
+$pin = @{}
+if ($ChainFile) { $pin.ChainFile = $ChainFile }
+if ($ExpectedIssuer) { $pin.ExpectedIssuer = $ExpectedIssuer }
 if ($Signed) {
-  & "$PSScriptRoot/verify-signature.ps1" -Path $SetupPath -ExpectedSubject $ExpectedSubject -ChainFile $ChainFile -AllowMissingSignTool
+  & "$PSScriptRoot/verify-signature.ps1" -Path $SetupPath -ExpectedSubject $ExpectedSubject @pin -AllowMissingSignTool
 }
 $setup = (Resolve-Path -LiteralPath $SetupPath).Path
 # Per-user silent install with the optional tasks turned on.
@@ -42,7 +50,7 @@ if ($Signed) {
   # signature on the first-party files and on the uninstaller Inno generated
   # (SignedUninstaller=yes), Microsoft's own on the ConPTY pair.
   & "$PSScriptRoot/verify-signature.ps1" -Path (Join-Path $dir 'grimalkin.exe'),(Join-Path $dir 'grimalkin.com'),(Join-Path $dir 'unins000.exe') `
-    -ExpectedSubject $ExpectedSubject -ChainFile $ChainFile -AllowMissingSignTool
+    -ExpectedSubject $ExpectedSubject @pin -AllowMissingSignTool
   foreach ($f in 'conpty.dll','OpenConsole.exe') {
     $s = Get-AuthenticodeSignature -LiteralPath (Join-Path $dir $f)
     if ($s.Status -ne 'Valid' -or $s.SignerCertificate.GetNameInfo('SimpleName', $false) -ne 'Microsoft Corporation') {

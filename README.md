@@ -194,15 +194,24 @@ then copy `target/release/grimalkin-launcher.exe` to `grimalkin.com` beside
 ### Windows release signing
 
 Windows releases are meant to be Authenticode-signed: `grimalkin.exe`, `grimalkin.com`,
-the installer and its uninstaller carry a signature with a trusted timestamp. The private key
-lives in AWS KMS and cannot be exported; GitHub Actions signs with it through short-lived
-OIDC credentials, only for `v*` tags on this repository. Microsoft's `conpty.dll` and
-`OpenConsole.exe` are never re-signed: CI checks that they are byte-identical to the pinned
-NuGet package and still carry Microsoft's own signature.
+the installer and its uninstaller carry a signature with a trusted timestamp. Signing happens
+in GitHub Actions, only for `v*` tags on this repository, through one of two providers chosen
+by the repository variable `WINDOWS_SIGNING_PROVIDER`:
+
+| Provider | Certificate and key | Cost | Publisher shown by Windows |
+| --- | --- | --- | --- |
+| `signpath` (**recommended for this project**) | [SignPath Foundation](https://signpath.org/) open source program: SignPath's certificate, key on SignPath's HSM, each release approved by hand in SignPath | free | "SignPath Foundation" |
+| `kms` (default; the variable may be unset) | A certificate you buy; the private key is an AWS KMS key that cannot be exported; short-lived OIDC credentials | about $12/yr AWS plus $129 to $439/yr for the certificate | the certificate holder you registered |
+
+The research, the comparison and the owner's runbook for SignPath are in
+[docs/SIGNING-SIGNPATH.md](docs/SIGNING-SIGNPATH.md); the AWS route is in
+[docs/SIGNING-AWS.md](docs/SIGNING-AWS.md). Microsoft's `conpty.dll` and `OpenConsole.exe`
+are never re-signed or submitted to either provider: CI checks that they are byte-identical
+to the pinned NuGet package and still carry Microsoft's own signature.
 
 **Unsigned builds and the caveat.** Signing is switched on by the repository variable
-`WINDOWS_SIGNING_ENABLED`. Until it is `true` (the state of this repository before the AWS
-side is provisioned), and for every pull request, fork, trunk push and non-release run,
+`WINDOWS_SIGNING_ENABLED`. Until it is `true` (the state of this repository before a
+provider is set up), and for every pull request, fork, trunk push and non-release run,
 nothing is signed. Such files are always labelled: the installer and zip are named
 `grimalkin-setup-<arch>-unsigned.exe` and `grimalkin-portable-<arch>-unsigned.zip`, the zip
 contains `UNSIGNED.txt`, and the installer's publisher reads "grimalkin contributors
@@ -221,15 +230,17 @@ so use an OV or IV certificate and keep the same signing identity across renewal
 #### How the pipeline works
 
 ```
-windows gate -> windows build (x64, arm64)  -> windows sign -> windows smoke (x64, arm64) -> release assets
-                (no cloud permissions)          (one job, the only id-token: write)
+windows gate -> windows build (x64, arm64)  -> windows sign            -> windows smoke (x64, arm64) -> release assets
+                (no cloud permissions)         provider kms: id-token: write (only job that has it)
+                                               provider signpath: "windows sign (signpath)", no id-token
 ```
 
 - **gate**: signs only if `WINDOWS_SIGNING_ENABLED` is `true` **and** the event is a push of a
   `v*` tag on `rlankenau/grimalkin` **and** the tagged commit is an ancestor of `trunk`. When
-  signing is enabled and the run is a release tag, a missing variable, the placeholder
-  certificate chain or a tag off trunk fails the run: **there is no silent unsigned
-  fallback and nothing is uploaded**.
+  signing is enabled and the run is a release tag, a missing variable or secret of the chosen
+  provider, the placeholder certificate chain (`kms`), an unknown `WINDOWS_SIGNING_PROVIDER`
+  or a tag off trunk fails the run: **there is no silent unsigned fallback and nothing is
+  uploaded**.
 - **build**: compiles, stages the architecture's files and the ConPTY pair, checks machine
   types and the ConPTY bytes/signature, tests the signature verifier. It runs build scripts
   and has no cloud credentials. With signing off it also builds the unsigned installer and zip.
@@ -243,6 +254,17 @@ windows gate -> windows build (x64, arm64)  -> windows sign -> windows smoke (x6
   with Inno Setup (`SignTool=` calls `scripts/windows/sign-file.ps1`; `SignedUninstaller=yes`
   signs the uninstaller too), builds the zips, verifies what is inside them, and only then
   uploads.
+- **sign (signpath)**: the same job for SignPath. It never runs cargo, has no cloud
+  credentials (permissions `contents: read`, `actions: read`) and only the SignPath API token
+  as a secret. It builds each installer's unsigned uninstaller with Inno Setup (a documented
+  `SignedUninstaller=yes` mode without `SignTool`), submits **request 1** (`grimalkin.exe`,
+  `grimalkin.com` and the uninstallers, both architectures) with
+  `signpath/github-action-submit-signing-request` (pinned by commit), waits for the manual
+  approval, verifies every signed file (valid, embedded, exact publisher, **issuing CA pinned
+  by `WINDOWS_SIGNING_ISSUER`**, timestamp), builds the Setup executables from the signed files
+  (Inno embeds the signed uninstaller and fails if it is missing) and submits **request 2** (the
+  two Setup executables). Then the same zips, test twins and checks as the KMS job. Two
+  approvals per release. Details and the reasons for this shape: docs/SIGNING-SIGNPATH.md.
 - **smoke**: on a native x64 and a native ARM64 runner, re-runs the whole installer smoke test
   (PE machine types, `Arch` marker, refuse and `/REPLACEARCH=1` flows, elevated refusal, unelevated
   twin) on the installer that will be released, and for signed builds verifies Setup, the installed
@@ -254,7 +276,25 @@ Local `cargo build` and ordinary Inno builds are unsigned and need no signing to
 `scripts/windows/` holds the scripts and `installer/windows/codesign-chain.pem` the public
 certificate chain (a placeholder until a certificate is issued).
 
-#### Setup
+#### Setup with SignPath (recommended)
+
+Full runbook, with the eligibility facts, in [docs/SIGNING-SIGNPATH.md](docs/SIGNING-SIGNPATH.md).
+In short: apply at <https://signpath.org/apply>; in SignPath create the project, the two
+artifact configurations from `installer/windows/signpath/`, a `release-signing` policy with
+approval and origin verification, link the "GitHub.com" trusted build system and create a CI
+user token; then set the secret `SIGNPATH_API_TOKEN` and these variables:
+
+| Variable | Value |
+| --- | --- |
+| `WINDOWS_SIGNING_PROVIDER` | `signpath` |
+| `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG` | from SignPath |
+| `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG`, `SIGNPATH_SETUP_ARTIFACT_CONFIGURATION_SLUG` | the artifact configurations for request 1 (program files, uninstallers) and request 2 (Setup) |
+| `WINDOWS_SIGNING_PUBLISHER` | exact Subject of SignPath's certificate, expected `CN=SignPath Foundation, O=SignPath Foundation, L=Lewes, S=Delaware, C=US` |
+| `WINDOWS_SIGNING_ISSUER` | exact Issuer of that certificate, expected `CN=GlobalSign GCC R45 CodeSigning CA 2020, O=GlobalSign nv-sa, C=BE` |
+| `SIGNPATH_WAIT_TIMEOUT_SECONDS` | optional; longest wait per request including the approval; default 7200 |
+| `WINDOWS_SIGNING_ENABLED` | `true`, set last |
+
+#### Setup with AWS KMS
 
 Order of operations, with commands, is in [scripts/aws/README.md](scripts/aws/README.md); the
 research behind the choices (CA options, costs, key protection evidence, jsign) is in
@@ -275,6 +315,7 @@ research behind the choices (CA options, costs, key protection evidence, jsign) 
    | Variable | Value |
    | --- | --- |
    | `WINDOWS_SIGNING_ENABLED` | `true` to sign release tags; anything else builds unsigned |
+   | `WINDOWS_SIGNING_PROVIDER` | unset or `kms` |
    | `AWS_SIGNING_ROLE_ARN` | the stack's `SignerRoleArn` |
    | `AWS_REGION` | region of the key |
    | `AWS_KMS_KEY_ALIAS` | key alias or id; default `alias/grimalkin-codesign` |
@@ -304,6 +345,9 @@ through a browser** (so Mark of the Web is set):
 - [ ] Running the installer shows the verified publisher in the UAC / SmartScreen dialog (record
       any "Windows protected your PC" warning and the browser used; a warning is reputation, not
       a failed signature). Run it again with the ZIP and `grimalkin.exe` downloaded directly.
+- [ ] SignPath route only: Setup's temporary self-copies are not signed (Inno signs them only
+      through `SignTool=`). Run an all-users install (UAC prompt) and an upgrade over a previous
+      version and record what the prompts show for the publisher.
 - [ ] Silent install, launch from the Start menu and `grimalkin.com`, add-to-PATH, context menu,
       uninstall (Settings, Apps) and upgrade over the previous version.
 - [ ] Smart App Control or an enterprise WDAC policy, if available, runs the signed build.
@@ -928,6 +972,28 @@ packaging/macports/gen-crates.py --update packaging/macports/Portfile
 Submit it as a pull request to <https://github.com/macports/macports-ports>
 adding `aqua/grimalkin/Portfile`; the reviewers will want a stable (non rc)
 version.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/). *Status: the application to the SignPath
+Foundation open source program is not approved yet; until it is, releases are unsigned (or
+signed by the project's own certificate when the AWS KMS route is configured), and this
+policy describes how releases will be signed.*
+
+- **What is signed:** `grimalkin.exe`, `grimalkin.com`, the Windows installer and its
+  uninstaller, built from this repository by GitHub Actions on GitHub-hosted runners, only
+  for release tags (`v*`) on `rlankenau/grimalkin`. Microsoft's `conpty.dll` and
+  `OpenConsole.exe` are third-party files that are shipped as Microsoft built them and are not
+  signed by this project.
+- **Origin:** SignPath verifies that each signed file comes from a GitHub Actions run of this
+  repository (origin verification). Every release needs manual approval in SignPath.
+- **Team roles:** committers and reviewers: [@rlankenau](https://github.com/rlankenau);
+  approvers: [@rlankenau](https://github.com/rlankenau). All members use multi-factor
+  authentication on GitHub and SignPath.
+- **Privacy policy:** this program will not transfer any information to other networked
+  systems unless specifically requested by the user or the person installing or operating it.
+  grimalkin has no telemetry and no update check.
 
 ## License
 
