@@ -16,6 +16,11 @@
        of the next certificate in the file. The chain file is committed to the
        repository and reviewed, so this pins the issuing CA, not just a name.
 
+    4. With -ExpectedIssuer (the SignPath provider, where the leaf certificate is
+       owned and rotated by SignPath so no leaf can be committed): the signer
+       certificate's Issuer must equal that string exactly (case-sensitive), which
+       pins the issuing CA. It can be combined with -ChainFile.
+
   -SignTool may be a path or the name of a function (the self-test mocks it).
   If signtool.exe cannot be found the script fails, unless -AllowMissingSignTool
   is given (used on runners where the SDK location is unproven; the
@@ -26,6 +31,7 @@ param(
     [Parameter(Mandatory)][string[]]$Path,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedSubject,
     [string]$ChainFile,
+    [string]$ExpectedIssuer,
     [string]$SignTool,
     [switch]$AllowMissingSignTool
 )
@@ -66,7 +72,11 @@ foreach ($file in $Path) {
             throw "Issuer of the signer certificate of $file is not the CA in $ChainFile"
         }
     }
+    if ($ExpectedIssuer -and $sig.SignerCertificate.Issuer -cne $ExpectedIssuer) {
+        throw "Unexpected issuer for ${file}: '$($sig.SignerCertificate.Issuer)', expected '$ExpectedIssuer'"
+    }
     Write-Host "Verified $file"
     Write-Host "  publisher : $($sig.SignerCertificate.Subject)"
+    Write-Host "  issuer    : $($sig.SignerCertificate.Issuer)"
     Write-Host "  timestamp : $($sig.TimeStamperCertificate.Subject)"
 }

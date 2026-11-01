@@ -58,6 +58,9 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 VersionInfoVersion={#AppVersionNumeric}
 VersionInfoProductTextVersion={#AppVersion}
+; Explicit so Setup and the uninstaller carry the same ProductName as the program
+; files ("Grimalkin"); SignPath's artifact configuration enforces it.
+VersionInfoProductName=Grimalkin
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
 AppPublisherURL=https://github.com/rlankenau/grimalkin
@@ -101,6 +104,22 @@ SolidCompression=yes
 SignTool=grimalkin
 SignedUninstaller=yes
 SignToolRetryCount=3
+#endif
+
+; SignPath route (no Inno SignTool; see docs/SIGNING-SIGNPATH.md). SignPath cannot
+; be called from inside ISCC, so the uninstaller is signed in a separate step:
+; /DPreSignedUninstaller=<dir> enables SignedUninstaller without SignTool. The
+; first compile writes the unsigned uninstaller into <dir>\uninst-<inno
+; version>-<hash>.e32 (.e64) and stops with "please attach your digital signature to the
+; following executable file"; once that file is signed (by SignPath), compiling
+; again embeds its signature. The file name is a hash of the unsigned uninstaller,
+; so a signature can never be attached to a different one.
+#ifdef PreSignedUninstaller
+  #ifdef SignInstaller
+    #error SignInstaller and PreSignedUninstaller are different signing routes; define only one
+  #endif
+SignedUninstaller=yes
+SignedUninstallerDir={#PreSignedUninstaller}
 #endif
 
 OutputDir=..\..\installer-out

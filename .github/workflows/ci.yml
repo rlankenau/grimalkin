@@ -45,11 +45,19 @@ jobs:
   #   windows-gate     decides, once, whether this run signs (see below)
   #   windows-build    per architecture: build + stage dist. NO cloud permissions.
   #                    Unsigned runs also package here (installer + zip).
-  #   windows-sign     ONE job, the only one with `id-token: write`: signs both
-  #                    architectures through AWS KMS, packages, verifies
+  #   windows-sign     provider "kms" (default): ONE job, the only one with
+  #                    `id-token: write`: signs both architectures through AWS KMS,
+  #                    packages, verifies
+  #   windows-sign-signpath
+  #                    provider "signpath": the same job for SignPath Foundation
+  #                    (free for open source): no cloud credentials, no id-token
   #   windows-smoke    per architecture, on a native runner: install / uninstall
   #                    the installer that will be released
   #   windows-release  attaches the verified assets to the GitHub release
+  #
+  # The provider is the repository variable WINDOWS_SIGNING_PROVIDER: "kms" (the
+  # default, AWS KMS + a purchased certificate) or "signpath" (SignPath Foundation,
+  # docs/SIGNING-SIGNPATH.md). Exactly one of the two sign jobs runs.
   #
   # Signing happens only when ALL of these hold: the repository variable
   # WINDOWS_SIGNING_ENABLED is "true", the event is a push of a v* tag on the
@@ -69,6 +77,8 @@ jobs:
       sign: ${{ steps.gate.outputs.sign }}
       # "" for a signed build, "-unsigned" otherwise (artifact / file names).
       suffix: ${{ steps.gate.outputs.suffix }}
+      # "kms" or "signpath" (WINDOWS_SIGNING_PROVIDER, default kms); only meaningful when sign=true.
+      provider: ${{ steps.gate.outputs.provider }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -78,12 +88,23 @@ jobs:
         id: gate
         env:
           SIGNING_ENABLED: ${{ vars.WINDOWS_SIGNING_ENABLED }}
+          PROVIDER_VAR: ${{ vars.WINDOWS_SIGNING_PROVIDER }}
           ROLE_ARN: ${{ vars.AWS_SIGNING_ROLE_ARN }}
           AWS_REGION_VAR: ${{ vars.AWS_REGION }}
           PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          ISSUER: ${{ vars.WINDOWS_SIGNING_ISSUER }}
+          SP_ORG: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SP_PROJECT: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SP_POLICY: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SP_BINARIES_CONFIG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          SP_SETUP_CONFIG: ${{ vars.SIGNPATH_SETUP_ARTIFACT_CONFIGURATION_SLUG }}
+          SP_TIMEOUT: ${{ vars.SIGNPATH_WAIT_TIMEOUT_SECONDS }}
+          # Only whether the secret is set, never its value.
+          SP_TOKEN_SET: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
         run: |
           set -euo pipefail
           sign=false
+          provider="${PROVIDER_VAR:-kms}"
           if [[ "$SIGNING_ENABLED" != "true" ]]; then
             echo "::notice::Windows signing is off (repository variable WINDOWS_SIGNING_ENABLED is not 'true'): this build is UNSIGNED"
           elif [[ "$GITHUB_REPOSITORY" != "$UPSTREAM_REPOSITORY" || "$GITHUB_EVENT_NAME" != "push" || "$GITHUB_REF" != refs/tags/v* ]]; then
@@ -95,25 +116,60 @@ jobs:
               echo "::error::$GITHUB_REF points at $GITHUB_SHA, which is not on trunk; refusing to sign"
               exit 1
             fi
-            for name in ROLE_ARN AWS_REGION_VAR PUBLISHER; do
-              if [[ -z "${!name}" ]]; then
-                echo "::error::signing is enabled but a repository variable is missing (AWS_SIGNING_ROLE_ARN, AWS_REGION, WINDOWS_SIGNING_PUBLISHER); see README, Windows release signing"
+            case "$provider" in
+              kms)
+                for name in ROLE_ARN AWS_REGION_VAR PUBLISHER; do
+                  if [[ -z "${!name}" ]]; then
+                    echo "::error::signing is enabled but a repository variable is missing (AWS_SIGNING_ROLE_ARN, AWS_REGION, WINDOWS_SIGNING_PUBLISHER); see README, Windows release signing"
+                    exit 1
+                  fi
+                done
+                if ! [[ "$ROLE_ARN" =~ ^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$ ]]; then
+                  echo "::error::AWS_SIGNING_ROLE_ARN is not an IAM role ARN"
+                  exit 1
+                fi
+                if ! grep -q -- '-----BEGIN CERTIFICATE-----' installer/windows/codesign-chain.pem; then
+                  echo "::error::installer/windows/codesign-chain.pem holds no certificate yet (still the placeholder)"
+                  exit 1
+                fi
+                ;;
+              signpath)
+                for name in SP_ORG SP_PROJECT SP_POLICY SP_BINARIES_CONFIG SP_SETUP_CONFIG PUBLISHER ISSUER; do
+                  if [[ -z "${!name}" ]]; then
+                    echo "::error::provider signpath: a repository variable is missing (SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG, SIGNPATH_ARTIFACT_CONFIGURATION_SLUG, SIGNPATH_SETUP_ARTIFACT_CONFIGURATION_SLUG, WINDOWS_SIGNING_PUBLISHER, WINDOWS_SIGNING_ISSUER); see docs/SIGNING-SIGNPATH.md"
+                    exit 1
+                  fi
+                done
+                if [[ "$SP_TOKEN_SET" != "true" ]]; then
+                  echo "::error::provider signpath: the repository secret SIGNPATH_API_TOKEN is not set"
+                  exit 1
+                fi
+                if ! [[ "$SP_ORG" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+                  echo "::error::SIGNPATH_ORGANIZATION_ID is not a GUID"
+                  exit 1
+                fi
+                for name in SP_PROJECT SP_POLICY SP_BINARIES_CONFIG SP_SETUP_CONFIG; do
+                  if ! [[ "${!name}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                    echo "::error::$name is not a valid SignPath slug (ASCII letters, digits, '.', '-', '_')"
+                    exit 1
+                  fi
+                done
+                if [[ -n "$SP_TIMEOUT" ]] && ! [[ "$SP_TIMEOUT" =~ ^[0-9]{2,5}$ ]]; then
+                  echo "::error::SIGNPATH_WAIT_TIMEOUT_SECONDS must be a number of seconds"
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "::error::WINDOWS_SIGNING_PROVIDER must be 'kms' or 'signpath', not '$provider'"
                 exit 1
-              fi
-            done
-            if ! [[ "$ROLE_ARN" =~ ^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$ ]]; then
-              echo "::error::AWS_SIGNING_ROLE_ARN is not an IAM role ARN"
-              exit 1
-            fi
-            if ! grep -q -- '-----BEGIN CERTIFICATE-----' installer/windows/codesign-chain.pem; then
-              echo "::error::installer/windows/codesign-chain.pem holds no certificate yet (still the placeholder)"
-              exit 1
-            fi
+                ;;
+            esac
             sign=true
           fi
           echo "sign=$sign" >> "$GITHUB_OUTPUT"
+          echo "provider=$provider" >> "$GITHUB_OUTPUT"
           if [[ "$sign" == "true" ]]; then echo "suffix=" >> "$GITHUB_OUTPUT"; else echo "suffix=-unsigned" >> "$GITHUB_OUTPUT"; fi
-          echo "windows signing: $sign" >> "$GITHUB_STEP_SUMMARY"
+          echo "windows signing: $sign (provider: $provider)" >> "$GITHUB_STEP_SUMMARY"
 
   # Builds the Windows binaries for each architecture and stages dist/ with the
   # architecture-matching ConPTY redistributable. x64 builds on windows-latest.
@@ -249,6 +305,15 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      # The SignPath route builds the installer in steps (the uninstaller is signed
+      # separately). This proves, with a throwaway self-signed certificate and on
+      # every run, the Inno Setup behaviour that route relies on. It replaces
+      # dist/ with copies, so it stays the last step of the job.
+      - name: Test the SignPath installer flow (self-signed stand-in)
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/windows/test-signpath-inno-flow.ps1 -Arch ${{ matrix.arch }} -Version $env:APP_VERSION
+
   # Signs both architectures, builds the signed installers and zips, verifies
   # everything, and only then uploads. The ONLY job with `id-token: write`.
   #
@@ -260,7 +325,7 @@ jobs:
     name: windows sign
     runs-on: windows-latest
     needs: [windows-gate, windows-build]
-    if: needs.windows-gate.outputs.sign == 'true'
+    if: needs.windows-gate.outputs.sign == 'true' && needs.windows-gate.outputs.provider == 'kms'
     permissions:
       id-token: write
       contents: read
@@ -412,6 +477,240 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # Signs both architectures through SignPath Foundation (free for open source) and
+  # does everything else the AWS KMS job does: installers, zips, verification and
+  # only then the upload. Runs instead of "windows sign" when the repository
+  # variable WINDOWS_SIGNING_PROVIDER is "signpath". Design: docs/SIGNING-SIGNPATH.md.
+  #
+  # Permissions: no `id-token: write` and no cloud credentials at all. The only
+  # secret is the SignPath API token, used by the submit steps. `actions: read` is
+  # what SignPath's action needs to read this run and download the artifact.
+  #
+  # Like the KMS job it never runs cargo or code from the build. Two SignPath
+  # signing requests per release, each needing manual approval in SignPath:
+  #   1. grimalkin.exe + grimalkin.com (both architectures) and the unsigned
+  #      installer uninstallers (SignPath cannot be called from inside ISCC)
+  #   2. the two Setup executables, built from the signed files and the signed
+  #      uninstallers
+  # ConPTY (conpty.dll, OpenConsole.exe) is never submitted.
+  windows-sign-signpath:
+    name: windows sign (signpath)
+    runs-on: windows-latest
+    needs: [windows-gate, windows-build]
+    if: needs.windows-gate.outputs.sign == 'true' && needs.windows-gate.outputs.provider == 'signpath'
+    permissions:
+      contents: read
+      actions: read
+    env:
+      WINDOWS_SIGNING_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+      # Exact Issuer of SignPath's certificate (the CA that issues SignPath
+      # Foundation's certificates), checked on every signed file.
+      WINDOWS_SIGNING_ISSUER: ${{ vars.WINDOWS_SIGNING_ISSUER }}
+      # Longest wait for one request, which includes the manual approval.
+      SIGNPATH_WAIT_TIMEOUT: ${{ vars.SIGNPATH_WAIT_TIMEOUT_SECONDS || '7200' }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Assert this is an authorised release run
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne $env:UPSTREAM_REPOSITORY -or $env:GITHUB_EVENT_NAME -ne 'push' -or $env:GITHUB_REF -notlike 'refs/tags/v*') {
+            throw 'signing is restricted to v* tag pushes on the upstream repository'
+          }
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          if ($version -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.+-]+)?$') { throw "unexpected tag: $env:GITHUB_REF_NAME" }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+          # The installer's publisher text is the certificate's common name.
+          $cn = [regex]::Match($env:WINDOWS_SIGNING_PUBLISHER, '(?:^|, )CN=([^,]+)')
+          if (-not $cn.Success) { throw 'WINDOWS_SIGNING_PUBLISHER has no CN= part' }
+          "PUBLISHER_NAME=$($cn.Groups[1].Value)" >> $env:GITHUB_ENV
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist-x64
+          path: stage/x64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist-arm64
+          path: stage/arm64
+      - name: Check the staged files before submitting anything
+        run: |
+          foreach ($arch in 'x64', 'arm64') {
+            if (Test-Path "stage/$arch/UNSIGNED.txt") { throw "stage/$arch contains UNSIGNED.txt in a signing run" }
+            scripts/windows/check-pe-machine.ps1 -Dir "stage/$arch" -Arch $arch
+            scripts/windows/check-conpty.ps1 -Dir "stage/$arch" -Arch $arch -Version $env:CONPTY_VERSION -Sha256 $env:CONPTY_SHA256
+            # What SignPath's artifact configuration enforces, checked early.
+            scripts/windows/check-product-info.ps1 -Path "stage/$arch/grimalkin.exe", "stage/$arch/grimalkin.com" -Version $env:APP_VERSION
+          }
+          # A copy for the negative tests of the verifier: an unsigned binary.
+          New-Item -ItemType Directory $env:RUNNER_TEMP/negative | Out-Null
+          Copy-Item stage/x64/grimalkin.exe $env:RUNNER_TEMP/negative/unsigned-sample.exe
+      # Request 1, part 1: Inno writes the unsigned uninstaller of each installer
+      # (SignedUninstaller=yes without SignTool; ISCC stops by design) so that it can
+      # be signed together with the program files. It does not depend on the payload
+      # (scripts/windows/test-signpath-inno-flow.ps1 proves it on every CI run).
+      - name: Generate the unsigned uninstallers and lay out request 1
+        run: |
+          foreach ($arch in 'x64', 'arm64') {
+            $uninst = scripts/windows/build-installer.ps1 -Arch $arch -Version $env:APP_VERSION -Dist "stage/$arch" `
+              -SignPathGenerateUninstaller -SignPathUninstallerDir "$env:RUNNER_TEMP/uninstaller-unsigned/$arch" -Publisher $env:PUBLISHER_NAME |
+              Select-Object -Last 1
+            scripts/windows/check-product-info.ps1 -Path $uninst.FullName -Version $env:APP_VERSION
+            $in = "signpath/binaries/$arch"
+            New-Item -ItemType Directory $in | Out-Null
+            # SignPath's PE file type lists .exe/.dll/... but not .com, so the launcher
+            # is submitted under an .exe name and renamed back after signing (an
+            # Authenticode signature does not depend on the file name).
+            Copy-Item "stage/$arch/grimalkin.exe" $in
+            Copy-Item "stage/$arch/grimalkin.com" "$in/grimalkin-launcher.exe"
+            # Inno names it uninst-<version>-<hash>.e32 (a PE file with an Inno-specific
+            # extension); submitted as .exe and given its Inno name back after signing.
+            Copy-Item $uninst.FullName "$in/$($uninst.BaseName).exe"
+          }
+          Get-ChildItem signpath/binaries -Recurse -File | Format-Table FullName, Length
+      - name: Upload the unsigned files for SignPath (request 1)
+        id: upload-binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signpath-unsigned-binaries
+          path: signpath/binaries
+          if-no-files-found: error
+          retention-days: 3
+      - name: Submit signing request 1 (program files and uninstallers) and wait
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-binaries.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: ${{ env.SIGNPATH_WAIT_TIMEOUT }}
+          output-artifact-directory: signpath/signed-binaries
+          parameters: |
+            version: "${{ env.APP_VERSION }}"
+      - name: Verify the signed files and put them in place
+        run: |
+          foreach ($arch in 'x64', 'arm64') {
+            $sent = Get-ChildItem "signpath/binaries/$arch" -File | ForEach-Object Name | Sort-Object
+            $got = Get-ChildItem "signpath/signed-binaries/$arch" -File | ForEach-Object Name | Sort-Object
+            if ((($sent -join '|') -cne ($got -join '|'))) { throw "${arch}: SignPath returned [$($got -join ', ')], expected [$($sent -join ', ')]" }
+            $files = Get-ChildItem "signpath/signed-binaries/$arch" -File | ForEach-Object FullName
+            scripts/windows/verify-signature.ps1 -Path $files -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ExpectedIssuer $env:WINDOWS_SIGNING_ISSUER
+            $cn = (Get-AuthenticodeSignature $files[0]).SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            if ($cn -cne $env:PUBLISHER_NAME) { throw "signer common name '$cn' is not '$env:PUBLISHER_NAME' (the installer was built with that publisher text)" }
+            # The signed program files replace the staged ones (the launcher gets its
+            # .com name back); the signed uninstaller goes to the directory the final
+            # compile reads (same file name).
+            Copy-Item "signpath/signed-binaries/$arch/grimalkin.exe" "stage/$arch/grimalkin.exe" -Force
+            Copy-Item "signpath/signed-binaries/$arch/grimalkin-launcher.exe" "stage/$arch/grimalkin.com" -Force
+            scripts/windows/verify-signature.ps1 -Path "stage/$arch/grimalkin.com" -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ExpectedIssuer $env:WINDOWS_SIGNING_ISSUER
+            $dir = "$env:RUNNER_TEMP/uninstaller-signed/$arch"
+            New-Item -ItemType Directory $dir | Out-Null
+            foreach ($u in Get-ChildItem "$env:RUNNER_TEMP/uninstaller-unsigned/$arch" -File) {
+              Copy-Item "signpath/signed-binaries/$arch/$($u.BaseName).exe" (Join-Path $dir $u.Name)
+            }
+          }
+      - name: Negative tests of the verifier (on copies)
+        run: |
+          scripts/windows/test-verify-signature.ps1 `
+            -UnsignedPath "$env:RUNNER_TEMP/negative/unsigned-sample.exe" `
+            -SignedPath stage/x64/grimalkin.exe, stage/x64/grimalkin.com, stage/arm64/grimalkin.exe, stage/arm64/grimalkin.com `
+            -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ExpectedIssuer $env:WINDOWS_SIGNING_ISSUER -SkipSignFileTests
+      # Request 2: Setup built from the signed program files and the signed
+      # uninstaller (ISCC embeds its signature and fails if it is missing).
+      - name: Build the Setup executables (not yet signed) and lay out request 2
+        run: |
+          foreach ($arch in 'x64', 'arm64') {
+            # ISCC builds the arm64 installer fine on this x64 runner.
+            scripts/windows/build-installer.ps1 -Arch $arch -Version $env:APP_VERSION -Dist "stage/$arch" `
+              -SignPathSetup -SignPathUninstallerDir "$env:RUNNER_TEMP/uninstaller-signed/$arch" -OutDir "signpath/setup/$arch" -Publisher $env:PUBLISHER_NAME | Out-Null
+          }
+          Get-ChildItem signpath/setup -Recurse -File | Format-Table FullName, Length
+          scripts/windows/check-product-info.ps1 -Path signpath/setup/x64/grimalkin-setup-x64.exe, signpath/setup/arm64/grimalkin-setup-arm64.exe -Version $env:APP_VERSION
+      - name: Upload the Setup executables for SignPath (request 2)
+        id: upload-setup
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signpath-unsigned-setup
+          path: signpath/setup
+          if-no-files-found: error
+          retention-days: 3
+      - name: Submit signing request 2 (Setup executables) and wait
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_SETUP_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: ${{ env.SIGNPATH_WAIT_TIMEOUT }}
+          output-artifact-directory: signpath/signed-setup
+          parameters: |
+            version: "${{ env.APP_VERSION }}"
+      - name: Verify the signed Setup executables
+        run: |
+          New-Item -ItemType Directory installer-out | Out-Null
+          foreach ($arch in 'x64', 'arm64') {
+            $setup = "signpath/signed-setup/$arch/grimalkin-setup-$arch.exe"
+            if ((Get-ChildItem "signpath/signed-setup/$arch" -File).Count -ne 1) { throw "${arch}: SignPath returned more than the Setup executable" }
+            scripts/windows/verify-signature.ps1 -Path $setup -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ExpectedIssuer $env:WINDOWS_SIGNING_ISSUER
+            Copy-Item $setup installer-out/
+            # CI-only twin (unelevated behaviour): payload is the signed one, the
+            # twin itself is never signed or released.
+            scripts/windows/build-installer.ps1 -Arch $arch -Version $env:APP_VERSION -Dist "stage/$arch" -CITest | Out-Null
+          }
+      - name: Build portable zips and verify what is inside them
+        run: |
+          foreach ($arch in 'x64', 'arm64') {
+            $zip = "grimalkin-portable-$arch.zip"
+            Compress-Archive -Path "stage/$arch/*" -DestinationPath $zip
+            $x = Join-Path $env:RUNNER_TEMP "unzip-$arch"
+            Expand-Archive -LiteralPath $zip -DestinationPath $x
+            foreach ($f in Get-ChildItem "stage/$arch" -File) {
+              if ((Get-FileHash $f.FullName).Hash -ne (Get-FileHash (Join-Path $x $f.Name)).Hash) { throw "$arch zip: $($f.Name) differs from the staged file" }
+            }
+            scripts/windows/verify-signature.ps1 -Path "$x/grimalkin.exe", "$x/grimalkin.com" -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ExpectedIssuer $env:WINDOWS_SIGNING_ISSUER
+            scripts/windows/check-conpty.ps1 -Dir $x -Arch $arch -Version $env:CONPTY_VERSION -Sha256 $env:CONPTY_SHA256
+            scripts/windows/check-pe-machine.ps1 -Dir $x -Arch $arch
+          }
+      - name: Upload signed x64 installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-setup-x64
+          path: installer-out/grimalkin-setup-x64.exe
+          if-no-files-found: error
+      - name: Upload signed arm64 installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-setup-arm64
+          path: installer-out/grimalkin-setup-arm64.exe
+          if-no-files-found: error
+      - name: Upload signed x64 portable zip
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-portable-x64
+          path: grimalkin-portable-x64.zip
+          if-no-files-found: error
+      - name: Upload signed arm64 portable zip
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grimalkin-portable-arm64
+          path: grimalkin-portable-arm64.zip
+          if-no-files-found: error
+      - name: Upload CI test installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installer-citest-all
+          path: installer-test/grimalkin-setup-citest-*.exe
+          if-no-files-found: error
+          retention-days: 3
+
   # The installer is built for ${{ matrix.arch }}; it can only run on a machine
   # of that architecture. x64 runs on windows-latest (x64), arm64 on
   # windows-11-arm (native ARM64). Signed or unsigned, it is the installer that
@@ -419,9 +718,10 @@ jobs:
   windows-smoke:
     name: windows smoke (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
-    needs: [windows-gate, windows-build, windows-sign]
-    # Run after a successful sign job, or when signing is off (sign job skipped).
-    if: ${{ !cancelled() && needs.windows-build.result == 'success' && (needs.windows-gate.outputs.sign != 'true' || needs.windows-sign.result == 'success') }}
+    needs: [windows-gate, windows-build, windows-sign, windows-sign-signpath]
+    # Run after a successful sign job (exactly one of the two providers' jobs runs,
+    # the other is skipped), or when signing is off (both skipped).
+    if: ${{ !cancelled() && needs.windows-build.result == 'success' && (needs.windows-gate.outputs.sign != 'true' || needs.windows-sign.result == 'success' || needs.windows-sign-signpath.result == 'success') }}
     permissions:
       contents: read
     strategy:
@@ -457,6 +757,8 @@ jobs:
         env:
           SIGNED: ${{ needs.windows-gate.outputs.sign }}
           PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          ISSUER: ${{ vars.WINDOWS_SIGNING_ISSUER }}
+          PROVIDER: ${{ needs.windows-gate.outputs.provider }}
           SUFFIX: ${{ needs.windows-gate.outputs.suffix }}
         run: |
           $x = Join-Path $env:RUNNER_TEMP 'portable'
@@ -465,7 +767,10 @@ jobs:
           $unsignedMarker = Test-Path (Join-Path $x 'UNSIGNED.txt')
           if ($env:SIGNED -eq 'true') {
             if ($unsignedMarker) { throw 'a signed portable zip must not contain UNSIGNED.txt' }
-            scripts/windows/verify-signature.ps1 -Path "$x/grimalkin.exe", "$x/grimalkin.com" -ExpectedSubject $env:PUBLISHER -ChainFile installer/windows/codesign-chain.pem -AllowMissingSignTool
+            # KMS: the committed chain pins the leaf and its CA. SignPath owns the
+            # leaf, so the issuing CA is pinned instead.
+            $pin = if ($env:PROVIDER -eq 'signpath') { @{ ExpectedIssuer = $env:ISSUER } } else { @{ ChainFile = 'installer/windows/codesign-chain.pem' } }
+            scripts/windows/verify-signature.ps1 -Path "$x/grimalkin.exe", "$x/grimalkin.com" -ExpectedSubject $env:PUBLISHER @pin -AllowMissingSignTool
           } elseif (-not $unsignedMarker) {
             throw 'an unsigned portable zip must contain UNSIGNED.txt'
           }
@@ -475,6 +780,8 @@ jobs:
         env:
           SIGNED: ${{ needs.windows-gate.outputs.sign }}
           PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+          ISSUER: ${{ vars.WINDOWS_SIGNING_ISSUER }}
+          PROVIDER: ${{ needs.windows-gate.outputs.provider }}
           SUFFIX: ${{ needs.windows-gate.outputs.suffix }}
         run: |
           $params = @{
@@ -485,7 +792,8 @@ jobs:
           if ($env:SIGNED -eq 'true') {
             $params.Signed = $true
             $params.ExpectedSubject = $env:PUBLISHER
-            $params.ChainFile = 'installer/windows/codesign-chain.pem'
+            if ($env:PROVIDER -eq 'signpath') { $params.ExpectedIssuer = $env:ISSUER }
+            else { $params.ChainFile = 'installer/windows/codesign-chain.pem' }
           }
           scripts/windows/smoke-installer.ps1 @params
 
@@ -497,12 +805,12 @@ jobs:
   windows-release:
     name: windows release assets
     runs-on: ubuntu-latest
-    needs: [windows-gate, windows-sign, windows-smoke]
+    needs: [windows-gate, windows-sign, windows-sign-signpath, windows-smoke]
     # The implicit success() would skip this job whenever the (correctly
     # skipped) sign job is anywhere upstream, so state the conditions instead:
-    # smoke passed, and when signing is on the sign job passed too. Never an
-    # unsigned fallback when signing is enabled.
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.windows-smoke.result == 'success' && (needs.windows-gate.outputs.sign != 'true' || needs.windows-sign.result == 'success') }}
+    # smoke passed, and when signing is on the sign job of the chosen provider
+    # passed too. Never an unsigned fallback when signing is enabled.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.windows-smoke.result == 'success' && (needs.windows-gate.outputs.sign != 'true' || needs.windows-sign.result == 'success' || needs.windows-sign-signpath.result == 'success') }}
     permissions:
       contents: write
     steps:

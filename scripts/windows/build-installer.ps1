@@ -12,6 +12,22 @@
   environment documented in sign-file.ps1. -Publisher is the certificate's common
   name, shown as the publisher in Apps & features.
 
+  SignPath route (docs/SIGNING-SIGNPATH.md). SignPath cannot be called from inside
+  ISCC, so Inno's SignTool is not used and the installer is built in steps:
+    -SignPathGenerateUninstaller  compiles with SignedUninstaller=yes and no
+        SignTool. ISCC then writes the unsigned uninstaller to
+        -SignPathUninstallerDir\uninst-<inno version>-<hash>.e32 (or .e64; it is a
+        PE file with an Inno-specific extension) and stops with
+        "please attach your digital signature ... and compile again": that
+        failure is expected. The script returns the uninstaller file, which the
+        caller submits to SignPath. The directory must be empty.
+    -SignPathSetup  after the uninstaller in -SignPathUninstallerDir has been
+        replaced by its signed version (same name), compiles again: ISCC embeds
+        the signature (and fails if the file is not signed). The result,
+        <OutDir>\grimalkin-setup-<arch>.exe, is UNSIGNED so far and is submitted
+        to SignPath by the caller. Use the same -Publisher in both steps.
+  Both take -Publisher (the certificate's common name) like -Sign does.
+
   -CITest builds the CI-only twin (/DCITestUnelevated, never released) into
   installer-test\ and never signs it.
 
@@ -23,12 +39,28 @@ param(
     [Parameter(Mandatory)][string]$Version,
     [switch]$Sign,
     [switch]$CITest,
+    [switch]$SignPathGenerateUninstaller,
+    [switch]$SignPathSetup,
+    [string]$SignPathUninstallerDir,
+    [string]$OutDir,
     [string]$Publisher,
     [string]$Dist = 'dist'
 )
 $ErrorActionPreference = 'Stop'
 if ($Sign -and $CITest) { throw 'the CI test twin is never signed' }
 if ($Sign -and -not $Publisher) { throw '-Sign needs -Publisher' }
+$signPath = $SignPathGenerateUninstaller -or $SignPathSetup
+if ($SignPathGenerateUninstaller -and $SignPathSetup) { throw '-SignPathGenerateUninstaller and -SignPathSetup are separate steps' }
+if ($signPath) {
+    if ($Sign -or $CITest) { throw 'the SignPath steps cannot be combined with -Sign or -CITest' }
+    if (-not $Publisher -or -not $SignPathUninstallerDir) { throw 'the SignPath steps need -Publisher and -SignPathUninstallerDir' }
+    if ($SignPathSetup -and -not $OutDir) { throw '-SignPathSetup needs -OutDir' }
+    New-Item -ItemType Directory -Force -Path $SignPathUninstallerDir | Out-Null
+    $SignPathUninstallerDir = (Resolve-Path -LiteralPath $SignPathUninstallerDir).Path
+    if ($SignPathGenerateUninstaller -and (Get-ChildItem -LiteralPath $SignPathUninstallerDir -Force)) {
+        throw "-SignPathUninstallerDir $SignPathUninstallerDir must be empty"
+    }
+}
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $want = Join-Path $repo 'dist'
@@ -62,6 +94,12 @@ if ($CITest) {
     $out = 'installer-test'
     $base = "grimalkin-setup-citest-$Arch"
     $defs += '/DCITestUnelevated'
+} elseif ($signPath) {
+    # The unsigned-uninstaller step produces no installer (ISCC stops); the second
+    # step writes the installer, not yet signed, into -OutDir.
+    $out = if ($SignPathSetup) { New-Item -ItemType Directory -Force -Path $OutDir | ForEach-Object FullName } else { Join-Path ([IO.Path]::GetTempPath()) "grimalkin-iscc-$([guid]::NewGuid())" }
+    $base = "grimalkin-setup-$Arch"
+    $defs += "/DAppPublisher=$Publisher", "/DPreSignedUninstaller=$SignPathUninstallerDir"
 } elseif ($Sign) {
     $out = 'installer-out'
     $base = "grimalkin-setup-$Arch"
@@ -75,10 +113,26 @@ if ($CITest) {
     $base = "grimalkin-setup-$Arch-unsigned"
     $defs += '/DAppPublisher=grimalkin contributors (unsigned build)'
 }
-Write-Host "ISCC: Arch=$Arch AppVersion=$Version -> $out\$base.exe (sign=$([bool]$Sign))"
+Write-Host "ISCC: Arch=$Arch AppVersion=$Version -> $out\$base.exe (sign=$([bool]$Sign), signpath=$signPath)"
 Push-Location $repo
 try {
-    & $iscc @defs "/O$out" "/F$base" installer/windows/grimalkin.iss
+    if ($SignPathGenerateUninstaller) {
+        # ISCC is EXPECTED to fail here, after writing the unsigned uninstaller.
+        $log = & $iscc @defs "/O$out" "/F$base" installer/windows/grimalkin.iss 2>&1 | Out-String
+        $code = $LASTEXITCODE
+        Write-Host $log
+        if ($code -eq 0) { throw 'ISCC succeeded without a signed uninstaller; the SignPath flow is not what was expected' }
+        if ($log -notmatch 'Signed uninstaller mode is enabled') { throw "ISCC failed for another reason (exit code $code)" }
+        $found = @(Get-ChildItem -LiteralPath $SignPathUninstallerDir -Filter 'uninst-*' -File | Where-Object Extension -In '.e32', '.e64')
+        if ($found.Count -ne 1) { throw "expected exactly one uninstaller in $SignPathUninstallerDir, found $($found.Count)" }
+        Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
+        $global:LASTEXITCODE = 0
+        return $found[0]
+    }
+    # Out-Host: ISCC's log goes to the console, not into this script's output, which
+    # callers use to get the installer file.
+    & $iscc @defs "/O$out" "/F$base" installer/windows/grimalkin.iss | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 } finally { Pop-Location }
-Get-Item (Join-Path $repo "$out\$base.exe")
+# $out is relative to the repo, or absolute with -SignPathSetup (Combine keeps a rooted second path).
+Get-Item ([IO.Path]::Combine($repo, "$out\$base.exe"))

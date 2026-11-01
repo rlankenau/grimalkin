@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for signing request 2 of the release
+  (docs/SIGNING-SIGNPATH.md): the two Setup executables, built from the files
+  signed in request 1 (the uninstaller inside already carries its signature).
+  Create it in SignPath as a second artifact configuration, slug "setup", and set
+  the repository variable SIGNPATH_SETUP_ARTIFACT_CONFIGURATION_SLUG to that slug.
+
+  Zip layout:  x64/grimalkin-setup-x64.exe   arm64/grimalkin-setup-arm64.exe
+  Inno Setup writes ProductName "Grimalkin" (VersionInfoProductName in
+  grimalkin.iss) and ProductVersion = the release version.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file-set product-name="Grimalkin" product-version="${version}">
+      <include path="x64/grimalkin-setup-x64.exe" />
+      <include path="arm64/grimalkin-setup-arm64.exe" />
+      <for-each>
+        <authenticode-sign />
+      </for-each>
+    </pe-file-set>
+  </zip-file>
+</artifact-configuration>

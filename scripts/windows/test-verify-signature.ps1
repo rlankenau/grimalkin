@@ -18,14 +18,18 @@
                    publisher and after a one-byte tamper
     -ConptyPath    a copy of conpty.dll / OpenConsole.exe: sign-file.ps1 must
                    refuse it
-  with -ExpectedSubject / -ChainFile identifying the real publisher.
+  with -ExpectedSubject and -ChainFile and/or -ExpectedIssuer identifying the real
+  publisher. -SkipSignFileTests leaves out the re-signing and ConPTY tests, which
+  call sign-file.ps1 (the AWS KMS route) and are meaningless for the SignPath route.
 #>
 param(
     [string]$UnsignedPath,
     [string[]]$SignedPath = @(),
     [string]$ConptyPath,
     [string]$ExpectedSubject,
-    [string]$ChainFile
+    [string]$ChainFile,
+    [string]$ExpectedIssuer,
+    [switch]$SkipSignFileTests
 )
 $ErrorActionPreference = 'Stop'
 $verify = Join-Path $PSScriptRoot 'verify-signature.ps1'
@@ -118,6 +122,14 @@ try {
     Assert-Rejected 'leaf issued by a different CA than the chain file' {
         & $verify -Path $launcher -ExpectedSubject $subject -ChainFile $wrongCaChain -SignTool Test-SignTool
     } 'not the CA'
+    & $verify -Path $launcher -ExpectedSubject $subject -ExpectedIssuer $ca.Subject -SignTool Test-SignTool | Out-Null
+    Write-Host 'ok: expected issuer accepted'
+    Assert-Rejected 'unexpected issuer' {
+        & $verify -Path $launcher -ExpectedSubject $subject -ExpectedIssuer 'CN=Another Test CA' -SignTool Test-SignTool
+    } 'Unexpected issuer'
+    Assert-Rejected 'issuer comparison is case-sensitive' {
+        & $verify -Path $launcher -ExpectedSubject $subject -ExpectedIssuer $ca.Subject.ToUpperInvariant() -SignTool Test-SignTool
+    } 'Unexpected issuer'
     Assert-Rejected 'placeholder chain file' {
         & $verify -Path $launcher -ExpectedSubject $subject -ChainFile $placeholder -SignTool Test-SignTool
     } 'no PEM certificates'
@@ -140,6 +152,7 @@ try {
         if (-not $ExpectedSubject) { $ExpectedSubject = $subject }
         $chainArgs = @{}
         if ($ChainFile) { $chainArgs.ChainFile = $ChainFile }
+        if ($ExpectedIssuer) { $chainArgs.ExpectedIssuer = $ExpectedIssuer }
         Assert-Rejected 'unsigned binary' { & $verify -Path $UnsignedPath -ExpectedSubject $ExpectedSubject @chainArgs } 'verification failed|not valid'
         foreach ($file in $SignedPath) {
             & $verify -Path $file -ExpectedSubject $ExpectedSubject @chainArgs
@@ -153,11 +166,13 @@ try {
             [IO.File]::WriteAllBytes($tampered, $bytes)
             Assert-Rejected "tampered binary ($file)" { & $verify -Path $tampered -ExpectedSubject $ExpectedSubject @chainArgs } 'verification failed|not valid'
             # sign-file must not stack a second signature on a signed file.
-            $again = Join-Path $temp "again-$([IO.Path]::GetFileName($file))"
-            Copy-Item $file $again
-            Assert-Rejected "re-signing a signed file ($file)" { & $signFile -Path $again } 'already carries a signature'
+            if (-not $SkipSignFileTests) {
+                $again = Join-Path $temp "again-$([IO.Path]::GetFileName($file))"
+                Copy-Item $file $again
+                Assert-Rejected "re-signing a signed file ($file)" { & $signFile -Path $again } 'already carries a signature'
+            }
         }
-        if ($ConptyPath) {
+        if ($ConptyPath -and -not $SkipSignFileTests) {
             $copy = Join-Path $temp ([IO.Path]::GetFileName($ConptyPath))
             Copy-Item $ConptyPath $copy
             Assert-Rejected "signing $copy" { & $signFile -Path $copy } 'Microsoft redistributable'

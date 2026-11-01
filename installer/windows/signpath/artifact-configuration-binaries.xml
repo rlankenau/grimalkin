@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for signing request 1 of the release
+  (docs/SIGNING-SIGNPATH.md): the program files of both architectures and the
+  installers' uninstallers. Create it in SignPath (project > Artifact
+  configurations > Add > Custom), slug "binaries", and set the repository variable
+  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG to that slug.
+
+  The zip is laid out by the "windows sign (signpath)" job:
+    x64/grimalkin.exe          x64/grimalkin-launcher.exe (the console launcher
+    x64/uninst-*.exe            grimalkin.com, renamed because SignPath's PE type
+    arm64/...same...            has no .com extension)
+  conpty.dll and OpenConsole.exe (Microsoft's) are never in this artifact.
+
+  Metadata restrictions (SignPath Foundation requires product name and version to
+  be enforced): ProductName is "Grimalkin" in all of these files, ProductVersion is
+  the release version, passed by the workflow as the parameter "version".
+  Each include matches exactly one file (SignPath's default), so a missing or extra
+  file fails the request.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file-set product-name="Grimalkin" product-version="${version}">
+      <include path="x64/grimalkin.exe" />
+      <include path="x64/grimalkin-launcher.exe" />
+      <include path="x64/uninst-*.exe" />
+      <include path="arm64/grimalkin.exe" />
+      <include path="arm64/grimalkin-launcher.exe" />
+      <include path="arm64/uninst-*.exe" />
+      <for-each>
+        <authenticode-sign />
+      </for-each>
+    </pe-file-set>
+  </zip-file>
+</artifact-configuration>
