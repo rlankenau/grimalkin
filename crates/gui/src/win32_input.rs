@@ -201,26 +201,9 @@ fn single_char(s: &str) -> Option<char> {
     }
 }
 
-/// The character Windows would put in the record: the event text when the
-/// platform supplied it (it already has Ctrl applied), else the logical key,
-/// with Ctrl turned into the C0 code. `None` for keys without a character.
-fn record_char(input: &KeyInput, ctrl: bool) -> Option<char> {
-    if let Some(c) = input.text.and_then(single_char) {
-        return Some(c);
-    }
-    let c = match input.logical {
-        Key::Character(s) => single_char(s)?,
-        Key::Named(NamedKey::Space) => ' ',
-        Key::Named(NamedKey::Enter) => '\r',
-        Key::Named(NamedKey::Tab) => '\t',
-        Key::Named(NamedKey::Backspace) => '\u{8}',
-        Key::Named(NamedKey::Escape) => '\u{1b}',
-        _ => return None,
-    };
-    if !ctrl {
-        return Some(c);
-    }
-    Some(match c {
+/// The C0 code Windows produces for Ctrl+`c` (what `ToUnicode` returns).
+fn ctrl_char(c: char) -> char {
+    match c {
         'a'..='z' => (c as u8 - b'a' + 1) as char,
         'A'..='Z' => (c as u8 - b'A' + 1) as char,
         '[' => '\u{1b}',
@@ -231,7 +214,38 @@ fn record_char(input: &KeyInput, ctrl: bool) -> Option<char> {
         '\r' => '\n',
         '\u{8}' => '\u{7f}',
         other => other,
-    })
+    }
+}
+
+/// The character Windows would put in the record: the event text (winit's
+/// `text` has no Ctrl applied) or else the logical key, with Ctrl turned into
+/// the C0 code. `None` for keys without a character.
+fn record_char(input: &KeyInput, ctrl: bool) -> Option<char> {
+    let c = match input.text.and_then(single_char) {
+        Some(c) => c,
+        None => match input.logical {
+            Key::Character(s) => single_char(s)?,
+            Key::Named(NamedKey::Space) => ' ',
+            Key::Named(NamedKey::Enter) => '\r',
+            Key::Named(NamedKey::Tab) => '\t',
+            Key::Named(NamedKey::Backspace) => '\u{8}',
+            Key::Named(NamedKey::Escape) => '\u{1b}',
+            _ => return None,
+        },
+    };
+    let convertible = !c.is_control() || matches!(c, '\r' | '\u{8}');
+    Some(if ctrl && convertible { ctrl_char(c) } else { c })
+}
+
+/// The layout-aware virtual key for letter and digit keys: Windows reports
+/// the virtual key of the character, not of the key position (Dvorak Ctrl+C
+/// is `VK_C`), while the scan code stays physical.
+fn layout_vk(input: &KeyInput) -> Option<u16> {
+    let c = input.unmodified.or_else(|| match input.logical {
+        Key::Character(s) => single_char(s),
+        _ => None,
+    })?;
+    c.is_ascii_alphanumeric().then(|| c.to_ascii_uppercase() as u16)
 }
 
 /// The key records for one winit key event (press or release), as bytes.
@@ -289,6 +303,14 @@ pub fn encode_event(input: &KeyInput, mods: ModifiersState) -> Option<Vec<u8>> {
     if vk == 0x13 && ctrl {
         vk = VK_CANCEL;
         cs |= ENHANCED_KEY;
+    }
+    // Dead-key results such as "´x" are several characters: one key press,
+    // several records.
+    if input.text.is_some_and(|t| t.chars().count() > 1) {
+        return packet_events(input, cs);
+    }
+    if let Some(v) = layout_vk(input) {
+        vk = v;
     }
     // Text that is more than one UTF-16 unit cannot be one record.
     let ch = record_char(input, ctrl);
@@ -377,7 +399,7 @@ mod tests {
     #[test]
     fn ctrl_c_press_and_release() {
         let k = Key::Character(SmolStr::new("c"));
-        let down = input(&k, KeyCode::KeyC, Some("\u{3}"), true);
+        let down = input(&k, KeyCode::KeyC, Some("c"), true);
         assert_eq!(ev(&down, ModifiersState::CONTROL), "\x1b[67;46;3;1;8;1_");
         // Release has no text; Ctrl is mapped from the logical key.
         let up = input(&k, KeyCode::KeyC, None, false);
@@ -422,6 +444,31 @@ mod tests {
         let k = Key::Character(SmolStr::new("A"));
         let m = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert_eq!(ev(&input(&k, KeyCode::KeyA, None, true), m), "\x1b[65;30;1;1;24;1_");
+    }
+
+    #[test]
+    fn ctrl_is_applied_to_event_text() {
+        let d = Key::Character(SmolStr::new("d"));
+        assert_eq!(ev(&input(&d, KeyCode::KeyD, Some("d"), true), ModifiersState::CONTROL), "\x1b[68;32;4;1;8;1_");
+        let enter = Key::Named(NamedKey::Enter);
+        assert_eq!(ev(&input(&enter, KeyCode::Enter, Some("\r"), true), ModifiersState::CONTROL), "\x1b[13;28;10;1;8;1_");
+    }
+
+    #[test]
+    fn virtual_key_follows_the_layout_but_scan_code_stays_physical() {
+        // Dvorak: the key at the US "I" position types "c".
+        let c = Key::Character(SmolStr::new("c"));
+        assert_eq!(ev(&input(&c, KeyCode::KeyI, Some("c"), true), ModifiersState::CONTROL), "\x1b[67;23;3;1;8;1_");
+    }
+
+    #[test]
+    fn multi_char_text_from_a_mapped_key_uses_packets() {
+        let x = Key::Character(SmolStr::new("x"));
+        let i = input(&x, KeyCode::KeyX, Some("´x"), true);
+        assert_eq!(
+            ev(&i, ModifiersState::empty()),
+            "\x1b[231;0;180;1;0;1_\x1b[231;0;180;0;0;1_\x1b[231;0;120;1;0;1_\x1b[231;0;120;0;0;1_"
+        );
     }
 
     #[test]
