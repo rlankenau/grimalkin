@@ -41,6 +41,9 @@ pub struct TextBuffers {
 pub struct Prefs {
     pub cfg: Config,
     pub section: Section,
+    /// The next frame puts the keyboard focus on the selected section's tab
+    /// (after a section switch from the keyboard, which leaves it nowhere).
+    pub focus_tab: bool,
     pub queue: EditQueue,
     pub themes: Vec<ThemeEntry>,
     pub skins: Vec<SkinOption>,
@@ -86,6 +89,7 @@ impl Prefs {
         let mut p = Prefs {
             cfg: Config::default(),
             section: Section::Appearance,
+            focus_tab: false,
             queue: EditQueue::default(),
             themes: Vec::new(),
             skins: Vec::new(),
@@ -224,6 +228,12 @@ impl Prefs {
 
     pub fn run_action(&self, a: MenuAction) {
         (self.dispatch)(a);
+    }
+
+    /// Ctrl+Tab and friends: move `step` sections on and focus that tab.
+    pub fn step_section(&mut self, step: i32) {
+        self.section = self.section.cycle(step);
+        self.focus_tab = true;
     }
 
     /// Remove every key of `section` from the config file.
