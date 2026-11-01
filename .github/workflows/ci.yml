@@ -597,7 +597,7 @@ jobs:
           foreach ($arch in 'x64', 'arm64') {
             $sent = Get-ChildItem "signpath/binaries/$arch" -File | ForEach-Object Name | Sort-Object
             $got = Get-ChildItem "signpath/signed-binaries/$arch" -File | ForEach-Object Name | Sort-Object
-            if ((($sent -join '|') -cne ($got -join '|'))) { throw "$arch: SignPath returned [$($got -join ', ')], expected [$($sent -join ', ')]" }
+            if ((($sent -join '|') -cne ($got -join '|'))) { throw "${arch}: SignPath returned [$($got -join ', ')], expected [$($sent -join ', ')]" }
             $files = Get-ChildItem "signpath/signed-binaries/$arch" -File | ForEach-Object FullName
             scripts/windows/verify-signature.ps1 -Path $files -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ExpectedIssuer $env:WINDOWS_SIGNING_ISSUER
             $cn = (Get-AuthenticodeSignature $files[0]).SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
@@ -658,7 +658,7 @@ jobs:
           New-Item -ItemType Directory installer-out | Out-Null
           foreach ($arch in 'x64', 'arm64') {
             $setup = "signpath/signed-setup/$arch/grimalkin-setup-$arch.exe"
-            if ((Get-ChildItem "signpath/signed-setup/$arch" -File).Count -ne 1) { throw "$arch: SignPath returned more than the Setup executable" }
+            if ((Get-ChildItem "signpath/signed-setup/$arch" -File).Count -ne 1) { throw "${arch}: SignPath returned more than the Setup executable" }
             scripts/windows/verify-signature.ps1 -Path $setup -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ExpectedIssuer $env:WINDOWS_SIGNING_ISSUER
             Copy-Item $setup installer-out/
             # CI-only twin (unelevated behaviour): payload is the signed one, the

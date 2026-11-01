@@ -71,7 +71,7 @@ try {
     if ($null -eq $r.SignerCertificate) { throw "could not sign the test uninstaller: $($r.StatusMessage)" }
     Copy-Item $asExe $f1.FullName -Force
 
-    $setup = & $build -Arch $Arch -Version $Version -Dist $dist1 -SignPathSetup -SignPathUninstallerDir $u1 -OutDir $out -Publisher $publisher
+    $setup = & $build -Arch $Arch -Version $Version -Dist $dist1 -SignPathSetup -SignPathUninstallerDir $u1 -OutDir $out -Publisher $publisher | Select-Object -Last 1
     if ($setup.Length -lt 1MB) { throw "suspiciously small installer: $($setup.Length) bytes" }
     Write-Host "ok: the final compile embedded the signed uninstaller ($($setup.FullName))"
     & (Join-Path $PSScriptRoot 'check-product-info.ps1') -Path $setup.FullName -Version $Version
