@@ -110,7 +110,7 @@ SignToolRetryCount=3
 ; be called from inside ISCC, so the uninstaller is signed in a separate step:
 ; /DPreSignedUninstaller=<dir> enables SignedUninstaller without SignTool. The
 ; first compile writes the unsigned uninstaller into <dir>\uninst-<inno
-; version>-<hash>.exe and stops with "please attach your digital signature to the
+; version>-<hash>.e32 (.e64) and stops with "please attach your digital signature to the
 ; following executable file"; once that file is signed (by SignPath), compiling
 ; again embeds its signature. The file name is a hash of the unsigned uninstaller,
 ; so a signature can never be attached to a different one.

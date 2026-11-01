@@ -205,7 +205,8 @@ matter here:
   enabled for your project, a hook becomes possible (one request per file, each approved).
 - **Chosen: pre-signed uninstaller.** Inno has a documented mode for exactly this case: with
   `SignedUninstaller=yes` and **no** `SignTool`, the first compile writes the unsigned
-  uninstaller to `SignedUninstallerDir\uninst-<Inno version>-<hash>.exe` and stops with
+  uninstaller to `SignedUninstallerDir\uninst-<Inno version>-<hash>.e32` (`.e64`; a PE file with an
+  Inno-specific extension, observed in CI) and stops with
   "Signed uninstaller mode is enabled. Using an external code-signing tool, please attach
   your digital signature to the following executable file ... and compile again". When the
   file is signed, later compiles copy its signature into the installer (Inno verifies that
@@ -214,7 +215,8 @@ matter here:
   (`jrsoftware/issrc`, `Compiler.SetupCompiler.pas`, procedure `SignSetupMemoryFile`) and the
   help page above. The unsigned uninstaller should not depend on the program files, so it can be produced
   before they are signed and signed together with them; `test-signpath-inno-flow.ps1` checks
-  that on every CI run.
+  that on every CI run. The workflow submits it under an `.exe` name (SignPath's PE type does
+  not list `.e32`) and restores the Inno name afterwards; the bytes are identical.
 
 ### The flow in this repository (two signing requests per release)
 

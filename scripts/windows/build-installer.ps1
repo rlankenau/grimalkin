@@ -16,7 +16,8 @@
   ISCC, so Inno's SignTool is not used and the installer is built in steps:
     -SignPathGenerateUninstaller  compiles with SignedUninstaller=yes and no
         SignTool. ISCC then writes the unsigned uninstaller to
-        -SignPathUninstallerDir\uninst-<inno version>-<hash>.exe and stops with
+        -SignPathUninstallerDir\uninst-<inno version>-<hash>.e32 (or .e64; it is a
+        PE file with an Inno-specific extension) and stops with
         "please attach your digital signature ... and compile again": that
         failure is expected. The script returns the uninstaller file, which the
         caller submits to SignPath. The directory must be empty.
@@ -122,7 +123,7 @@ try {
         Write-Host $log
         if ($code -eq 0) { throw 'ISCC succeeded without a signed uninstaller; the SignPath flow is not what was expected' }
         if ($log -notmatch 'Signed uninstaller mode is enabled') { throw "ISCC failed for another reason (exit code $code)" }
-        $found = @(Get-ChildItem -LiteralPath $SignPathUninstallerDir -Filter 'uninst-*.exe' -File)
+        $found = @(Get-ChildItem -LiteralPath $SignPathUninstallerDir -Filter 'uninst-*' -File | Where-Object Extension -In '.e32', '.e64')
         if ($found.Count -ne 1) { throw "expected exactly one uninstaller in $SignPathUninstallerDir, found $($found.Count)" }
         Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
         $global:LASTEXITCODE = 0

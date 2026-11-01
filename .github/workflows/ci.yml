@@ -565,7 +565,9 @@ jobs:
             # Authenticode signature does not depend on the file name).
             Copy-Item "stage/$arch/grimalkin.exe" $in
             Copy-Item "stage/$arch/grimalkin.com" "$in/grimalkin-launcher.exe"
-            Copy-Item $uninst.FullName $in
+            # Inno names it uninst-<version>-<hash>.e32 (a PE file with an Inno-specific
+            # extension); submitted as .exe and given its Inno name back after signing.
+            Copy-Item $uninst.FullName "$in/$($uninst.BaseName).exe"
           }
           Get-ChildItem signpath/binaries -Recurse -File | Format-Table FullName, Length
       - name: Upload the unsigned files for SignPath (request 1)
@@ -608,7 +610,9 @@ jobs:
             scripts/windows/verify-signature.ps1 -Path "stage/$arch/grimalkin.com" -ExpectedSubject $env:WINDOWS_SIGNING_PUBLISHER -ExpectedIssuer $env:WINDOWS_SIGNING_ISSUER
             $dir = "$env:RUNNER_TEMP/uninstaller-signed/$arch"
             New-Item -ItemType Directory $dir | Out-Null
-            Copy-Item "signpath/signed-binaries/$arch/uninst-*.exe" $dir
+            foreach ($u in Get-ChildItem "$env:RUNNER_TEMP/uninstaller-unsigned/$arch" -File) {
+              Copy-Item "signpath/signed-binaries/$arch/$($u.BaseName).exe" (Join-Path $dir $u.Name)
+            }
           }
       - name: Negative tests of the verifier (on copies)
         run: |

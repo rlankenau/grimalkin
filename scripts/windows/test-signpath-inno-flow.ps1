@@ -63,8 +63,13 @@ try {
     $global:LASTEXITCODE = 0
 
     $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=$publisher" -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
-    $r = Set-AuthenticodeSignature -FilePath $f1.FullName -Certificate $cert -HashAlgorithm SHA256
+    # Inno names the file uninst-<version>-<hash>.e32 (or .e64): not an extension a
+    # signing tool knows, so sign a copy named .exe and put it back under the Inno name.
+    $asExe = Join-Path $work "$($f1.BaseName).exe"
+    Copy-Item $f1.FullName $asExe
+    $r = Set-AuthenticodeSignature -FilePath $asExe -Certificate $cert -HashAlgorithm SHA256
     if ($null -eq $r.SignerCertificate) { throw "could not sign the test uninstaller: $($r.StatusMessage)" }
+    Copy-Item $asExe $f1.FullName -Force
 
     $setup = & $build -Arch $Arch -Version $Version -Dist $dist1 -SignPathSetup -SignPathUninstallerDir $u1 -OutDir $out -Publisher $publisher
     if ($setup.Length -lt 1MB) { throw "suspiciously small installer: $($setup.Length) bytes" }
