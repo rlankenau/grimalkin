@@ -375,6 +375,14 @@ pub struct PtyConfig {
     /// (kitty graphics) and other sequences untouched. Needs a sideloaded
     /// `conpty.dll` + `OpenConsole.exe` or Windows 11. Ignored elsewhere.
     pub passthrough: bool,
+    /// Windows only: create the pseudoconsole with
+    /// `PSEUDOCONSOLE_WIN32_INPUT_MODE` and, once ConPTY requests it
+    /// (`CSI ? 9001 h`), send every key as a win32-input-mode record
+    /// (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`), like Windows Terminal. That gives programs
+    /// real key events, including releases and chords with no byte form (Ctrl+
+    /// Break, Ctrl+Shift+letter). Off by default: keys are sent as the usual
+    /// xterm bytes. Takes effect for new windows. Ignored elsewhere.
+    pub win32_input_mode: bool,
     /// Cursor movement after kitty graphics placements: `auto` (default),
     /// `protocol` or `none`; see [`GraphicsCursor`].
     pub graphics_cursor: GraphicsCursor,
@@ -630,6 +638,8 @@ mod tests {
     #[test]
     fn pty_passthrough_config_and_env_override() {
         assert!(!Config::from_toml("").unwrap().pty.passthrough);
+        assert!(!Config::from_toml("").unwrap().pty.win32_input_mode);
+        assert!(Config::from_toml("[pty]\nwin32_input_mode = true").unwrap().pty.win32_input_mode);
         assert!(Config::from_toml("[pty]\npassthrough = true").unwrap().pty.passthrough);
         assert!(!passthrough_with_env(false, None));
         assert!(passthrough_with_env(true, None));

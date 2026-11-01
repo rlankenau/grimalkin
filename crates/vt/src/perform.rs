@@ -665,6 +665,7 @@ impl Terminal {
             1006 => md.mouse_encoding == MouseEncoding::Sgr,
             1015 => md.mouse_encoding == MouseEncoding::Urxvt,
             2004 => md.bracketed_paste,
+            9001 => md.win32_input,
             2026 => md.synchronized_output,
             _ => return None,
         })
@@ -751,6 +752,7 @@ impl Terminal {
                 }
             }
             2004 => self.modes.bracketed_paste = on,
+            9001 => self.modes.win32_input = on,
             2026 => self.set_synchronized(on),
             _ => {}
         }

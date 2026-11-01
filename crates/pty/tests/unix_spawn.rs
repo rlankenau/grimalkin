@@ -181,6 +181,7 @@ fn on_wake_called() {
         pixel_height: 0,
         login_shell: false,
         passthrough: false,
+        win32_input_mode: false,
         tx: txs,
         on_wake: Some(Box::new(move || {
             n2.fetch_add(1, Ordering::SeqCst);

@@ -5,6 +5,8 @@
 
 #[path = "../src/input.rs"]
 mod input;
+#[path = "../src/win32_input.rs"]
+mod win32_input;
 
 use grimalkin_vt::{MouseEncoding, MouseMode};
 use input::*;

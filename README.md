@@ -803,7 +803,8 @@ Tested facts (Windows 10, ConPTY package 1.25):
 - In the redistributable ConPTY (1.24+), bit 0x8 is not passthrough: it is
   `PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES` (the glyph-width mask is 0x18:
   GRAPHEMES 0x08, WCSWIDTH 0x10, CONSOLE 0x18; `AMBIGUOUS_IS_WIDE` is 0x20),
-  and 0x2/0x4 are unused. That is why a passthrough flag appeared to do
+  and 0x2/0x4 are unused (the 1.25 conhost always sends `CSI ? 9001 h` itself).
+  That is why a passthrough flag appeared to do
   nothing there. Grimalkin therefore sets 0x8 only for the in-box ConPTY; the
   sideloaded one already forwards unknown sequences.
 - The APC *reply* to a query (`a=q`) is stripped on the input side, so tools

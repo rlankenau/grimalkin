@@ -392,9 +392,12 @@ impl App {
             Some(c) => (c[0].clone(), c[1..].to_vec()),
             None => (cfg.shell.clone(), cfg.shell_args.clone()),
         };
+        // Only on Windows, where ConPTY is the one asking for the mode.
+        let pty_win32_input = cfg!(windows) && cfg.pty.win32_input_mode;
         let pty = Pty::spawn_with(SpawnConfig {
             login_shell: args.is_empty() && self.launch.command.is_none(),
             passthrough: cfg.pty.passthrough_enabled(),
+            win32_input_mode: pty_win32_input,
             cmd,
             args,
             cwd: default_cwd(self.launch.working_directory.clone()),
@@ -431,6 +434,7 @@ impl App {
             pty_wake_requested: false,
             occluded: false,
             writer,
+            pty_win32_input,
             gfx: Graphics::with_cursor_moves(cfg.pty.graphics_cursor.follows_protocol_here()),
             clipboard: None,
             selection: Selection::new(),
@@ -688,6 +692,8 @@ struct Running {
     /// A `PtyWake` arrived; drained on the next `about_to_wait`.
     pty_wake_requested: bool,
     writer: PtyWriter,
+    /// The pty was created with `pty.win32_input_mode` (Windows).
+    pty_win32_input: bool,
     gfx: Graphics,
     clipboard: Option<arboard::Clipboard>,
     selection: Selection,
@@ -1286,6 +1292,8 @@ impl Running {
             alt_screen: self.term.screen() == Screen::Alt,
             alt_is_meta: !input::IS_MAC || self.cfg.input.option_as_alt,
             ctrl_v_paste: self.cfg.input.ctrl_v_paste,
+            // The pty was created asking for it and ConPTY has requested it.
+            win32_input: self.pty_win32_input && self.term.win32_input_mode(),
         };
         match input::translate(&KeyInput::from_event(ev), self.mods, &st) {
             KeyAction::None => {}

@@ -60,7 +60,7 @@ use windows_sys::Win32::System::Threading::{
 use super::cmdline::{command_line, resolve_program, EnvBlock};
 use crate::{default_env, default_shell, ChildWait, Killer, Master, SpawnConfig, Spawned};
 
-use super::flags::{pseudoconsole_flags, BASE_FLAGS};
+use super::flags::pseudoconsole_flags;
 
 const ERROR_BROKEN_PIPE: i32 = 109;
 const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
@@ -583,7 +583,7 @@ pub(crate) fn open(cfg: &SpawnConfig) -> io::Result<Spawned> {
              forwards unknown sequences); not setting flag 0x8"
         );
     }
-    let flags = pseudoconsole_flags(api.sideloaded, cfg.passthrough);
+    let flags = pseudoconsole_flags(api.sideloaded, cfg.passthrough, cfg.win32_input_mode);
     let con = match PseudoConsole::create(
         api,
         cols,
@@ -609,7 +609,7 @@ pub(crate) fn open(cfg: &SpawnConfig) -> io::Result<Spawned> {
                 rows,
                 &input_read_pty,
                 &output_write_pty,
-                BASE_FLAGS,
+                pseudoconsole_flags(api.sideloaded, false, cfg.win32_input_mode),
             )?
         }
         Err(e) => return Err(e),
