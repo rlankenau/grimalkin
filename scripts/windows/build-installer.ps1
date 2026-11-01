@@ -129,7 +129,9 @@ try {
         $global:LASTEXITCODE = 0
         return $found[0]
     }
-    & $iscc @defs "/O$out" "/F$base" installer/windows/grimalkin.iss
+    # Out-Host: ISCC's log goes to the console, not into this script's output, which
+    # callers use to get the installer file.
+    & $iscc @defs "/O$out" "/F$base" installer/windows/grimalkin.iss | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 } finally { Pop-Location }
 # $out is relative to the repo, or absolute with -SignPathSetup (Combine keeps a rooted second path).
